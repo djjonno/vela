@@ -1,10 +1,13 @@
 # syntax=docker/dockerfile:1
 
 # ---- Builder stage -------------------------------------------------------
-# Pinned to a recent stable Rust compatible with the workspace MSRV (1.82).
+# Latest stable Rust on bookworm. A newer toolchain than the workspace MSRV
+# (1.82) is required because locked transitive dependencies (e.g. indexmap
+# 2.x) pull in the `edition2024` feature, stabilized in Rust 1.85. bookworm is
+# kept so the builder's glibc matches the debian:bookworm-slim runtime stage.
 # vela-proto's build.rs uses a vendored protoc (protoc-bin-vendored), so no
 # system protoc package is required here.
-FROM rust:1.83-bookworm AS builder
+FROM rust:1-bookworm AS builder
 
 WORKDIR /build
 
