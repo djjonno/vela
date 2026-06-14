@@ -1,0 +1,18 @@
+[package]
+name = "vela-proto"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# vela-proto owns the wire types and declares no dependency on any other Vela crate.
+[dependencies]
+thiserror.workspace = true
+tracing.workspace = true
+prost = "0.13.4"
+tonic = "0.12.3"
+
+[build-dependencies]
+tonic-build = "0.12.3"
+protoc-bin-vendored = "3.2.0"

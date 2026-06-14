@@ -1,0 +1,26 @@
+[package]
+name = "vela-client"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# Dependency edges point inward only: vela-client -> vela-proto. The client owns
+# leader routing and connection management; it deliberately does NOT depend on
+# vela-core (that would invert the dependency direction), so it reimplements a
+# small client-side partition router rather than reusing core's.
+[dependencies]
+vela-proto.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tokio = { version = "1.43.0", features = ["rt", "rt-multi-thread", "sync", "time", "macros"] }
+tonic = "0.12.3"
+# Used to decode the typed `VelaError` carried in a `tonic::Status`'s details so
+# the redirection-retry layer can read the `NotLeader` code and leader hint
+# (task 16.2). Pinned to the same version vela-proto generates against.
+prost = "0.13.4"
+
+[dev-dependencies]
+tokio = { version = "1.43.0", features = ["rt", "macros", "test-util"] }
+proptest.workspace = true

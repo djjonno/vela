@@ -1,0 +1,101 @@
+# Local multi-node Vela cluster (Requirements 14.2, 14.3, 14.5).
+#
+# Brings up four `velad` nodes wired into a single cluster. Every node is built
+# from the root Dockerfile and configured entirely through the environment
+# variables that `crates/vela-server/src/config.rs` parses:
+#
+#   VELA_NODE_ID            stable identity of the node
+#   VELA_LISTEN_ADDR        address the gRPC listener binds on (in-container)
+#   VELA_PEERS              comma-separated host:port list of the OTHER nodes
+#   VELA_REPLICATION_FACTOR replicas per partition (Raft group size)
+#
+# Each service joins the Compose default network, so nodes resolve one another
+# by service name (node1..node4) via Docker DNS. Every node's peer list points
+# at the other three, so on startup each node discovers all other configured
+# nodes as cluster members (Req 14.3), enabling produce/consume on topics
+# created against the running cluster (Req 14.5).
+#
+# Container port 7001 is mapped to a distinct host port per node (7001..7004)
+# so a local client or `vela-ctl` can reach any individual node.
+#
+# Usage:
+#   docker compose up --build
+
+name: vela
+
+services:
+  node1:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: vela/velad
+    container_name: vela-node1
+    hostname: node1
+    environment:
+      VELA_NODE_ID: node1
+      VELA_LISTEN_ADDR: 0.0.0.0:7001
+      VELA_PEERS: node2:7001,node3:7001,node4:7001
+      VELA_REPLICATION_FACTOR: "3"
+    ports:
+      - "7001:7001"
+    networks:
+      - vela
+    restart: unless-stopped
+
+  node2:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: vela/velad
+    container_name: vela-node2
+    hostname: node2
+    environment:
+      VELA_NODE_ID: node2
+      VELA_LISTEN_ADDR: 0.0.0.0:7001
+      VELA_PEERS: node1:7001,node3:7001,node4:7001
+      VELA_REPLICATION_FACTOR: "3"
+    ports:
+      - "7002:7001"
+    networks:
+      - vela
+    restart: unless-stopped
+
+  node3:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: vela/velad
+    container_name: vela-node3
+    hostname: node3
+    environment:
+      VELA_NODE_ID: node3
+      VELA_LISTEN_ADDR: 0.0.0.0:7001
+      VELA_PEERS: node1:7001,node2:7001,node4:7001
+      VELA_REPLICATION_FACTOR: "3"
+    ports:
+      - "7003:7001"
+    networks:
+      - vela
+    restart: unless-stopped
+
+  node4:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: vela/velad
+    container_name: vela-node4
+    hostname: node4
+    environment:
+      VELA_NODE_ID: node4
+      VELA_LISTEN_ADDR: 0.0.0.0:7001
+      VELA_PEERS: node1:7001,node2:7001,node3:7001
+      VELA_REPLICATION_FACTOR: "3"
+    ports:
+      - "7004:7001"
+    networks:
+      - vela
+    restart: unless-stopped
+
+networks:
+  vela:
+    driver: bridge

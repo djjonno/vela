@@ -1,0 +1,33 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/vela-log",
+    "crates/vela-raft",
+    "crates/vela-proto",
+    "crates/vela-core",
+    "crates/vela-server",
+    "crates/vela-client",
+    "crates/vela-ctl",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.82"
+license = "Apache-2.0"
+repository = "https://github.com/djjonno/vela"
+
+[workspace.dependencies]
+# Internal crates (path deps; dependency edges point inward only).
+vela-log = { path = "crates/vela-log" }
+vela-raft = { path = "crates/vela-raft" }
+vela-proto = { path = "crates/vela-proto" }
+vela-core = { path = "crates/vela-core" }
+vela-client = { path = "crates/vela-client" }
+
+# Shared third-party dependencies with explicit versions.
+thiserror = "1.0.69"
+tracing = "0.1.41"
+
+# Dev-only shared dependencies.
+proptest = "1.5.0"

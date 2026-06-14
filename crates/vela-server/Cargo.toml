@@ -1,0 +1,50 @@
+[package]
+name = "vela-server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# The node daemon library, plus the `velad` binary.
+[lib]
+name = "vela_server"
+path = "src/lib.rs"
+
+[[bin]]
+name = "velad"
+path = "src/main.rs"
+
+# Dependency edges point inward only: vela-server -> vela-core, vela-raft,
+# vela-proto. The direct `vela-raft` edge lets the server name the consensus
+# trait seams (`Transport`, `Clock`, `RaftInput`, `RaftMessage`, ...) it must
+# bridge onto gRPC; it is still an inward dependency (server is the outermost
+# layer).
+[dependencies]
+vela-core.workspace = true
+vela-raft.workspace = true
+# `vela-log` is depended on only so the gRPC boundary can name `LogError` and
+# give the storage-error family its own typed `VelaError` mapping (task 14.5).
+# This is still an inward edge (server is the outermost layer).
+vela-log.workspace = true
+vela-proto.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+# CLI parsing (with derive + env-var support) and structured-log subscriber for
+# the `velad` daemon (Requirement 14.4, 15.1-15.3).
+clap = { version = "4.5.21", features = ["derive", "env"] }
+tracing-subscriber = { version = "0.3.19", features = ["env-filter", "fmt"] }
+
+# Async runtime, gRPC transport, and protobuf codec for the node daemon
+# (Requirement 12.2, 12.3, 15.1). Versions match `vela-proto`'s tonic/prost.
+tokio = { version = "1.41.1", features = ["rt-multi-thread", "macros", "time", "sync", "net"] }
+tonic = "0.12.3"
+prost = "0.13.4"
+bytes = "1.8.0"
+
+[dev-dependencies]
+# Property-based tests for the gRPC-boundary conversions (e.g. typed-error
+# round-tripping, Property 39 / Requirement 12.4) and the membership
+# availability state machine (Property 37, task 14.4).
+proptest.workspace = true

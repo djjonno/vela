@@ -1,0 +1,47 @@
+[package]
+name = "vela-ctl"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# Produces the `vela-ctl` binary.
+[[bin]]
+name = "vela-ctl"
+path = "src/main.rs"
+
+# Dependency edges point inward only: vela-ctl -> vela-client, vela-proto.
+[dependencies]
+vela-client.workspace = true
+vela-proto.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+# CLI argument parsing (derive API) with env-var support for the endpoint flag.
+clap = { version = "4.5.23", features = ["derive", "env"] }
+# Async runtime: admin calls are async, and the 5 s connection-failure bound is a
+# `tokio::time::timeout` around each operation.
+tokio = { version = "1.43.0", features = ["rt-multi-thread", "macros", "time"] }
+# Used only to classify a transport-level `Unavailable` status as a connection
+# error (Requirement 13.6); pinned to match the version vela-client/vela-proto use.
+tonic = "0.12.3"
+
+[dev-dependencies]
+# `test-util` enables the paused-clock helpers used to exercise the 5 s
+# connection-failure timeout deterministically (no real waiting); `rt-multi-thread`
+# and `net` let the example tests run an in-process fake gRPC server on a
+# background task while the CLI drives it (task 17.2).
+tokio = { version = "1.43.0", features = [
+    "rt",
+    "rt-multi-thread",
+    "macros",
+    "time",
+    "net",
+    "test-util",
+] }
+# The fake server implements the `VelaClient` gRPC service from `vela-proto` and
+# is served over `tonic::transport`; `tokio-stream` adapts the bound
+# `TcpListener` into the incoming stream tonic serves, so the port is chosen by
+# the OS and known before the CLI connects (no readiness race).
+vela-proto.workspace = true
+tokio-stream = { version = "0.1.17", features = ["net"] }

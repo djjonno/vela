@@ -1,0 +1,17 @@
+[package]
+name = "vela-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# Dependency edges point inward only: vela-core -> vela-raft, vela-log.
+[dependencies]
+vela-raft.workspace = true
+vela-log.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true

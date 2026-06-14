@@ -1,0 +1,354 @@
+syntax = "proto3";
+
+// All Vela wire message types live in this single proto package, owned by the
+// `vela-proto` crate (Requirement 12.1). gRPC service surfaces (`VelaClient`,
+// `VelaPeer`) are added in task 2.2; this file defines the message types they
+// will use and is laid out so those services can be appended without churn.
+package vela.v1;
+
+// ---------------------------------------------------------------------------
+// Records and log entries (Requirements 4, 6, 8)
+// ---------------------------------------------------------------------------
+
+// A single event entry produced to and consumed from a partition. Key and value
+// are opaque bytes; the combined payload must not exceed 1 MiB (Requirement 4.8,
+// enforced above the wire layer).
+message Record {
+  // Optional partition key / record key. Absent when produced without a key.
+  optional bytes key = 1;
+  bytes value = 2;
+}
+
+// A leader's no-op marker entry, appended on election (extended Raft paper, §8).
+message Noop {}
+
+// The payload carried by a single log entry. Exactly one variant is set.
+message EntryPayload {
+  oneof kind {
+    Record record = 1;          // a produced event record
+    Noop noop = 2;              // leader no-op on election
+    ClusterCommand cluster = 3; // a replicated cluster-metadata mutation
+  }
+}
+
+// A single element of a partition log: a Raft term, a 0-based index, and a
+// payload (Requirement 6, 8). Indices are 0-based.
+message LogEntry {
+  uint64 index = 1;
+  uint64 term = 2;
+  EntryPayload payload = 3;
+}
+
+// ---------------------------------------------------------------------------
+// Raft RPCs (Requirements 7, 8, 12.3)
+//
+// Every partition-scoped RPC carries (topic, partition) so a single server-to-
+// server channel multiplexes the many per-partition Raft groups two nodes
+// co-host. Optional log-position fields are absent when the log is empty.
+// ---------------------------------------------------------------------------
+
+// RequestVote RPC: a candidate solicits a vote (Requirement 7.3, 7.7, 7.8).
+message RequestVoteRequest {
+  string topic = 1;
+  uint32 partition = 2;
+  uint64 term = 3;
+  string candidate_id = 4;
+  optional uint64 last_log_index = 5;
+  optional uint64 last_log_term = 6;
+}
+
+// Reply to a RequestVote RPC (Requirement 7.7, 7.8).
+message RequestVoteReply {
+  uint64 term = 1;
+  bool vote_granted = 2;
+}
+
+// AppendEntries RPC: a leader replicates entries and sends heartbeats. Carries
+// at most 256 entries per RPC (Requirement 8.1); an empty `entries` list is a
+// heartbeat (Requirement 7.6).
+message AppendEntriesRequest {
+  string topic = 1;
+  uint32 partition = 2;
+  uint64 term = 3;
+  string leader_id = 4;
+  optional uint64 prev_log_index = 5;
+  optional uint64 prev_log_term = 6;
+  repeated LogEntry entries = 7;
+  optional uint64 leader_commit = 8;
+}
+
+// Reply to an AppendEntries RPC. `conflict_hint` lets a leader back up
+// `next_index` after a rejection (Requirement 8.3).
+message AppendEntriesReply {
+  uint64 term = 1;
+  bool success = 2;
+  optional uint64 conflict_hint = 3;
+}
+
+// ---------------------------------------------------------------------------
+// Produce / Consume client messages (Requirements 4, 5)
+// ---------------------------------------------------------------------------
+
+// Produce a single record to a resolved (topic, partition). Partition routing
+// happens client-side before dispatch (Requirement 4.1, 4.2).
+message ProduceRequest {
+  string topic = 1;
+  uint32 partition = 2;
+  Record record = 3;
+}
+
+// Successful produce result: the assigned 0-based committed offset
+// (Requirement 4.4, 4.7).
+message ProduceResponse {
+  uint64 offset = 1;
+}
+
+// Consume committed records from a partition starting at `offset`. `max_count`
+// is bounded 1..=10000; absent means the default of 500 (Requirement 5.5, 5.6).
+message ConsumeRequest {
+  string topic = 1;
+  uint32 partition = 2;
+  uint64 offset = 3;
+  optional uint32 max_count = 4;
+}
+
+// A consumed record paired with its committed offset.
+message ConsumedRecord {
+  uint64 offset = 1;
+  Record record = 2;
+}
+
+// Committed records in strictly ascending offset order plus the next offset to
+// request (Requirement 5.1, 5.2).
+message ConsumeResponse {
+  repeated ConsumedRecord records = 1;
+  uint64 next_offset = 2;
+}
+
+// ---------------------------------------------------------------------------
+// Topic-admin messages (Requirements 2, 3, 10, 13)
+// ---------------------------------------------------------------------------
+
+// Per-node availability state: exactly one of available or unavailable
+// (Requirement 9.3).
+enum NodeAvailability {
+  NODE_AVAILABILITY_UNSPECIFIED = 0;
+  NODE_AVAILABILITY_AVAILABLE = 1;
+  NODE_AVAILABILITY_UNAVAILABLE = 2;
+}
+
+// A cluster member node: its identity, transport address, and availability
+// (Requirement 9.3).
+message Member {
+  string id = 1;
+  string addr = 2;
+  NodeAvailability availability = 3;
+}
+
+// The replica assignment and current leader for one partition (Requirement 2.3,
+// 10.1, 10.4). `leader` is absent while an election is in progress.
+message PartitionInfo {
+  uint32 index = 1;
+  repeated string replicas = 2; // distinct member node ids
+  optional string leader = 3;   // current leader node id, if any
+}
+
+// A topic and its partitions as known to cluster metadata (Requirement 13.3,
+// 13.4).
+message TopicInfo {
+  string name = 1;
+  uint32 partition_count = 2;
+  repeated PartitionInfo partitions = 3;
+}
+
+// Create a topic with a name and partition count (Requirement 2.1, 13.1).
+message CreateTopicRequest {
+  string name = 1;
+  uint32 partitions = 2;
+}
+
+message CreateTopicResponse {
+  TopicInfo topic = 1;
+}
+
+// Delete an existing topic (Requirement 3.1, 13.2).
+message DeleteTopicRequest {
+  string name = 1;
+}
+
+message DeleteTopicResponse {}
+
+// List all topics known to cluster metadata (Requirement 13.3).
+message ListTopicsRequest {}
+
+message ListTopicsResponse {
+  repeated TopicInfo topics = 1;
+}
+
+// Describe a single topic's partitions and leaders (Requirement 13.4).
+message DescribeTopicRequest {
+  string name = 1;
+}
+
+message DescribeTopicResponse {
+  TopicInfo topic = 1;
+}
+
+// Resolve the current leader of a partition (Requirement 10.4, 11.1).
+message FindLeaderRequest {
+  string topic = 1;
+  uint32 partition = 2;
+}
+
+message FindLeaderResponse {
+  optional string leader = 1; // absent if no leader is currently elected
+}
+
+// ---------------------------------------------------------------------------
+// Cluster metadata, commands, and propagation (Requirements 2.8, 3.1, 3.5, 9)
+// ---------------------------------------------------------------------------
+
+// A replicated cluster-metadata mutation, committed through the dedicated
+// metadata Raft group (design "Cluster Metadata Management"). Exactly one
+// variant is set.
+message ClusterCommand {
+  oneof command {
+    CreateTopicCommand create_topic = 1;
+    DeleteTopicCommand delete_topic = 2;
+    SetAvailabilityCommand set_availability = 3;
+  }
+}
+
+message CreateTopicCommand {
+  string name = 1;
+  repeated PartitionInfo partitions = 2;
+}
+
+message DeleteTopicCommand {
+  string name = 1;
+}
+
+message SetAvailabilityCommand {
+  string node = 1;
+  NodeAvailability availability = 2;
+}
+
+// The full cluster metadata snapshot, carrying an epoch bumped on each committed
+// metadata change (Requirement 9.3, design).
+message ClusterMetadata {
+  repeated Member members = 1;
+  repeated TopicInfo topics = 2;
+  uint64 epoch = 3;
+}
+
+// Membership heartbeat exchanged between nodes (Requirement 9.4, 9.5).
+message HeartbeatRequest {
+  string node_id = 1;
+}
+
+message HeartbeatReply {
+  string node_id = 1;
+}
+
+// Push updated cluster metadata to a node; the reply acknowledges the epoch
+// applied (Requirement 2.8, 3.5, 3.6).
+message SyncMetadataRequest {
+  ClusterMetadata metadata = 1;
+}
+
+message SyncMetadataReply {
+  uint64 epoch = 1;
+}
+
+// ---------------------------------------------------------------------------
+// Shared typed error (Requirements 11.2, 12.4)
+// ---------------------------------------------------------------------------
+
+// Classification of a failure returned across both gRPC services. Mirrors the
+// error taxonomy in the design (validation, not-found, conflict/state,
+// leadership, timeout, propagation).
+enum ErrorCode {
+  ERROR_CODE_UNSPECIFIED = 0;
+  ERROR_CODE_VALIDATION = 1;            // invalid request parameters
+  ERROR_CODE_TOPIC_NOT_FOUND = 2;       // unknown topic
+  ERROR_CODE_PARTITION_NOT_FOUND = 3;   // unknown partition
+  ERROR_CODE_TOPIC_EXISTS = 4;          // duplicate topic name
+  ERROR_CODE_TOPIC_DELETING = 5;        // topic is being deleted
+  ERROR_CODE_NOT_LEADER = 6;            // request hit a non-leader; see `leader`
+  ERROR_CODE_PARTITION_UNAVAILABLE = 7; // no elected leader
+  ERROR_CODE_INSUFFICIENT_NODES = 8;    // fewer nodes than replication factor
+  ERROR_CODE_PAYLOAD_TOO_LARGE = 9;     // record payload exceeds 1 MiB
+  ERROR_CODE_COMMIT_TIMEOUT = 10;       // not committed within the commit timeout
+  ERROR_CODE_PROPAGATION_TIMEOUT = 11;  // metadata not acked by all nodes in time
+  ERROR_CODE_INTERNAL = 12;             // unexpected internal failure
+}
+
+// The shared typed error: a classification code, a human-readable message, and
+// an optional leader hint used for `NotLeader` redirection (Requirement 4.6,
+// 11.2, 12.4).
+message VelaError {
+  ErrorCode code = 1;
+  string message = 2;
+  optional string leader = 3; // current leader node id, when known
+}
+
+// ---------------------------------------------------------------------------
+// gRPC services (Requirements 12.2, 12.3)
+//
+// Two services split the wire surface by audience. Client-facing produce,
+// consume, and topic-admin operations live on `VelaClient`; server-to-server
+// Raft, membership, and metadata-propagation RPCs live on `VelaPeer`. Every
+// partition-scoped RPC carries (topic, partition) in its request message so a
+// single channel multiplexes the many per-partition Raft groups two nodes
+// co-host.
+// ---------------------------------------------------------------------------
+
+// Client-to-server API: producing and consuming Records and administering
+// Topics (Requirement 12.2). The partition-scoped RPCs (`Produce`, `Consume`,
+// `FindLeader`) carry (topic, partition) in their requests; the topic-admin
+// RPCs operate on whole topics.
+service VelaClient {
+  // Append a single Record to a (topic, partition); returns the committed
+  // offset (Requirement 4).
+  rpc Produce(ProduceRequest) returns (ProduceResponse);
+
+  // Read committed Records from a (topic, partition) starting at an offset
+  // (Requirement 5).
+  rpc Consume(ConsumeRequest) returns (ConsumeResponse);
+
+  // Create a Topic with a name and partition count (Requirement 2).
+  rpc CreateTopic(CreateTopicRequest) returns (CreateTopicResponse);
+
+  // Delete an existing Topic and all its partitions (Requirement 3).
+  rpc DeleteTopic(DeleteTopicRequest) returns (DeleteTopicResponse);
+
+  // List all Topics known to cluster metadata (Requirement 13.3).
+  rpc ListTopics(ListTopicsRequest) returns (ListTopicsResponse);
+
+  // Describe a single Topic's partitions and leaders (Requirement 13.4).
+  rpc DescribeTopic(DescribeTopicRequest) returns (DescribeTopicResponse);
+
+  // Resolve the current leader of a (topic, partition) (Requirement 10.4,
+  // 11.1).
+  rpc FindLeader(FindLeaderRequest) returns (FindLeaderResponse);
+}
+
+// Server-to-server API: per-partition Raft RPCs plus membership and metadata
+// propagation (Requirement 12.3). `AppendEntries` and `RequestVote` carry
+// (topic, partition) so a single channel multiplexes every co-hosted Raft
+// group.
+service VelaPeer {
+  // Replicate log entries / send heartbeats for a partition's Raft group
+  // (Requirement 8).
+  rpc AppendEntries(AppendEntriesRequest) returns (AppendEntriesReply);
+
+  // Solicit a vote for a partition's Raft group (Requirement 7).
+  rpc RequestVote(RequestVoteRequest) returns (RequestVoteReply);
+
+  // Membership liveness heartbeat between nodes (Requirement 9.4, 9.5).
+  rpc Heartbeat(HeartbeatRequest) returns (HeartbeatReply);
+
+  // Push updated cluster metadata to a node and observe the applied epoch
+  // (Requirement 2.8, 3.5, 3.6).
+  rpc SyncMetadata(SyncMetadataRequest) returns (SyncMetadataReply);
+}

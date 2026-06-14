@@ -1,0 +1,12 @@
+# Keep the Docker build context small and reproducible: never ship host build
+# artifacts, VCS, editor, or mutation-testing output into the image.
+target/
+**/target/
+mutants.out*/
+.git/
+.vscode/
+.DS_Store
+Dockerfile
+.dockerignore
+docker-compose.yml
+.kiro/
