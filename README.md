@@ -4,30 +4,34 @@
 Rust. It stores ordered event streams across a cluster and (soon) runs stream
 processors *inside that same cluster* — no separate compute tier required.
 
-Vela is a ground-up Rust re-implementation and evolution of
-[kerala](https://github.com/djjonno/kerala).
-
 - **Produce / Consume** — create topics, then produce and consume event records.
 - **Distribute** — topics are partitioned, and partitions are balanced across the
   cluster.
 - **Process** *(planned)* — run sandboxed processors that transform or aggregate
   events and project the results into new topics.
 
-## Why Vela
+## Vision
 
-**Distributed consensus, not a single leader.** Kerala runs one Raft group for the
-whole cluster, so a single node is the leader for everything. Vela runs **one Raft
-group per topic partition**, spreading leadership and write load across every node.
+Vela aims to be a better Kafka: the throughput and durability you expect from a
+modern event log, without the operational weight and the separate processing tier.
 
-**Processing where the data lives.** Unlike Kafka + Flink, where stream processing
-runs on separate compute, Vela aims to process data on the same nodes that store it:
+**No single write bottleneck.** Many systems concentrate coordination on one leader.
+Vela runs **one Raft group per topic partition**, so leadership and write load spread
+across every node in the cluster and scale horizontally as you add partitions.
+
+**Processing where the data lives.** Today, stream processing typically runs on a
+separate compute tier (think Kafka + Flink), shuttling data across the network to be
+processed. Vela aims to process data on the same nodes that store it:
 
 - Processor input is **node-local** — a node processes the partitions it already
   holds, avoiding cross-node data movement.
 - Processor code is **replicated data on a topic**, so processing is fully
   **replayable** and any node holding a partition can run it.
-- The processing language is [ark-lang](https://github.com/djjonno/ark-lang), an
-  interpreted language executed in a sandbox.
+- Processors run in a **sandbox**, isolated from the node and from each other.
+
+**One platform, fewer moving parts.** Storage, consensus, and (soon) processing live
+in a single cluster you can run locally with one command, instead of stitching
+together a broker, a coordinator, and a stream-processing framework.
 
 ## Architecture
 
@@ -39,8 +43,9 @@ runs on separate compute, Vela aims to process data on the same nodes that store
 | **Log**       | The append-only ordered entries for a partition (in-memory for now).        |
 | **Node**      | A cluster member hosting partition replicas and (later) processors.         |
 
-Consensus uses an **in-house Raft implementation**. Persistence is **in-memory for
-now** — durable storage is a planned follow-up.
+Consensus uses an **in-house Raft implementation**, run **per partition** rather than
+once per cluster. Persistence is **in-memory for now** — durable storage is a planned
+follow-up.
 
 ## Project Layout
 
@@ -100,8 +105,8 @@ cargo mutants                # mutation testing
 1. **Now** — partitioned topics, per-partition Raft consensus, in-memory log,
    produce/consume, local multi-node cluster.
 2. **Next** — durable log persistence.
-3. **Later** — embedded ark-lang stream-processing runtime (code-as-data,
-   node-local execution, replayable).
+3. **Later** — embedded stream-processing runtime (code-as-data, node-local
+   execution, replayable).
 
 ## License
 
