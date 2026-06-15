@@ -13,6 +13,10 @@
 
 use thiserror::Error;
 
+mod wal;
+
+pub use wal::{DurableWal, RealClock, RealFileSystem, SyncPolicy, WalConfig};
+
 /// The kind of payload carried by a [`LogEntry`].
 ///
 /// `vela-log` stays free of domain types: a payload is opaque bytes plus this
@@ -82,7 +86,11 @@ pub struct Snapshot {
 }
 
 /// Errors returned by [`LogStorage`] operations.
-#[derive(Debug, Error, PartialEq, Eq)]
+///
+/// Does not derive `PartialEq`/`Eq`: the [`Io`](LogError::Io) variant carries a
+/// [`std::io::Error`], which is not `PartialEq`. Tests match on variants (e.g.
+/// with `matches!`) rather than comparing error values for equality.
+#[derive(Debug, Error)]
 pub enum LogError {
     /// A commit was requested with an index below the current commit index or
     /// above the highest stored index (Requirement 6.9).
@@ -112,6 +120,54 @@ pub enum LogError {
     /// continuation of the log.
     #[error("append_entries received non-contiguous or out-of-order entries")]
     NonContiguousEntries,
+
+    /// An I/O operation against the durable log's backing storage failed. Used
+    /// only by the durable `LogStorage` implementation (Requirement 10.1).
+    /// `op` names the in-progress operation for diagnosis (Requirement 10.2).
+    #[error("durable log I/O failure during {op}: {source}")]
+    Io {
+        /// Name of the operation that was in progress when the I/O failed.
+        op: &'static str,
+        /// The underlying I/O error.
+        #[source]
+        source: std::io::Error,
+    },
+
+    /// A persisted record frame failed its integrity check during a read or
+    /// recovery (Requirement 10.1). `index` is the absolute index expected at
+    /// the corrupt position, not the corrupt frame's own index field.
+    #[error("log corruption at index {index}: {detail}")]
+    Corruption {
+        /// The absolute index expected at the position where corruption was
+        /// detected.
+        index: u64,
+        /// A short, static description of the corruption.
+        detail: &'static str,
+    },
+
+    /// Compaction was requested with a retained point that would discard an
+    /// uncommitted entry or the entry at the commit index (Requirement 10.1).
+    #[error(
+        "compaction retained point {requested} out of bounds \
+         (commit_index={commit:?}, log_start={log_start})"
+    )]
+    CompactionOutOfBounds {
+        /// The retained point that was requested.
+        requested: u64,
+        /// The commit index at the time of the request.
+        commit: CommitIndex,
+        /// The log start index at the time of the request.
+        log_start: u64,
+    },
+
+    /// The durable log was opened with an invalid configuration
+    /// (Requirement 10.1). Kept distinct from [`Io`](LogError::Io) so that
+    /// configuration validation is not conflated with real I/O failures.
+    #[error("invalid WAL configuration: {detail}")]
+    Config {
+        /// A description of what was invalid about the configuration.
+        detail: String,
+    },
 }
 
 /// The storage seam behind which a partition's append-only log lives.
@@ -164,6 +220,17 @@ pub trait LogStorage {
     /// Produce a [`Snapshot`] of the committed log state up to the commit
     /// index (Requirement 6.12).
     fn snapshot(&self) -> Snapshot;
+
+    /// Force all buffered record frames to stable storage (Requirement 4.8).
+    ///
+    /// Additive seam for a future group-commit-before-acknowledge path. The
+    /// default is a successful no-op, which is correct for non-durable
+    /// implementations such as [`InMemoryLog`] that never buffer writes
+    /// (Requirement 4.9); the durable implementation overrides it to fsync and
+    /// returns [`LogError::Io`] if the force fails.
+    fn flush(&mut self) -> Result<(), LogError> {
+        Ok(())
+    }
 }
 
 /// In-memory implementation of [`LogStorage`] for this milestone
@@ -464,10 +531,10 @@ mod tests {
             term: 2,
             payload: payload(5),
         }];
-        assert_eq!(
+        assert!(matches!(
             log.append_entries(&gap),
             Err(LogError::NonContiguousEntries)
-        );
+        ));
 
         // Overwriting a committed entry is rejected.
         log.commit(1).unwrap();
@@ -476,9 +543,9 @@ mod tests {
             term: 3,
             payload: payload(7),
         }];
-        assert_eq!(
+        assert!(matches!(
             log.append_entries(&clobber),
             Err(LogError::NonContiguousEntries)
-        );
+        ));
     }
 }

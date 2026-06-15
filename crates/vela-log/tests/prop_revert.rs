@@ -108,16 +108,23 @@ proptest! {
         if below_commit {
             // 6.11: a revert below the commit index is rejected with
             // RevertBelowCommit and leaves both entries and commit unchanged.
-            prop_assert_eq!(
-                result,
-                Err(LogError::RevertBelowCommit {
-                    requested: idx,
-                    commit: commit_before,
-                }),
-                "expected revert({}) below commit {:?} to be rejected",
-                idx,
-                commit_before
-            );
+            // `LogError` no longer derives `PartialEq` (its durable `Io` variant
+            // wraps a non-`PartialEq` `std::io::Error`), so match on the variant
+            // and assert its fields directly.
+            match &result {
+                Err(LogError::RevertBelowCommit { requested, commit }) => {
+                    prop_assert_eq!(*requested, idx);
+                    prop_assert_eq!(*commit, commit_before);
+                }
+                other => prop_assert!(
+                    false,
+                    "expected revert({}) below commit {:?} to be rejected with \
+                     RevertBelowCommit, got {:?}",
+                    idx,
+                    commit_before,
+                    other
+                ),
+            }
             prop_assert_eq!(
                 log.commit_index(),
                 commit_before,

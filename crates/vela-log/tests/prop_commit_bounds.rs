@@ -123,17 +123,27 @@ proptest! {
             );
         } else {
             // 6.9: an out-of-bounds commit is rejected with CommitOutOfBounds and
-            // leaves the commit index unchanged.
-            prop_assert_eq!(
-                result,
+            // leaves the commit index unchanged. `LogError` no longer derives
+            // `PartialEq` (its durable `Io` variant wraps a non-`PartialEq`
+            // `std::io::Error`), so match on the variant and assert its fields.
+            match &result {
                 Err(LogError::CommitOutOfBounds {
-                    requested: idx,
-                    current: commit_before,
-                    last: last_index,
-                }),
-                "expected commit({}) to be rejected as out of bounds",
-                idx
-            );
+                    requested,
+                    current,
+                    last,
+                }) => {
+                    prop_assert_eq!(*requested, idx);
+                    prop_assert_eq!(*current, commit_before);
+                    prop_assert_eq!(*last, last_index);
+                }
+                other => prop_assert!(
+                    false,
+                    "expected commit({}) to be rejected as out of bounds with \
+                     CommitOutOfBounds, got {:?}",
+                    idx,
+                    other
+                ),
+            }
             prop_assert_eq!(
                 log.commit_index(),
                 commit_before,
