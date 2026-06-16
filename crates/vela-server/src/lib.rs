@@ -16,6 +16,7 @@ mod clock;
 mod driver;
 pub mod membership;
 mod node;
+mod paths;
 mod registry;
 mod service;
 mod transport;
@@ -93,7 +94,7 @@ pub type ServeError = Box<dyn std::error::Error + Send + Sync>;
 /// same state.
 pub async fn serve(config: Config) -> Result<(), ServeError> {
     let addr: SocketAddr = config.listen_addr;
-    let node = NodeShared::new(&config);
+    let node = NodeShared::new(&config)?;
 
     let client = VelaClientServer::new(VelaClientService::new(node.clone()));
     let peer = VelaPeerServer::new(VelaPeerService::new(node.clone()));
@@ -168,6 +169,7 @@ mod tests {
             listen_addr: Some("127.0.0.1:7001".to_string()),
             peers: vec!["node-b:7001".to_string()],
             replication_factor: Some("3".to_string()),
+            data_dir: Some("/var/lib/vela".to_string()),
         }
     }
 

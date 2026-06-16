@@ -310,6 +310,7 @@ mod tests {
                     durable_last: ack,
                     durable_segment,
                     durable_offset,
+                    ..ManifestState::default()
                 },
             )
             .unwrap();
@@ -590,6 +591,7 @@ mod tests {
             durable_last: Some(4),
             durable_segment: last.0,
             durable_offset: last.1 + last.2 as u64,
+            ..ManifestState::default()
         };
         let recovered = replay(&fs, &cfg(SyncPolicy::Always), &state).unwrap();
         // Indices below log_start are skipped; the retained range is 2..=4.

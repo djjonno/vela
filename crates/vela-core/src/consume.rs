@@ -195,6 +195,7 @@ mod tests {
                 name: name.to_string(),
                 partitions,
                 state: TopicState::Active,
+                backend: crate::model::LogBackend::Durable,
             },
         );
         meta

@@ -35,7 +35,9 @@
 //! genuinely broken node fails the test promptly rather than hanging.
 
 use std::net::SocketAddr;
-use std::time::Duration;
+use std::process;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tonic::transport::Channel;
 
@@ -44,6 +46,30 @@ use vela_server::{serve, CliArgs, Config};
 use vela_proto::v1;
 use vela_proto::v1::vela_client_client::VelaClientClient;
 use vela_proto::v1::vela_peer_client::VelaPeerClient;
+
+/// Monotonic counter making per-test data directories unique within a process.
+static DATA_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// A unique, writable data directory under the system temp directory for one
+/// test node.
+///
+/// Topics default to the Durable backend, so creating a topic opens a real
+/// `DurableWal` under the node's data directory; rooting that beneath a unique
+/// temp directory lets the smoke test drive a genuine durable produce/consume
+/// round-trip without depending on a fixed, possibly-unwritable location. The
+/// directory is created lazily by the WAL; cleanup is left to the OS temp reaper
+/// because the spawned server task outlives the test and holds it open.
+fn unique_data_dir() -> String {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock should be after the unix epoch")
+        .as_nanos();
+    let n = DATA_DIR_COUNTER.fetch_add(1, Ordering::Relaxed);
+    std::env::temp_dir()
+        .join(format!("vela-server-smoke-{}-{n}-{nanos}", process::id()))
+        .to_string_lossy()
+        .into_owned()
+}
 
 /// Reserve a free localhost port by binding (then dropping) an ephemeral
 /// listener, returning the address the server should bind. Mirrors the helper
@@ -64,6 +90,7 @@ fn config(node_id: &str, addr: SocketAddr, peers: &[&str], rf: u32) -> Config {
         listen_addr: Some(addr.to_string()),
         peers: peers.iter().map(|p| p.to_string()).collect(),
         replication_factor: Some(rf.to_string()),
+        data_dir: Some(unique_data_dir()),
     })
     .expect("valid test configuration")
 }
@@ -155,6 +182,7 @@ async fn single_node_cluster_elects_then_produces_and_consumes_end_to_end() {
         .create_topic(v1::CreateTopicRequest {
             name: "smoke".to_string(),
             partitions: 1,
+            log_backend: v1::LogBackend::Unspecified as i32,
         })
         .await
         .expect("create_topic succeeds")
@@ -296,6 +324,7 @@ async fn two_node_cluster_peers_are_reachable_for_discovery() {
         .create_topic(v1::CreateTopicRequest {
             name: "peered".to_string(),
             partitions: 1,
+            log_backend: v1::LogBackend::Unspecified as i32,
         })
         .await
         .expect("create_topic succeeds while peered");

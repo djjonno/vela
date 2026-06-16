@@ -29,10 +29,11 @@
 
 use std::collections::HashMap;
 
-use vela_log::{InMemoryLog, LogEntry, PayloadKind};
+use vela_log::{InMemoryLog, LogEntry, LogStorage, PayloadKind};
 use vela_raft::{Clock, NodeId as RaftNodeId, RaftInput, RaftNode, RaftOutput, Role};
 
 use crate::model::{Offset, PartitionIndex};
+use crate::partition_log::PartitionLog;
 
 /// The key identifying one partition's Raft group within a [`RaftGroupFleet`]:
 /// the topic name paired with the partition index (Requirement 7.1).
@@ -149,8 +150,12 @@ impl StateMachine {
     }
 }
 
-/// One partition replica hosted on this node: a [`RaftNode`] over an
-/// [`InMemoryLog`] paired with the partition's [`StateMachine`].
+/// One partition replica hosted on this node: a [`RaftNode`] over a
+/// [`PartitionLog`] paired with the partition's [`StateMachine`].
+///
+/// The log is injected at construction rather than hardcoded, so a replica can
+/// be built over either backend the [`PartitionLog`] enum holds — durable or
+/// in-memory — without `PartitionReplica` knowing which (Requirement 5.2).
 ///
 /// Consensus and partition state are kept together so that committing entries
 /// and assigning offsets cannot drift apart: [`PartitionReplica::step`] drives
@@ -159,20 +164,56 @@ impl StateMachine {
 /// commit (Requirement 4.7, 8.8).
 pub struct PartitionReplica {
     /// The consensus state machine for this partition replica.
-    raft: RaftNode<InMemoryLog>,
+    raft: RaftNode<PartitionLog>,
     /// The partition state machine fed by committed entries.
     state: StateMachine,
 }
 
 impl PartitionReplica {
-    /// Create a follower replica for a fresh partition Raft group: a
-    /// [`RaftNode`] with the given identity and peer set over a new in-memory
-    /// log, plus an empty [`StateMachine`].
-    pub fn new(node_id: RaftNodeId, peers: Vec<RaftNodeId>) -> Self {
+    /// Create a follower replica for a fresh partition Raft group over the
+    /// injected `log`: a [`RaftNode`] with the given identity and peer set built
+    /// on `log`, plus an empty [`StateMachine`] (Requirement 5.2, 13.2).
+    ///
+    /// This is the construction path the server uses once it has selected and
+    /// built the topic's backend; for a fresh log no entries are committed yet,
+    /// so the state machine starts empty.
+    pub fn with_log(node_id: RaftNodeId, peers: Vec<RaftNodeId>, log: PartitionLog) -> Self {
         Self {
-            raft: RaftNode::new(node_id, peers, InMemoryLog::new()),
+            raft: RaftNode::new(node_id, peers, log),
             state: StateMachine::new(),
         }
+    }
+
+    /// Recover a replica from an injected, already-opened `log`, restoring the
+    /// partition state machine from the log's recovered committed prefix
+    /// (Requirement 11.1, 11.2, 11.3).
+    ///
+    /// [`RaftNode::recover`] restores `current_term`/`voted_for` from the log's
+    /// hard state and initialises `commit_index` from the recovered log. The
+    /// committed prefix `[0..=commit_index]` is then re-applied to a fresh
+    /// [`StateMachine`] exactly once, in ascending index order, so committed
+    /// records regain the same gap-free offsets they held before the restart.
+    /// `read` clamps to the log's retained range, so it yields exactly the
+    /// committed prefix. A fresh/empty log has no commit index, so this is
+    /// identical to [`PartitionReplica::with_log`] (an empty state machine).
+    pub fn recover(node_id: RaftNodeId, peers: Vec<RaftNodeId>, log: PartitionLog) -> Self {
+        let raft = RaftNode::recover(node_id, peers, log);
+        let mut state = StateMachine::new();
+        if let Some(commit) = raft.commit_index() {
+            let entries = raft.log().read(0, commit);
+            state.apply_committed(&entries);
+        }
+        Self { raft, state }
+    }
+
+    /// Create a follower replica for a fresh partition Raft group backed by a
+    /// new in-memory log, plus an empty [`StateMachine`].
+    ///
+    /// A thin shim over [`PartitionReplica::with_log`] with an
+    /// [`InMemoryLog`]-backed [`PartitionLog`], retained so existing call sites
+    /// and tests that do not select a backend compile unchanged.
+    pub fn new(node_id: RaftNodeId, peers: Vec<RaftNodeId>) -> Self {
+        Self::with_log(node_id, peers, PartitionLog::InMemory(InMemoryLog::new()))
     }
 
     /// Drive the replica one step with `input`, using `clock` for timing, and
@@ -192,7 +233,7 @@ impl PartitionReplica {
     }
 
     /// Shared, read-only access to the underlying Raft node.
-    pub fn raft(&self) -> &RaftNode<InMemoryLog> {
+    pub fn raft(&self) -> &RaftNode<PartitionLog> {
         &self.raft
     }
 
@@ -271,11 +312,38 @@ impl RaftGroupFleet {
     /// [`FleetError::GroupExists`] and the fleet is left unchanged. On success
     /// the new replica is registered as a follower, ready to be driven via
     /// [`RaftGroupFleet::get_mut`].
+    ///
+    /// A thin shim over [`RaftGroupFleet::create_group_with_log`] that injects a
+    /// fresh in-memory backend, retained so call sites that do not select a
+    /// backend stay unchanged.
     pub fn create_group(
         &mut self,
         key: GroupKey,
         node_id: RaftNodeId,
         peers: Vec<RaftNodeId>,
+    ) -> Result<(), FleetError> {
+        self.create_group_with_log(
+            key,
+            node_id,
+            peers,
+            PartitionLog::InMemory(InMemoryLog::new()),
+        )
+    }
+
+    /// Instantiate the Raft group for one partition over the injected `log`,
+    /// building a fresh replica with [`PartitionReplica::with_log`].
+    ///
+    /// Like [`RaftGroupFleet::create_group`] it enforces exactly one group per
+    /// partition (Requirement 7.1): a duplicate `key` is rejected with
+    /// [`FleetError::GroupExists`] and the fleet is left unchanged. This is the
+    /// path the server takes once it has selected and constructed the topic's
+    /// backend (Requirement 5.2).
+    pub fn create_group_with_log(
+        &mut self,
+        key: GroupKey,
+        node_id: RaftNodeId,
+        peers: Vec<RaftNodeId>,
+        log: PartitionLog,
     ) -> Result<(), FleetError> {
         if self.groups.contains_key(&key) {
             let (topic, partition) = key;
@@ -285,7 +353,37 @@ impl RaftGroupFleet {
             });
         }
         self.groups
-            .insert(key, PartitionReplica::new(node_id, peers));
+            .insert(key, PartitionReplica::with_log(node_id, peers, log));
+        Ok(())
+    }
+
+    /// Instantiate the Raft group for one partition by **recovering** it from
+    /// the injected, already-opened `log`, building the replica with
+    /// [`PartitionReplica::recover`].
+    ///
+    /// Identical lifecycle guarantees to [`RaftGroupFleet::create_group_with_log`]
+    /// — a duplicate `key` is rejected with [`FleetError::GroupExists`] and the
+    /// fleet is left unchanged (Requirement 7.1) — but the replica restores its
+    /// Raft hard state and re-applies the recovered log's committed prefix to
+    /// its state machine, so a durable partition reopened after a restart
+    /// regains its committed records at their original offsets (Requirement
+    /// 11.1, 11.2, 11.3).
+    pub fn create_recovered_group(
+        &mut self,
+        key: GroupKey,
+        node_id: RaftNodeId,
+        peers: Vec<RaftNodeId>,
+        log: PartitionLog,
+    ) -> Result<(), FleetError> {
+        if self.groups.contains_key(&key) {
+            let (topic, partition) = key;
+            return Err(FleetError::GroupExists {
+                topic,
+                partition: partition.0,
+            });
+        }
+        self.groups
+            .insert(key, PartitionReplica::recover(node_id, peers, log));
         Ok(())
     }
 

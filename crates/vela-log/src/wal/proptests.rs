@@ -34,7 +34,7 @@ use proptest::test_runner::TestCaseError;
 
 use super::fs::fault::MemFileSystem;
 use super::{DurableWal, WalConfig};
-use crate::{EntryPayload, InMemoryLog, LogEntry, LogError, LogStorage, PayloadKind};
+use crate::{EntryPayload, HardState, InMemoryLog, LogEntry, LogError, LogStorage, PayloadKind};
 
 /// Data directory used for every generated case; each case gets a fresh
 /// [`MemFileSystem`], so the fixed path never collides across cases.
@@ -548,5 +548,87 @@ proptest! {
                 end
             );
         }
+    }
+}
+
+// ===========================================================================
+// Task 2.2: durable hard-state round-trip (Feature: per-topic-log-durability,
+// Property 10)
+// ===========================================================================
+//
+// ### Property: the last persisted hard state is restored byte-for-byte
+//
+// *For any* non-empty sequence of persisted `(current_term, voted_for)` values
+// applied in order to a `DurableWal` under the
+// [`Always`](super::SyncPolicy::Always) sync policy, when the WAL is dropped and
+// reopened on the same filesystem, the reopened WAL's
+// [`hard_state`](LogStorage::hard_state) equals the **last** persisted
+// `HardState` — the prior persists are superseded, and the surviving value
+// round-trips exactly (term and vote alike).
+//
+// **Validates: Requirements 10.3**
+//
+// Requirement 10.3: "FOR ALL sequences of term advances and vote grants applied
+// to a Durable replica whose Raft_Hard_State was persisted, WHEN the replica is
+// restarted on the same data, THE restored `current_term` and `voted_for` SHALL
+// equal the values the replica held immediately before the restart."
+//
+// `Always` is the consensus-safe policy (the `DurableWal` default) and the only
+// one this feature constructs for a log that backs consensus, so the test
+// matches that convention. The values are unconstrained `u64` terms and
+// arbitrary `Option<u64>` votes, so the generator sweeps the full hard-state
+// input space rather than a sanitized subset.
+
+/// Strategy for one persisted hard state: an arbitrary term and an arbitrary
+/// optional vote, spanning both the voted (`Some`) and not-yet-voted (`None`)
+/// cases across the whole `u64` range.
+fn hard_state_strategy() -> impl Strategy<Value = HardState> {
+    (any::<u64>(), proptest::option::of(any::<u64>())).prop_map(|(current_term, voted_for)| {
+        HardState {
+            current_term,
+            voted_for,
+        }
+    })
+}
+
+proptest! {
+    // At least 256 cases, matching this crate's existing proptest config and
+    // comfortably above the project's 100-iteration minimum.
+    #![proptest_config(ProptestConfig::with_cases(256))]
+
+    /// Persist a non-empty sequence of hard-state values under `Always`, drop
+    /// and reopen on the same in-memory filesystem, and assert the reopened WAL
+    /// restores exactly the last value persisted.
+    #[test]
+    fn durable_hard_state_round_trip(
+        states in prop::collection::vec(hard_state_strategy(), 1..40),
+    ) {
+        // The sequence is non-empty by construction, so a last value exists.
+        // `HardState` is `Copy`, so this is the value the WAL held immediately
+        // before the simulated restart.
+        let expected = *states.last().expect("sequence is non-empty by construction");
+
+        let fs = MemFileSystem::new();
+        {
+            // `Always` is the default sync policy and the only consensus-safe
+            // one; each persist is durable before it returns.
+            let mut wal = DurableWal::open_with(WalConfig::new(DIR), fs.clone())
+                .expect("open on a fresh filesystem should succeed");
+            for state in &states {
+                wal.persist_hard_state(*state)
+                    .expect("persist_hard_state under Always should succeed without faults");
+            }
+        } // dropping `wal` releases the exclusive directory lock
+
+        // Reopen on the same backing store: the recovered hard state must equal
+        // the last value persisted, superseding every earlier persist.
+        let reopened = DurableWal::open_with(WalConfig::new(DIR), fs.clone())
+            .expect("reopen on the same filesystem should succeed");
+
+        prop_assert_eq!(
+            reopened.hard_state(),
+            Some(expected),
+            "reopened hard state must equal the last persisted value"
+        );
     }
 }

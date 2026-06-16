@@ -74,6 +74,7 @@ fn metadata_with_topic(name: &str) -> ClusterMetadata {
                 leader: Some(NodeId::new("node-0")),
             }],
             state: TopicState::Active,
+            backend: vela_core::LogBackend::Durable,
         },
     );
     meta

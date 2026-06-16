@@ -18,7 +18,7 @@
 //! Validates: Requirements 3.7
 
 use proptest::prelude::*;
-use vela_core::{ClusterMetadata, CoreError, Member, NodeAvailability, NodeId};
+use vela_core::{ClusterMetadata, CoreError, LogBackend, Member, NodeAvailability, NodeId};
 
 /// The maximum topic name length the production code accepts (Requirement 2.1).
 const MAX_NAME_LEN: usize = 255;
@@ -93,6 +93,7 @@ proptest! {
             &scenario.name,
             scenario.partition_count,
             scenario.replication_factor,
+            LogBackend::Durable,
         )
         .expect("valid creation request must succeed");
         meta.begin_delete(&scenario.name)

@@ -72,7 +72,7 @@ use index::{IndexEntry, LogIndex};
 use manifest::{Manifest, ManifestState};
 use segment::{segment_file_name, FrameLocation, RestoreTail, SegmentSet};
 
-use crate::{CommitIndex, EntryPayload, LogEntry, LogError, LogStorage, Snapshot};
+use crate::{CommitIndex, EntryPayload, HardState, LogEntry, LogError, LogStorage, Snapshot};
 
 /// A durable, on-disk [`LogStorage`](crate::LogStorage) for one partition log.
 ///
@@ -128,6 +128,13 @@ pub struct DurableWal<F: FileSystem = RealFileSystem, C: Clock = RealClock> {
     durable_segment: u64,
     /// Byte offset just past `durable_last`'s frame within its segment.
     durable_offset: u64,
+    /// In-memory mirror of the persisted Raft hard-state term; the durable copy
+    /// lives in the manifest. `0` for a fresh log (Requirements 9.2, 10.1).
+    hs_current_term: u64,
+    /// In-memory mirror of the persisted Raft vote; `None` when this replica has
+    /// not voted in `hs_current_term`. The durable copy lives in the manifest
+    /// (Requirements 9.1, 10.2).
+    hs_voted_for: Option<u64>,
     /// Set when an unrecoverable read I/O fault is observed, after which the
     /// log has fail-stopped (panicked) on a read path. Held in a [`Cell`] so the
     /// `&self` reads (`entry`/`read`/`snapshot`) can record the poison before
@@ -201,6 +208,13 @@ impl<F: FileSystem, C: Clock> DurableWal<F, C> {
             })?;
         let state = state.unwrap_or_default();
 
+        // Capture the recovered Raft hard state from the best manifest slot
+        // before `replay` consumes the rest of `state`. A fresh log defaults to
+        // term 0 with no vote, so `hard_state()` reports `HardState::default()`
+        // (Requirements 10.1, 10.2).
+        let hs_current_term = state.hs_current_term;
+        let hs_voted_for = state.hs_voted_for;
+
         // Reconstruct the in-memory index, commit index, and acknowledged
         // extent from the segments on disk, discriminating a recoverable torn
         // tail from interior corruption and applying policy-scoped shortfall
@@ -243,6 +257,8 @@ impl<F: FileSystem, C: Clock> DurableWal<F, C> {
             durable_last: recovered.durable_last,
             durable_segment: recovered.durable_segment,
             durable_offset: recovered.durable_offset,
+            hs_current_term,
+            hs_voted_for,
             poisoned: Cell::new(false),
             last_force_at: None,
             pending_force_error: false,
@@ -259,6 +275,8 @@ impl<F: FileSystem, C: Clock> DurableWal<F, C> {
             durable_last: self.durable_last,
             durable_segment: self.durable_segment,
             durable_offset: self.durable_offset,
+            hs_current_term: self.hs_current_term,
+            hs_voted_for: self.hs_voted_for,
         }
     }
 
@@ -297,6 +315,8 @@ impl<F: FileSystem, C: Clock> DurableWal<F, C> {
             durable_last: Some(last),
             durable_segment: segment,
             durable_offset: offset_past,
+            hs_current_term: self.hs_current_term,
+            hs_voted_for: self.hs_voted_for,
         };
         self.manifest
             .write(&self.fs, &state)
@@ -547,6 +567,8 @@ impl<F: FileSystem, C: Clock> DurableWal<F, C> {
             durable_last: self.durable_last,
             durable_segment: self.durable_segment,
             durable_offset: self.durable_offset,
+            hs_current_term: self.hs_current_term,
+            hs_voted_for: self.hs_voted_for,
         };
         self.manifest
             .write(&self.fs, &state)
@@ -705,6 +727,8 @@ impl<F: FileSystem, C: Clock> LogStorage for DurableWal<F, C> {
                     durable_last: reduced_last,
                     durable_segment: reduced_segment,
                     durable_offset: reduced_offset,
+                    hs_current_term: self.hs_current_term,
+                    hs_voted_for: self.hs_voted_for,
                 };
                 self.manifest
                     .write(&self.fs, &state)
@@ -965,6 +989,8 @@ impl<F: FileSystem, C: Clock> LogStorage for DurableWal<F, C> {
                 durable_last: reduced_last,
                 durable_segment: reduced_segment,
                 durable_offset: reduced_offset,
+                hs_current_term: self.hs_current_term,
+                hs_voted_for: self.hs_voted_for,
             };
             self.manifest
                 .write(&self.fs, &state)
@@ -1044,6 +1070,55 @@ impl<F: FileSystem, C: Clock> LogStorage for DurableWal<F, C> {
             })?;
         Ok(())
     }
+
+    fn persist_hard_state(&mut self, hard_state: HardState) -> Result<(), LogError> {
+        // A read fault has already fail-stopped the log; refuse further writes
+        // rather than persist over a poisoned log.
+        if self.poisoned.get() {
+            return Err(LogError::Io {
+                op: "persist_hard_state",
+                source: io::Error::other("log poisoned by a prior read failure"),
+            });
+        }
+
+        // Write a fresh manifest slot carrying the new hard state alongside the
+        // unchanged extent/commit/log-start fields, reusing the double-buffered
+        // alternate-slot + fsync path. `Manifest::write` fsyncs before it
+        // returns, so the state is durable before this method returns — the
+        // persist-before-return guarantee Raft depends on (Requirements 9.1,
+        // 9.2). On failure the in-memory mirror is left unchanged, so the
+        // reported `hard_state()` does not advance (Requirement 9.4).
+        let state = ManifestState {
+            log_start_index: self.index.log_start_index(),
+            commit_index: self.commit_index,
+            durable_last: self.durable_last,
+            durable_segment: self.durable_segment,
+            durable_offset: self.durable_offset,
+            hs_current_term: hard_state.current_term,
+            hs_voted_for: hard_state.voted_for,
+        };
+        self.manifest
+            .write(&self.fs, &state)
+            .map_err(|source| LogError::Io {
+                op: "persist hard state manifest",
+                source,
+            })?;
+
+        // Only mirror the persisted values once the fsync succeeded.
+        self.hs_current_term = hard_state.current_term;
+        self.hs_voted_for = hard_state.voted_for;
+        Ok(())
+    }
+
+    fn hard_state(&self) -> Option<HardState> {
+        // The durable WAL always reports a hard state: the value recovered from
+        // the best manifest slot at open, or `HardState::default()` (term 0, no
+        // vote) for a fresh log (Requirements 10.1, 10.2).
+        Some(HardState {
+            current_term: self.hs_current_term,
+            voted_for: self.hs_voted_for,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -1094,6 +1169,126 @@ mod tests {
         let fs = MemFileSystem::new();
         let _wal = open(&fs);
         assert!(fs.exists(Path::new(DIR)));
+    }
+
+    // --- durable hard state: persist, reopen, restore (R9, R10) ------------
+
+    #[test]
+    fn fresh_log_reports_default_hard_state() {
+        let fs = MemFileSystem::new();
+        let wal = open(&fs);
+        // A fresh durable log always reports a hard state, equal to the default
+        // (term 0, no vote) — never `None` (Requirements 10.1, 10.2).
+        assert_eq!(wal.hard_state(), Some(HardState::default()));
+    }
+
+    #[test]
+    fn persist_hard_state_is_observable_in_memory() {
+        let fs = MemFileSystem::new();
+        let mut wal = open(&fs);
+        let hs = HardState {
+            current_term: 5,
+            voted_for: Some(3),
+        };
+        wal.persist_hard_state(hs).unwrap();
+        // The in-memory mirror reflects the persisted value immediately.
+        assert_eq!(wal.hard_state(), Some(hs));
+    }
+
+    #[test]
+    fn hard_state_restores_exact_value_after_reopen() {
+        let fs = MemFileSystem::new();
+        let hs = HardState {
+            current_term: 9,
+            voted_for: Some(2),
+        };
+        {
+            let mut wal = open(&fs);
+            wal.persist_hard_state(hs).unwrap();
+        } // drop releases the directory lock; the manifest slot is durable.
+
+        // Reopening the same filesystem restores the exact persisted value.
+        let reopened = open(&fs);
+        assert_eq!(reopened.hard_state(), Some(hs));
+    }
+
+    #[test]
+    fn hard_state_restores_term_advance_without_a_vote_after_reopen() {
+        let fs = MemFileSystem::new();
+        let hs = HardState {
+            current_term: 12,
+            voted_for: None,
+        };
+        {
+            let mut wal = open(&fs);
+            wal.persist_hard_state(hs).unwrap();
+        }
+
+        let reopened = open(&fs);
+        assert_eq!(reopened.hard_state(), Some(hs));
+    }
+
+    #[test]
+    fn last_persisted_hard_state_wins_after_reopen() {
+        let fs = MemFileSystem::new();
+        {
+            let mut wal = open(&fs);
+            // A sequence of persists: a vote, a term advance, then a new vote.
+            wal.persist_hard_state(HardState {
+                current_term: 1,
+                voted_for: Some(1),
+            })
+            .unwrap();
+            wal.persist_hard_state(HardState {
+                current_term: 2,
+                voted_for: None,
+            })
+            .unwrap();
+            wal.persist_hard_state(HardState {
+                current_term: 2,
+                voted_for: Some(4),
+            })
+            .unwrap();
+        }
+
+        // Only the last persisted value survives the reopen.
+        let reopened = open(&fs);
+        assert_eq!(
+            reopened.hard_state(),
+            Some(HardState {
+                current_term: 2,
+                voted_for: Some(4),
+            })
+        );
+    }
+
+    #[test]
+    fn hard_state_persists_alongside_committed_records() {
+        let fs = MemFileSystem::new();
+        {
+            let mut wal = open(&fs);
+            wal.append(payload(0), 1).unwrap();
+            wal.append(payload(1), 1).unwrap();
+            wal.commit(1).unwrap();
+            wal.persist_hard_state(HardState {
+                current_term: 7,
+                voted_for: Some(1),
+            })
+            .unwrap();
+        }
+
+        // Persisting hard state does not disturb the committed log extent, and
+        // the hard state is recovered alongside it.
+        let reopened = open(&fs);
+        assert_eq!(reopened.last_index(), Some(1));
+        assert_eq!(reopened.commit_index(), Some(1));
+        assert_eq!(
+            reopened.hard_state(),
+            Some(HardState {
+                current_term: 7,
+                voted_for: Some(1),
+            })
+        );
     }
 
     // --- append: index assignment and disk round-trip (R1.3, R8.5) ---------
@@ -1906,6 +2101,8 @@ mod tests {
                 durable_last: wal.durable_last,
                 durable_segment: wal.durable_segment,
                 durable_offset: wal.durable_offset,
+                hs_current_term: wal.hs_current_term,
+                hs_voted_for: wal.hs_voted_for,
             };
             wal.manifest.write(&fs, &crashed).unwrap();
             // The low segment files 0 and 1 were never deleted.

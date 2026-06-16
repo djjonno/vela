@@ -19,7 +19,7 @@ pub mod sim;
 // Boundary 1: the replicated log. Re-exported from `vela-log` so downstream
 // crates can name the storage seam and the entry/payload types through
 // `vela-raft` without taking a second dependency edge (Requirement 1.4).
-pub use vela_log::{CommitIndex, EntryPayload, LogEntry, LogStorage, PayloadKind};
+pub use vela_log::{CommitIndex, EntryPayload, HardState, LogEntry, LogStorage, PayloadKind};
 
 /// Base follower/candidate election timeout (Requirement 7.2).
 ///
@@ -201,6 +201,22 @@ pub enum RaftInput {
     Propose(EntryPayload),
 }
 
+/// The operation whose hard-state persistence failed during a [`RaftNode::step`]
+/// (Requirement 9.4).
+///
+/// Raft persists its hard state (`current_term`, `voted_for`) through the
+/// durable log seam *before* emitting any message that depends on the new
+/// term or vote. When that persist fails, the step makes no externally visible
+/// term/vote transition and emits no dependent message; the failing operation
+/// is reported here so the driver can log it and the triggering peer can retry.
+/// `op` is one of `"grant_vote"`, `"adopt_term"`, or `"start_election"`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PersistError {
+    /// The mutation point whose persist failed: `"grant_vote"`, `"adopt_term"`,
+    /// or `"start_election"`.
+    pub op: &'static str,
+}
+
 /// The effects produced by one call to [`RaftNode::step`].
 ///
 /// `step` performs no I/O: it returns the messages to dispatch, the entries
@@ -216,6 +232,12 @@ pub struct RaftOutput {
     /// The new role if this step changed it, for structured logging
     /// (Requirement 15.4).
     pub role_change: Option<Role>,
+    /// Set when a hard-state persist failed this step. When present, the step
+    /// made no externally visible term/vote transition and emitted no
+    /// dependent message (Requirement 9.4). The driver logs it; the triggering
+    /// peer retries. Always `None` for the volatile in-memory path, so existing
+    /// output is unchanged.
+    pub persist_error: Option<PersistError>,
 }
 
 /// The synchronous Raft state machine for one partition replica.
@@ -265,17 +287,36 @@ pub struct RaftNode<S: LogStorage> {
 }
 
 impl<S: LogStorage> RaftNode<S> {
-    /// Create a follower for a fresh group: term 0, no vote, the given log,
-    /// identity, and peer set. Volatile leader state starts empty and is
-    /// populated on election to leader.
-    pub fn new(id: NodeId, peers: Vec<NodeId>, log: S) -> Self {
+    /// Recover a replica from an injected log, restoring the persistent state a
+    /// durable backend retained across a restart.
+    ///
+    /// Restores `current_term` and `voted_for` from the log's recovered
+    /// [`HardState`] (`log.hard_state()`): a volatile or fresh log reports
+    /// `None`, which yields term 0 and no vote, while a durable log that
+    /// persisted a vote or term reports it so the restored replica cannot
+    /// forget it (Requirements 10.1, 10.2). `commit_index` and `last_applied`
+    /// are initialised from the log's recovered commit index so the caller can
+    /// re-apply the committed prefix to the partition state machine exactly once
+    /// (Requirement 11.1).
+    ///
+    /// Volatile leader state starts empty (role [`Role::Follower`], empty
+    /// per-peer cursors, no gathered votes) and is populated on election to
+    /// leader. For a fresh/empty log this is identical to a brand-new replica —
+    /// term 0, no vote, no commit — so the fresh-create and restart cases share
+    /// one path.
+    pub fn recover(id: NodeId, peers: Vec<NodeId>, log: S) -> Self {
+        let hard_state = log.hard_state().unwrap_or_default();
+        let commit_index = log.commit_index();
         Self {
-            current_term: 0,
-            voted_for: None,
+            current_term: hard_state.current_term,
+            voted_for: hard_state.voted_for.map(NodeId),
             log,
             role: Role::Follower,
-            commit_index: None,
-            last_applied: None,
+            commit_index,
+            // Committed entries are re-applied to the state machine by the
+            // caller; `last_applied` tracks the recovered commit index so the
+            // replica does not re-surface entries it already applied (R11.1).
+            last_applied: commit_index,
             votes_granted: 0,
             next_index: HashMap::new(),
             match_index: HashMap::new(),
@@ -283,6 +324,17 @@ impl<S: LogStorage> RaftNode<S> {
             id,
             peers,
         }
+    }
+
+    /// Create a follower for a fresh group: term 0, no vote, the given log,
+    /// identity, and peer set. Volatile leader state starts empty and is
+    /// populated on election to leader.
+    ///
+    /// A thin shim that delegates to [`RaftNode::recover`] over the given log.
+    /// For the fresh/empty log every existing call site passes, recover yields
+    /// identical state (term 0, no vote, no commit), so behaviour is unchanged.
+    pub fn new(id: NodeId, peers: Vec<NodeId>, log: S) -> Self {
+        Self::recover(id, peers, log)
     }
 
     /// This node's identity.
@@ -428,7 +480,31 @@ impl<S: LogStorage> RaftNode<S> {
     /// reset the election timer, and solicit votes from every peer
     /// (Requirements 7.2, 7.3, 7.5).
     fn start_election(&mut self, clock: &mut impl Clock, out: &mut RaftOutput) {
-        self.current_term += 1;
+        // The incremented term and self-vote are term-dependent: the broadcast
+        // `RequestVote` carries the new term. Persist them to stable storage
+        // *before* any state mutation or broadcast (Requirement 9.2). On a
+        // durable replica a persist failure means we stay a follower and
+        // broadcast nothing; the failure is surfaced and the election timer is
+        // re-armed so a later tick retries once storage recovers
+        // (Requirement 9.4). The volatile in-memory path defaults to a no-op
+        // `Ok`, so behaviour is unchanged (Requirement 9.3).
+        let new_term = self.current_term + 1;
+        if self
+            .log
+            .persist_hard_state(HardState {
+                current_term: new_term,
+                voted_for: Some(self.id.0),
+            })
+            .is_err()
+        {
+            out.persist_error = Some(PersistError {
+                op: "start_election",
+            });
+            self.arm_election_timer(clock);
+            return;
+        }
+
+        self.current_term = new_term;
         self.role = Role::Candidate;
         self.voted_for = Some(self.id);
         self.votes_granted = 1; // self-vote
@@ -634,6 +710,25 @@ impl<S: LogStorage> RaftNode<S> {
             RaftMessage::AppendEntriesReply(m) => m.term,
         };
         if msg_term > self.current_term {
+            // Adopting a higher term is term-dependent: persist the new term
+            // (clearing any vote) to stable storage *before* stepping down and
+            // emitting any message that depends on it (Requirement 9.2). On a
+            // durable replica a persist failure aborts the adoption — no term
+            // transition, nothing term-dependent emitted — and is surfaced for
+            // the driver to log and the peer to retry (Requirement 9.4). The
+            // volatile in-memory path defaults to a no-op `Ok`, so behaviour is
+            // unchanged there (Requirement 9.3).
+            if self
+                .log
+                .persist_hard_state(HardState {
+                    current_term: msg_term,
+                    voted_for: None,
+                })
+                .is_err()
+            {
+                out.persist_error = Some(PersistError { op: "adopt_term" });
+                return;
+            }
             self.step_down(msg_term);
         }
 
@@ -664,6 +759,24 @@ impl<S: LogStorage> RaftNode<S> {
         let grant = rv.term >= self.current_term && up_to_date && not_yet_voted;
 
         if grant {
+            // Persist the term and vote to stable storage *before* emitting the
+            // grant, so a restart can never forget this vote and grant a second
+            // one to a different candidate in the same term (Requirement 9.1).
+            // On a durable replica a persist failure leaves term/vote unchanged,
+            // emits no grant, and is surfaced for the driver to log and the
+            // candidate to retry (Requirement 9.4). The volatile in-memory path
+            // defaults to a no-op `Ok`, so behaviour is unchanged (R9.3).
+            if self
+                .log
+                .persist_hard_state(HardState {
+                    current_term: rv.term,
+                    voted_for: Some(rv.candidate_id.0),
+                })
+                .is_err()
+            {
+                out.persist_error = Some(PersistError { op: "grant_vote" });
+                return;
+            }
             self.current_term = rv.term;
             self.voted_for = Some(rv.candidate_id);
             // Granting a vote means we have heard from a viable candidate;
@@ -1286,6 +1399,31 @@ mod tests {
         assert_eq!(node.commit_index(), Some(1));
         let committed: Vec<u64> = out.committed.iter().map(|e| e.index).collect();
         assert_eq!(committed, vec![0, 1]);
+    }
+
+    #[test]
+    fn recover_initializes_commit_index_and_last_applied_from_log() {
+        // A restart restores the commit position from the recovered log: a log
+        // carrying committed entries hands its commit index to both
+        // `commit_index` and `last_applied`, so the replica re-applies the
+        // committed prefix exactly once and never re-surfaces it (R10.1, R10.2,
+        // R11.1). A fresh log carries no hard state, so term/vote default.
+        let mut log = InMemoryLog::new();
+        log.append(record(0), 1).expect("append entry 0");
+        log.append(record(1), 1).expect("append entry 1");
+        log.append(record(2), 1).expect("append entry 2");
+        log.commit(2).expect("commit through index 2");
+        let recovered_commit = log.commit_index();
+        assert_eq!(recovered_commit, Some(2));
+
+        let node = RaftNode::recover(NodeId(0), vec![NodeId(1), NodeId(2)], log);
+
+        assert_eq!(node.commit_index(), recovered_commit);
+        assert_eq!(node.last_applied(), recovered_commit);
+        // A fresh log persisted no hard state, so term 0 and no vote.
+        assert_eq!(node.current_term(), 0);
+        assert_eq!(node.voted_for(), None);
+        assert_eq!(node.role(), Role::Follower);
     }
 
     #[test]

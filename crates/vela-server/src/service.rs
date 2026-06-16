@@ -198,21 +198,34 @@ impl VelaClient for VelaClientService {
     ) -> Result<Response<v1::CreateTopicResponse>, Status> {
         let req = request.into_inner();
 
-        let topic = {
-            let mut metadata = self.node.metadata.lock().expect("metadata mutex poisoned");
-            metadata
-                .create_topic(&req.name, req.partitions, self.node.replication_factor)
-                .map_err(|e| convert::core_error_to_status(&e))?;
-            metadata
-                .topics
-                .get(&req.name)
-                .cloned()
-                .expect("topic was just created")
-        };
+        // Decode the requested log backend BEFORE touching metadata: an
+        // unspecified wire value defaults to Durable (Requirement 2.2) and any
+        // out-of-range value is rejected as a validation error, creating no
+        // topic (Requirement 2.5).
+        let backend = convert::log_backend_from_proto(req.log_backend)
+            .map_err(|e| convert::core_error_to_status(&e))?;
 
-        // Start a driver for every partition this node replicates.
+        // Validate, assign replicas, and durably commit the create through the
+        // `__meta` Raft group, then install it in the served view, so the
+        // catalogue change survives a cold restart (Requirement 16, 18). A
+        // validation rejection touches neither the durable log nor the view.
+        let topic = self
+            .node
+            .create_topic(&req.name, req.partitions, backend)
+            .map_err(|e| convert::core_error_to_status(&e))?;
+
+        // Start a driver for every partition this node replicates. A durable
+        // partition whose log cannot be opened is logged and left unstarted; the
+        // remaining partitions still start (Requirement 8.1, 8.2, 8.3).
         for partition in &topic.partitions {
-            self.node.spawn_partition(&req.name, partition);
+            if let Err(err) = self.node.spawn_partition(&req.name, partition) {
+                tracing::error!(
+                    topic = %req.name,
+                    partition = partition.index.0,
+                    %err,
+                    "failed to start durable partition replica; leaving it unstarted"
+                );
+            }
         }
 
         Ok(Response::new(v1::CreateTopicResponse {
@@ -226,21 +239,14 @@ impl VelaClient for VelaClientService {
     ) -> Result<Response<v1::DeleteTopicResponse>, Status> {
         let req = request.into_inner();
 
-        // Capture the partitions, then atomically remove the topic; only on a
+        // Durably commit the deletion through the `__meta` group (a missing or
+        // already-deleting topic is rejected without side effects); only on a
         // successful removal do we stop the local drivers (Requirement 3.1,
-        // 3.2, 3.3).
-        let partitions = {
-            let mut metadata = self.node.metadata.lock().expect("metadata mutex poisoned");
-            let partitions: Vec<u32> = metadata
-                .topics
-                .get(&req.name)
-                .map(|t| t.partitions.iter().map(|p| p.index.0).collect())
-                .unwrap_or_default();
-            metadata
-                .delete_topic(&req.name)
-                .map_err(|e| convert::core_error_to_status(&e))?;
-            partitions
-        };
+        // 3.2, 3.4, 16, 18).
+        let partitions = self
+            .node
+            .delete_topic(&req.name)
+            .map_err(|e| convert::core_error_to_status(&e))?;
 
         for partition in partitions {
             self.node.stop_partition(&req.name, partition);

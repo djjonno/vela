@@ -23,7 +23,7 @@
 use std::collections::BTreeMap;
 
 use proptest::prelude::*;
-use vela_core::{ClusterMetadata, Member, NodeAvailability, NodeId};
+use vela_core::{ClusterMetadata, LogBackend, Member, NodeAvailability, NodeId};
 
 /// Build a cluster of `n` available members named `node-0..node-{n-1}`.
 fn cluster(n: usize) -> ClusterMetadata {
@@ -62,7 +62,7 @@ proptest! {
         let replication_factor = (rf_seed % n_nodes) + 1;
 
         let mut meta = cluster(n_nodes);
-        meta.create_topic("orders", partition_count, replication_factor)
+        meta.create_topic("orders", partition_count, replication_factor, LogBackend::Durable)
             .expect("valid create_topic request should succeed");
 
         let topic = &meta.topics["orders"];

@@ -153,18 +153,32 @@ message PartitionInfo {
   optional string leader = 3;   // current leader node id, if any
 }
 
+// A topic's log storage backend, selected per topic at creation time. Exactly
+// one of durable or in-memory; unspecified is treated as durable by the server
+// (per-topic-log-durability Requirements 1, 2).
+enum LogBackend {
+  LOG_BACKEND_UNSPECIFIED = 0;
+  LOG_BACKEND_DURABLE = 1;
+  LOG_BACKEND_IN_MEMORY = 2;
+}
+
 // A topic and its partitions as known to cluster metadata (Requirement 13.3,
-// 13.4).
+// 13.4). `log_backend` reports the topic's selected log storage backend
+// (per-topic-log-durability Requirement 2.4).
 message TopicInfo {
   string name = 1;
   uint32 partition_count = 2;
   repeated PartitionInfo partitions = 3;
+  LogBackend log_backend = 4;
 }
 
 // Create a topic with a name and partition count (Requirement 2.1, 13.1).
+// `log_backend` selects the topic's log storage backend; unspecified means
+// durable (per-topic-log-durability Requirements 1.1, 2.1).
 message CreateTopicRequest {
   string name = 1;
   uint32 partitions = 2;
+  LogBackend log_backend = 3;
 }
 
 message CreateTopicResponse {
@@ -222,6 +236,7 @@ message ClusterCommand {
 message CreateTopicCommand {
   string name = 1;
   repeated PartitionInfo partitions = 2;
+  LogBackend log_backend = 3;
 }
 
 message DeleteTopicCommand {

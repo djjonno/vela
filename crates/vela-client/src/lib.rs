@@ -37,7 +37,7 @@
 //!
 //! ```no_run
 //! # async fn run() -> Result<(), vela_client::ClientError> {
-//! use vela_client::VelaClient;
+//! use vela_client::{LogBackend, VelaClient};
 //!
 //! // Bootstrap with (node_id, address) pairs.
 //! let client = VelaClient::new([
@@ -45,7 +45,7 @@
 //!     ("node-b".to_string(), "http://127.0.0.1:50052".to_string()),
 //! ]);
 //!
-//! client.admin().create_topic("orders", 8).await?;
+//! client.admin().create_topic("orders", 8, LogBackend::Durable).await?;
 //! let offset = client.producer().produce("orders", Some(b"user-42"), b"hello".to_vec()).await?;
 //! let batch = client.consumer().consume("orders", 0, 0, None).await?;
 //! # let _ = (offset, batch);
@@ -64,7 +64,7 @@ mod router;
 
 use std::sync::Arc;
 
-pub use admin::AdminClient;
+pub use admin::{AdminClient, LogBackend};
 pub use connection::{ConnectionManager, NodeRegistry};
 pub use consumer::{ConsumeOutcome, Consumer};
 pub use core::{ClientCore, MAX_RETRIES, RETRY_DELAY_MS};

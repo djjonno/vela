@@ -37,14 +37,17 @@
 //! the wire encoding.
 
 use std::collections::{BTreeSet, HashMap};
+use std::path::Path;
 
+use vela_log::{DurableWal, LogError, LogStorage, PayloadKind, SyncPolicy, WalConfig};
 use vela_raft::{Clock, NodeId as RaftNodeId, RaftInput, RaftOutput};
 
-use crate::fleet::{GroupKey, RaftGroupFleet};
+use crate::fleet::{FleetError, GroupKey, RaftGroupFleet};
 use crate::model::{
     ClusterCommand, ClusterMetadata, NodeAvailability, NodeId, Partition, PartitionIndex, Topic,
     TopicState,
 };
+use crate::partition_log::PartitionLog;
 use crate::topic::CoreError;
 
 /// The well-known topic name of the dedicated metadata Raft group (design
@@ -110,7 +113,9 @@ impl ClusterMetadata {
 /// this function does not re-validate — it folds the change in directly:
 ///
 /// - [`ClusterCommand::CreateTopic`] registers an [`TopicState::Active`] topic
-///   with the committed partitions.
+///   with the committed partitions, recording the backend the command carries
+///   so every node that applies the committed command stores the same backend
+///   on its [`Topic`] (Requirement 2.3, 3.2).
 /// - [`ClusterCommand::DeleteTopic`] removes the named topic (and, with it,
 ///   every partition the topic owns) in a single map removal.
 /// - [`ClusterCommand::SetAvailability`] updates a member's availability.
@@ -119,13 +124,18 @@ impl ClusterMetadata {
 /// acks attributed to a specific metadata version.
 pub fn apply_command(meta: &mut ClusterMetadata, command: &ClusterCommand) {
     match command {
-        ClusterCommand::CreateTopic { name, partitions } => {
+        ClusterCommand::CreateTopic {
+            name,
+            partitions,
+            backend,
+        } => {
             meta.topics.insert(
                 name.clone(),
                 Topic {
                     name: name.clone(),
                     partitions: partitions.clone(),
                     state: TopicState::Active,
+                    backend: *backend,
                 },
             );
         }
@@ -137,6 +147,23 @@ pub fn apply_command(meta: &mut ClusterMetadata, command: &ClusterCommand) {
         }
     }
     meta.epoch += 1;
+}
+
+/// Errors raised while opening and recovering the durable metadata Raft group
+/// (Requirement 16.1, 16.6, 17.x).
+///
+/// Recovering the `__meta/0` group performs real filesystem I/O (opening the
+/// durable WAL) and a fleet insertion, so a failure in either is surfaced as a
+/// typed error the server can fail fast on at startup rather than silently
+/// degrading the catalogue.
+#[derive(thiserror::Error, Debug)]
+pub enum MetadataRecoverError {
+    /// Opening (or creating) the durable metadata log failed.
+    #[error("failed to open the durable metadata log: {0}")]
+    Log(#[from] LogError),
+    /// Registering the recovered metadata group in the fleet failed.
+    #[error("failed to create the recovered metadata group: {0}")]
+    Fleet(#[from] FleetError),
 }
 
 /// Manages how [`ClusterMetadata`] is agreed and propagated across the cluster
@@ -189,6 +216,82 @@ impl MetadataController {
         let mut controller = Self::new(node_id, peers);
         controller.metadata = metadata;
         controller
+    }
+
+    /// Build a controller from an already-recovered `metadata` view and the
+    /// `fleet` hosting its (recovered) `__meta/0` group.
+    ///
+    /// Unlike [`MetadataController::new`]/[`MetadataController::with_metadata`],
+    /// which build a *fresh* in-memory metadata group, this installs a fleet the
+    /// caller has already populated — the path
+    /// [`MetadataController::recover_durable`] uses to hand back the durable,
+    /// recovered group together with the catalogue rebuilt from its committed
+    /// log. Acks start empty: they are per-process propagation bookkeeping, not
+    /// recovered state.
+    fn from_parts(metadata: ClusterMetadata, fleet: RaftGroupFleet) -> Self {
+        Self {
+            metadata,
+            fleet,
+            acks: HashMap::new(),
+        }
+    }
+
+    /// Open (or create) the durable `__meta/0` metadata Raft group at
+    /// `meta_path` and recover the committed cluster catalogue from it
+    /// (Requirement 16.1, 16.6, 17.1, 17.2, 17.3, 17.4).
+    ///
+    /// The metadata group is infrastructure, not a client-selectable topic, so
+    /// it always uses the [`Durable`](crate::model::LogBackend::Durable) backend
+    /// with the only consensus-safe policy, [`SyncPolicy::Always`] (Requirement
+    /// 16.1, 16.6). The durable WAL is opened directly at `meta_path` — path
+    /// derivation is the server's concern, so the caller passes the reserved
+    /// metadata path in — wrapped in a [`PartitionLog::Durable`], and the group
+    /// is created through [`RaftGroupFleet::create_recovered_group`], which
+    /// restores the Raft hard state and commit index from the recovered log
+    /// (Requirement 17.1, 17.2, 17.3).
+    ///
+    /// The catalogue is then rebuilt by replaying the recovered log's committed
+    /// prefix: every committed entry carrying a [`PayloadKind::Cluster`] payload
+    /// is decoded back into a [`ClusterCommand`] and folded into a fresh
+    /// [`ClusterMetadata`] via [`apply_command`], in ascending index order, so
+    /// the recovered view equals the one held before the restart, including each
+    /// topic's recorded backend (Requirement 17.4, 18.1, 18.3).
+    ///
+    /// Because `vela-core` must stay free of the wire encoding, the mapping from
+    /// a committed entry's payload bytes back into a [`ClusterCommand`] is
+    /// injected as `decode_cluster`; the server owns the codec and supplies the
+    /// matching decoder.
+    pub fn recover_durable(
+        node_id: RaftNodeId,
+        peers: Vec<RaftNodeId>,
+        meta_path: &Path,
+        decode_cluster: impl Fn(&[u8]) -> ClusterCommand,
+    ) -> Result<Self, MetadataRecoverError> {
+        // Open the durable metadata log at the reserved path with the only
+        // consensus-safe sync policy (Requirement 16.6).
+        let wal = DurableWal::open(WalConfig::new(meta_path).with_sync_policy(SyncPolicy::Always))?;
+        let log = PartitionLog::Durable(wal);
+
+        // Create the recovered group: this restores the Raft hard state and the
+        // commit index from the recovered log (Requirement 17.1, 17.2, 17.3).
+        let mut fleet = RaftGroupFleet::new();
+        fleet.create_recovered_group(metadata_group_key(), node_id, peers, log)?;
+
+        // Rebuild the catalogue by re-applying every committed `Cluster`
+        // command in ascending index order (Requirement 17.4, 18.1, 18.3).
+        let mut metadata = ClusterMetadata::new();
+        let replica = fleet
+            .get(&metadata_group_key())
+            .expect("the metadata group was just created");
+        if let Some(commit) = replica.raft().commit_index() {
+            for entry in replica.raft().log().read(0, commit) {
+                if entry.payload.kind == PayloadKind::Cluster {
+                    apply_command(&mut metadata, &decode_cluster(&entry.payload.bytes));
+                }
+            }
+        }
+
+        Ok(Self::from_parts(metadata, fleet))
     }
 
     /// Shared, read-only access to the current cluster metadata view.
@@ -312,7 +415,7 @@ impl MetadataController {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::Member;
+    use crate::model::{LogBackend, Member};
 
     fn member(id: &str, availability: NodeAvailability) -> Member {
         Member {
@@ -378,6 +481,7 @@ mod tests {
         let command = ClusterCommand::CreateTopic {
             name: "orders".to_string(),
             partitions: vec![partition(0, Some("a")), partition(1, Some("b"))],
+            backend: LogBackend::Durable,
         };
 
         apply_command(&mut meta, &command);
@@ -397,6 +501,7 @@ mod tests {
             &ClusterCommand::CreateTopic {
                 name: "orders".to_string(),
                 partitions: vec![partition(0, Some("a"))],
+                backend: LogBackend::Durable,
             },
         );
         assert_eq!(meta.epoch, 1);
@@ -450,6 +555,7 @@ mod tests {
         let epoch = controller.apply(&ClusterCommand::CreateTopic {
             name: "orders".to_string(),
             partitions: vec![partition(0, Some("a"))],
+            backend: LogBackend::Durable,
         });
         assert_eq!(epoch, 1);
         assert!(controller.metadata().topics.contains_key("orders"));
@@ -520,6 +626,7 @@ mod tests {
         controller.apply(&ClusterCommand::CreateTopic {
             name: "orders".to_string(),
             partitions: vec![partition(0, Some("node-a")), partition(1, Some("node-b"))],
+            backend: LogBackend::Durable,
         });
 
         assert_eq!(
@@ -534,6 +641,7 @@ mod tests {
         controller.apply(&ClusterCommand::CreateTopic {
             name: "orders".to_string(),
             partitions: vec![partition(0, Some("node-a"))],
+            backend: LogBackend::Durable,
         });
 
         // Unknown topic.
@@ -560,6 +668,7 @@ mod tests {
         controller.apply(&ClusterCommand::CreateTopic {
             name: "orders".to_string(),
             partitions: vec![partition(0, None)],
+            backend: LogBackend::Durable,
         });
 
         assert_eq!(

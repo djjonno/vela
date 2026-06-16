@@ -26,7 +26,7 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use clap::{Parser, Subcommand};
-use vela_client::{ClientError, VelaClient};
+use vela_client::{ClientError, LogBackend, VelaClient};
 
 /// Default endpoint contacted when `--endpoints`/`VELA_ADDR` is not supplied.
 const DEFAULT_ENDPOINT: &str = "http://127.0.0.1:50051";
@@ -77,6 +77,16 @@ pub enum Command {
         /// Number of partitions to create the topic with.
         #[arg(long, short = 'p', value_name = "N")]
         partitions: u32,
+        /// Log storage backend for the topic: `durable` (the default) or
+        /// `in-memory` (per-topic-log-durability Requirements 1.1–1.3). Any
+        /// other value is rejected at parse time, before any request is sent.
+        #[arg(
+            long,
+            value_name = "BACKEND",
+            default_value = "durable",
+            value_parser = parse_backend
+        )]
+        backend: LogBackend,
     },
     /// Delete a topic (Requirement 13.2).
     Delete {
@@ -100,6 +110,26 @@ impl Cli {
     pub fn parse_args() -> Self {
         <Self as Parser>::parse()
     }
+}
+
+/// Parse a `--backend` flag value into the client [`LogBackend`].
+///
+/// Delegates to the client's own parser so the CLI accepts exactly the two
+/// values the client API does — `durable` and `in-memory` — and rejects
+/// anything else at parse time, before any request is sent
+/// (per-topic-log-durability Requirement 1.3).
+fn parse_backend(value: &str) -> Result<LogBackend, ClientError> {
+    value.parse()
+}
+
+/// A human-readable label for a topic's wire backend value.
+///
+/// Decodes the `TopicInfo.log_backend` wire field into the client enum; an
+/// unspecified or unrecognized value is reported as `unspecified`.
+fn backend_label(log_backend: i32) -> String {
+    LogBackend::from_wire(log_backend)
+        .map(|backend| backend.to_string())
+        .unwrap_or_else(|| "unspecified".to_string())
 }
 
 /// A failure that ends the process with a non-zero status.
@@ -142,11 +172,17 @@ pub async fn run(cli: Cli) -> Result<(), CtlError> {
     let admin = client.admin();
 
     match cli.command {
-        Command::Create { name, partitions } => {
-            let topic = with_timeout(admin.create_topic(&name, partitions)).await?;
+        Command::Create {
+            name,
+            partitions,
+            backend,
+        } => {
+            let topic = with_timeout(admin.create_topic(&name, partitions, backend)).await?;
             println!(
-                "created topic '{}' with {} partition(s)",
-                topic.name, topic.partition_count
+                "created topic '{}' with {} partition(s) ({} backend)",
+                topic.name,
+                topic.partition_count,
+                backend_label(topic.log_backend)
             );
         }
         Command::Delete { name } => {
@@ -166,8 +202,10 @@ pub async fn run(cli: Cli) -> Result<(), CtlError> {
         Command::Describe { name } => {
             let topic = with_timeout(admin.describe_topic(&name)).await?;
             println!(
-                "topic '{}' ({} partition(s))",
-                topic.name, topic.partition_count
+                "topic '{}' ({} partition(s), {} backend)",
+                topic.name,
+                topic.partition_count,
+                backend_label(topic.log_backend)
             );
             for partition in topic.partitions {
                 let leader = partition.leader.as_deref().unwrap_or("<no leader>");
@@ -241,7 +279,9 @@ mod tests {
     fn create_parses_name_and_partition_count() {
         let cli = parse(&["create", "orders", "--partitions", "8"]).expect("valid");
         match cli.command {
-            Command::Create { name, partitions } => {
+            Command::Create {
+                name, partitions, ..
+            } => {
                 assert_eq!(name, "orders");
                 assert_eq!(partitions, 8);
             }
@@ -253,6 +293,50 @@ mod tests {
     fn create_accepts_short_partition_flag() {
         let cli = parse(&["create", "orders", "-p", "3"]).expect("valid");
         assert!(matches!(cli.command, Command::Create { partitions: 3, .. }));
+    }
+
+    #[test]
+    fn create_defaults_backend_to_durable() {
+        // Omitting `--backend` selects the durable default
+        // (per-topic-log-durability Requirement 1.2).
+        let cli = parse(&["create", "orders", "-p", "1"]).expect("valid");
+        assert!(matches!(
+            cli.command,
+            Command::Create {
+                backend: LogBackend::Durable,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn create_accepts_both_backend_values() {
+        let durable = parse(&["create", "orders", "-p", "1", "--backend", "durable"])
+            .expect("valid durable backend");
+        assert!(matches!(
+            durable.command,
+            Command::Create {
+                backend: LogBackend::Durable,
+                ..
+            }
+        ));
+
+        let in_memory = parse(&["create", "orders", "-p", "1", "--backend", "in-memory"])
+            .expect("valid in-memory backend");
+        assert!(matches!(
+            in_memory.command,
+            Command::Create {
+                backend: LogBackend::InMemory,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn create_rejects_an_unknown_backend() {
+        // An unrecognized backend is rejected at parse time, before any request
+        // is sent (per-topic-log-durability Requirement 1.3).
+        assert!(parse(&["create", "orders", "-p", "1", "--backend", "bogus"]).is_err());
     }
 
     #[test]
@@ -411,14 +495,17 @@ mod example_tests {
 
     use super::{run, Cli, Command, CtlError};
 
+    use std::sync::{Arc, Mutex};
+
     use tokio_stream::wrappers::TcpListenerStream;
     use tonic::{Request, Response, Status};
 
-    use vela_proto::v1::vela_client_server::{VelaClient, VelaClientServer};
+    use vela_client::{LogBackend as ClientBackend, VelaClient};
+    use vela_proto::v1::vela_client_server::{VelaClient as VelaClientService, VelaClientServer};
     use vela_proto::v1::{
         ConsumeRequest, ConsumeResponse, CreateTopicRequest, CreateTopicResponse,
         DeleteTopicRequest, DeleteTopicResponse, DescribeTopicRequest, DescribeTopicResponse,
-        FindLeaderRequest, FindLeaderResponse, ListTopicsRequest, ListTopicsResponse,
+        FindLeaderRequest, FindLeaderResponse, ListTopicsRequest, ListTopicsResponse, LogBackend,
         PartitionInfo, ProduceRequest, ProduceResponse, TopicInfo,
     };
 
@@ -429,9 +516,14 @@ mod example_tests {
     /// run to completion (Requirements 13.1–13.4). In `reject` mode every admin
     /// RPC returns an application error `Status`, standing in for a cluster that
     /// rejects the request (Requirement 13.7).
+    ///
+    /// `captured_backend` records the `log_backend` carried by the most recent
+    /// `CreateTopic` request, so tests can assert exactly which backend the
+    /// client sent on the wire (per-topic-log-durability Requirements 1.1, 1.2).
     #[derive(Clone)]
     struct FakeAdmin {
         reject: bool,
+        captured_backend: Arc<Mutex<Option<i32>>>,
     }
 
     impl FakeAdmin {
@@ -453,6 +545,7 @@ mod example_tests {
                         leader: None,
                     },
                 ],
+                log_backend: LogBackend::Durable as i32,
             }
         }
 
@@ -465,7 +558,7 @@ mod example_tests {
     }
 
     #[tonic::async_trait]
-    impl VelaClient for FakeAdmin {
+    impl VelaClientService for FakeAdmin {
         async fn create_topic(
             &self,
             request: Request<CreateTopicRequest>,
@@ -473,10 +566,16 @@ mod example_tests {
             if self.reject {
                 return Err(Self::rejection());
             }
-            let name = request.into_inner().name;
-            Ok(Response::new(CreateTopicResponse {
-                topic: Some(Self::canned_topic(&name)),
-            }))
+            let request = request.into_inner();
+            // Record the backend the client sent, and echo it back on the topic
+            // so the description reflects exactly what was requested.
+            *self
+                .captured_backend
+                .lock()
+                .expect("captured-backend mutex poisoned") = Some(request.log_backend);
+            let mut topic = Self::canned_topic(&request.name);
+            topic.log_backend = request.log_backend;
+            Ok(Response::new(CreateTopicResponse { topic: Some(topic) }))
         }
 
         async fn delete_topic(
@@ -543,12 +642,12 @@ mod example_tests {
     /// a background task. The `TcpListener` is bound *before* we return, so the
     /// returned endpoint URL is already accepting connections — the CLI never
     /// races server startup.
-    async fn spawn_fake(reject: bool) -> String {
+    async fn serve(fake: FakeAdmin) -> String {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind ephemeral port");
         let port = listener.local_addr().expect("local addr").port();
-        let service = VelaClientServer::new(FakeAdmin { reject });
+        let service = VelaClientServer::new(fake);
         tokio::spawn(async move {
             tonic::transport::Server::builder()
                 .add_service(service)
@@ -557,6 +656,28 @@ mod example_tests {
                 .expect("fake server serves");
         });
         format!("http://127.0.0.1:{port}")
+    }
+
+    /// Serve an accepting-or-rejecting fake whose captured backend is discarded.
+    async fn spawn_fake(reject: bool) -> String {
+        serve(FakeAdmin {
+            reject,
+            captured_backend: Arc::new(Mutex::new(None)),
+        })
+        .await
+    }
+
+    /// Serve an accepting fake and return both its endpoint and the handle that
+    /// captures the `log_backend` carried by `CreateTopic` requests, so a test
+    /// can assert exactly which backend the client sent.
+    async fn spawn_capturing() -> (String, Arc<Mutex<Option<i32>>>) {
+        let captured = Arc::new(Mutex::new(None));
+        let endpoint = serve(FakeAdmin {
+            reject: false,
+            captured_backend: Arc::clone(&captured),
+        })
+        .await;
+        (endpoint, captured)
     }
 
     /// Build a [`Cli`] aimed at a single endpoint.
@@ -576,12 +697,72 @@ mod example_tests {
             Command::Create {
                 name: "orders".to_string(),
                 partitions: 4,
+                backend: ClientBackend::Durable,
             },
         ))
         .await;
         assert!(
             matches!(result, Ok(())),
             "create should succeed: {result:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn create_sends_the_durable_backend_on_the_wire() {
+        // A durable create carries the durable backend value to the server
+        // (per-topic-log-durability Requirement 1.1, 1.2).
+        let (endpoint, captured) = spawn_capturing().await;
+        run(cli(
+            endpoint,
+            Command::Create {
+                name: "orders".to_string(),
+                partitions: 1,
+                backend: ClientBackend::Durable,
+            },
+        ))
+        .await
+        .expect("create should succeed");
+        assert_eq!(
+            *captured.lock().expect("captured-backend mutex poisoned"),
+            Some(LogBackend::Durable as i32),
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn create_sends_the_in_memory_backend_on_the_wire() {
+        // A specified in-memory backend is carried as LOG_BACKEND_IN_MEMORY
+        // (per-topic-log-durability Requirement 1.1).
+        let (endpoint, captured) = spawn_capturing().await;
+        run(cli(
+            endpoint,
+            Command::Create {
+                name: "orders".to_string(),
+                partitions: 1,
+                backend: ClientBackend::InMemory,
+            },
+        ))
+        .await
+        .expect("create should succeed");
+        assert_eq!(
+            *captured.lock().expect("captured-backend mutex poisoned"),
+            Some(LogBackend::InMemory as i32),
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn describe_reports_the_topic_backend() {
+        // `describe_topic` surfaces the topic's backend in usable form
+        // (per-topic-log-durability Requirement 1.4).
+        let endpoint = spawn_fake(false).await;
+        let client = VelaClient::new([("node-0".to_string(), endpoint)]);
+        let info = client
+            .admin()
+            .describe_topic("orders")
+            .await
+            .expect("describe should succeed");
+        assert_eq!(
+            ClientBackend::from_wire(info.log_backend),
+            Some(ClientBackend::Durable),
         );
     }
 

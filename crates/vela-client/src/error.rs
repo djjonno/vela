@@ -70,6 +70,16 @@ pub enum ClientError {
     /// (e.g. a successful `DescribeTopic` with no topic payload).
     #[error("malformed response: {0}")]
     MalformedResponse(String),
+
+    /// A caller supplied a log-backend value the client does not recognize. The
+    /// client accepts exactly `durable` and `in-memory` and rejects anything
+    /// else *before* sending a `CreateTopic` request
+    /// (per-topic-log-durability Requirement 1.3).
+    #[error("invalid log backend `{value}` (expected `durable` or `in-memory`)")]
+    InvalidBackend {
+        /// The unrecognized backend value supplied by the caller.
+        value: String,
+    },
 }
 
 impl From<tonic::Status> for ClientError {

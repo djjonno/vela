@@ -78,6 +78,7 @@ fn _wire_types_are_owned_by_vela_proto() {
     let _: Option<v1::VelaError> = None;
     let _: Option<v1::ErrorCode> = None;
     let _: Option<v1::NodeAvailability> = None;
+    let _: Option<v1::LogBackend> = None;
 }
 
 /// The shared typed error is a `vela-proto`-owned message with a classification
@@ -131,9 +132,63 @@ fn error_code_taxonomy_is_exposed() {
 }
 
 // ---------------------------------------------------------------------------
-// Both gRPC services are exposed (Requirements 12.2, 12.3)
+// Log-backend wire surface (per-topic-log-durability Requirements 2.1, 2.4)
 // ---------------------------------------------------------------------------
 
+/// The per-topic log backend selection is carried on the create-topic request,
+/// the topic-description type, and the replicated create-topic command
+/// (per-topic-log-durability Requirements 2.1, 2.4). Constructing each message
+/// with its `log_backend` field set is a compile-time assertion that the field
+/// exists on every message that must carry it, plus a runtime check that the
+/// value round-trips.
+#[test]
+fn log_backend_field_is_present_on_create_request_topic_info_and_command() {
+    // `CreateTopicRequest` carries the requested backend (Requirement 2.1).
+    let request = v1::CreateTopicRequest {
+        name: "orders".to_string(),
+        partitions: 3,
+        log_backend: v1::LogBackend::Durable as i32,
+    };
+    assert_eq!(request.log_backend, v1::LogBackend::Durable as i32);
+
+    // `TopicInfo` reports the topic's backend (Requirement 2.4).
+    let info = v1::TopicInfo {
+        name: "orders".to_string(),
+        partition_count: 3,
+        partitions: Vec::new(),
+        log_backend: v1::LogBackend::InMemory as i32,
+    };
+    assert_eq!(info.log_backend, v1::LogBackend::InMemory as i32);
+
+    // The replicated `CreateTopicCommand` carries the backend so every node
+    // applying the committed command records the same selection (Requirement
+    // 2.3).
+    let command = v1::CreateTopicCommand {
+        name: "orders".to_string(),
+        partitions: Vec::new(),
+        log_backend: v1::LogBackend::Durable as i32,
+    };
+    assert_eq!(command.log_backend, v1::LogBackend::Durable as i32);
+}
+
+/// The `LogBackend` enum exposes a zero-valued `UNSPECIFIED` sentinel so an
+/// absent wire value decodes to the proto3 default, which the server treats as
+/// durable (per-topic-log-durability Requirement 2.4, and Requirement 2.2 for
+/// the server-side default). Pinning the discriminant to 0 locks the sentinel
+/// in place.
+#[test]
+fn log_backend_has_zero_valued_unspecified_sentinel() {
+    assert_eq!(v1::LogBackend::Unspecified as i32, 0);
+    assert_eq!(v1::LogBackend::try_from(0), Ok(v1::LogBackend::Unspecified));
+
+    // The two concrete backends are the non-sentinel values.
+    assert_eq!(v1::LogBackend::Durable as i32, 1);
+    assert_eq!(v1::LogBackend::InMemory as i32, 2);
+}
+
+// ---------------------------------------------------------------------------
+// Both gRPC services are exposed (Requirements 12.2, 12.3)
+// ---------------------------------------------------------------------------
 /// The `VelaClient` client-facing service is generated into `vela-proto`: a
 /// client stub (`vela_client_client::VelaClientClient`) and a server trait
 /// (`vela_client_server::VelaClient`) (Requirement 12.2). Naming both paths is a

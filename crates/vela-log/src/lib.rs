@@ -85,6 +85,28 @@ pub struct Snapshot {
     pub entries: Vec<LogEntry>,
 }
 
+/// A Raft replica's persistent hard state: the consensus state that must
+/// survive a restart for safety.
+///
+/// Raft requires that `current_term` and `voted_for` be durable: a node that
+/// forgets its vote or term after a restart can grant a second vote in a term
+/// or regress its term, violating the at-most-one-vote-per-term and
+/// monotonic-term guarantees. For a durable [`LogStorage`] this state is
+/// persisted and restored via [`persist_hard_state`](LogStorage::persist_hard_state)
+/// and [`hard_state`](LogStorage::hard_state); for a volatile log such as
+/// [`InMemoryLog`] it stays in memory only, consistent with the backend.
+///
+/// `voted_for` is `None` when the replica has not voted in `current_term`. The
+/// [`Default`] is term `0` with no vote, matching a fresh log.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct HardState {
+    /// The replica's current Raft term.
+    pub current_term: u64,
+    /// The candidate this replica voted for in `current_term`, or `None` if it
+    /// has not voted in that term.
+    pub voted_for: Option<u64>,
+}
+
 /// Errors returned by [`LogStorage`] operations.
 ///
 /// Does not derive `PartialEq`/`Eq`: the [`Io`](LogError::Io) variant carries a
@@ -230,6 +252,30 @@ pub trait LogStorage {
     /// returns [`LogError::Io`] if the force fails.
     fn flush(&mut self) -> Result<(), LogError> {
         Ok(())
+    }
+
+    /// Persist the Raft [`HardState`] (`current_term`, `voted_for`) to stable
+    /// storage (Requirements 9.3, 10.1, 10.2).
+    ///
+    /// Additive seam mirroring [`flush`](LogStorage::flush): the default is a
+    /// successful no-op, which is correct for volatile implementations such as
+    /// [`InMemoryLog`] whose hard state stays in memory only. A durable
+    /// implementation overrides it to write the state durably before returning
+    /// and returns [`LogError::Io`] if the persist fails.
+    fn persist_hard_state(&mut self, _hard_state: HardState) -> Result<(), LogError> {
+        Ok(())
+    }
+
+    /// Return the persisted Raft [`HardState`] recovered at open, or `None`
+    /// when this log does not persist hard state (Requirements 10.1, 10.2).
+    ///
+    /// Additive seam mirroring [`flush`](LogStorage::flush): the default is
+    /// `None`, correct for volatile implementations such as [`InMemoryLog`]
+    /// that keep no durable hard state. A durable implementation overrides it
+    /// to return the recovered `(current_term, voted_for)`; a fresh durable log
+    /// reports [`HardState::default`].
+    fn hard_state(&self) -> Option<HardState> {
+        None
     }
 }
 

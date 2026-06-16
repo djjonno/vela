@@ -1,0 +1,16 @@
+{
+  "enabled": true,
+  "name": "Update README on Source Change",
+  "description": "When source files under crates/ are edited, review the changes and update the README documentation to reflect them.",
+  "version": "1",
+  "when": {
+    "type": "fileEdited",
+    "patterns": [
+      "crates/**/*.rs"
+    ]
+  },
+  "then": {
+    "type": "askAgent",
+    "prompt": "Source code under crates/ has changed. Review the edited file(s) and determine whether the change affects anything documented in README.md (features, architecture, crate responsibilities, APIs, usage, commands, or behavior). If it does, update README.md to accurately reflect the current state of the code. Keep edits focused and consistent with the existing README structure and tone. If the change has no documentation impact, make no edits and briefly say so."
+  }
+}

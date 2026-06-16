@@ -11,7 +11,7 @@
 //! Validates: Requirements 2.5, 2.6, 2.7
 
 use proptest::prelude::*;
-use vela_core::{ClusterMetadata, Member, NodeAvailability, NodeId};
+use vela_core::{ClusterMetadata, LogBackend, Member, NodeAvailability, NodeId};
 
 /// The bounds the production code enforces, restated here so the generators can
 /// deliberately produce values that fall *outside* them.
@@ -166,7 +166,7 @@ proptest! {
         let mut meta = req.meta.clone();
         let before = meta.clone();
 
-        let result = meta.create_topic(&req.name, req.partition_count, req.replication_factor);
+        let result = meta.create_topic(&req.name, req.partition_count, req.replication_factor, LogBackend::Durable);
 
         // The request must be rejected (Requirements 2.5, 2.6, 2.7).
         prop_assert!(

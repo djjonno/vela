@@ -33,8 +33,8 @@
 use prost::Message as _;
 
 use vela_core::{
-    ClusterMetadata, CoreError, Member, NodeAvailability, NodeId, Partition, PartitionIndex,
-    Record, Topic, TopicState,
+    ClusterCommand, ClusterMetadata, CoreError, LogBackend, Member, NodeAvailability, NodeId,
+    Partition, PartitionIndex, Record, Topic, TopicState,
 };
 use vela_log::LogError;
 use vela_raft::{
@@ -294,6 +294,7 @@ pub fn topic_to_proto(topic: &Topic) -> v1::TopicInfo {
         name: topic.name.clone(),
         partition_count: topic.partitions.len() as u32,
         partitions: topic.partitions.iter().map(partition_to_proto).collect(),
+        log_backend: log_backend_to_proto(topic.backend) as i32,
     }
 }
 
@@ -304,6 +305,54 @@ pub fn topic_from_proto(info: &v1::TopicInfo) -> Topic {
         name: info.name.clone(),
         partitions: info.partitions.iter().map(partition_from_proto).collect(),
         state: TopicState::Active,
+        backend: log_backend_from_proto_lenient(info.log_backend),
+    }
+}
+
+/// Map a domain [`LogBackend`] to its wire [`v1::LogBackend`] discriminant.
+pub fn log_backend_to_proto(backend: LogBackend) -> v1::LogBackend {
+    match backend {
+        LogBackend::Durable => v1::LogBackend::Durable,
+        LogBackend::InMemory => v1::LogBackend::InMemory,
+    }
+}
+
+/// Leniently map a wire `log_backend` discriminant to a domain [`LogBackend`].
+///
+/// The proto3 zero value (`LOG_BACKEND_UNSPECIFIED`) and any unrecognized value
+/// resolve to [`LogBackend::Durable`], matching the server's
+/// unspecified-means-durable default (Requirement 2.2). This lenient form is
+/// used when decoding an already-agreed metadata snapshot ([`topic_from_proto`]),
+/// where the backend was validated upstream on the create path. The strict,
+/// validating decoder used by the create-topic service path is
+/// [`log_backend_from_proto`].
+pub fn log_backend_from_proto_lenient(value: i32) -> LogBackend {
+    match v1::LogBackend::try_from(value) {
+        Ok(v1::LogBackend::InMemory) => LogBackend::InMemory,
+        _ => LogBackend::Durable,
+    }
+}
+
+/// Strictly decode a wire `log_backend` discriminant from a create-topic
+/// request into a domain [`LogBackend`] (Requirement 2.2, 2.5).
+///
+/// The mapping is:
+///
+/// - `0` (`LOG_BACKEND_UNSPECIFIED`) → [`LogBackend::Durable`] — an omitted
+///   selection defaults to the durable backend (Requirement 2.2).
+/// - `1` (`LOG_BACKEND_DURABLE`) → [`LogBackend::Durable`].
+/// - `2` (`LOG_BACKEND_IN_MEMORY`) → [`LogBackend::InMemory`].
+/// - any other integer → [`CoreError::InvalidLogBackend`], a validation error
+///   that the caller surfaces while creating no topic (Requirement 2.5).
+///
+/// Unknown integers are detected via [`v1::LogBackend::try_from`], which returns
+/// `Err` for any value outside the defined enum, so an out-of-range wire value
+/// maps to the validation error rather than silently defaulting.
+pub(crate) fn log_backend_from_proto(value: i32) -> Result<LogBackend, CoreError> {
+    match v1::LogBackend::try_from(value) {
+        Ok(v1::LogBackend::Unspecified) | Ok(v1::LogBackend::Durable) => Ok(LogBackend::Durable),
+        Ok(v1::LogBackend::InMemory) => Ok(LogBackend::InMemory),
+        Err(_) => Err(CoreError::InvalidLogBackend),
     }
 }
 
@@ -348,6 +397,100 @@ pub fn cluster_metadata_from_proto(metadata: &v1::ClusterMetadata) -> ClusterMet
 }
 
 // ---------------------------------------------------------------------------
+// Cluster commands (the replicated metadata log payloads)
+// ---------------------------------------------------------------------------
+//
+// A committed metadata change is a domain [`ClusterCommand`] encoded into the
+// durable metadata Raft group's log as a `PayloadKind::Cluster` entry. These
+// codecs are the single place a domain command is translated to/from its wire
+// [`v1::ClusterCommand`] form and the prost bytes the log stores, so the durable
+// `__meta` group can persist the catalogue and rebuild it on recovery
+// (Requirement 16, 17, 18). `vela-core` stays free of the wire encoding: it is
+// handed an already-decoded command on apply and a decoder closure on recover.
+
+/// Convert a domain [`ClusterCommand`] into its wire [`v1::ClusterCommand`].
+///
+/// Each variant maps to the matching [`v1::cluster_command::Command`], carrying
+/// the topic's `log_backend` on a create so every node that replays the
+/// committed command records the same backend (Requirement 2.3, 3.2).
+pub fn cluster_command_to_proto(command: &ClusterCommand) -> v1::ClusterCommand {
+    let command = match command {
+        ClusterCommand::CreateTopic {
+            name,
+            partitions,
+            backend,
+        } => v1::cluster_command::Command::CreateTopic(v1::CreateTopicCommand {
+            name: name.clone(),
+            partitions: partitions.iter().map(partition_to_proto).collect(),
+            log_backend: log_backend_to_proto(*backend) as i32,
+        }),
+        ClusterCommand::DeleteTopic { name } => {
+            v1::cluster_command::Command::DeleteTopic(v1::DeleteTopicCommand { name: name.clone() })
+        }
+        ClusterCommand::SetAvailability { node, availability } => {
+            v1::cluster_command::Command::SetAvailability(v1::SetAvailabilityCommand {
+                node: node.0.clone(),
+                availability: availability_to_proto(*availability) as i32,
+            })
+        }
+    };
+    v1::ClusterCommand {
+        command: Some(command),
+    }
+}
+
+/// Convert a wire [`v1::ClusterCommand`] into a domain [`ClusterCommand`].
+///
+/// The create variant decodes its backend leniently
+/// ([`log_backend_from_proto_lenient`]): the command was validated on the create
+/// path before it was ever committed, so on replay an unspecified/unknown
+/// backend resolves to [`LogBackend::Durable`]. An unset oneof (only possible
+/// from corrupt bytes, never from [`cluster_command_to_proto`]) folds into a
+/// benign no-op: a [`ClusterCommand::SetAvailability`] for the empty node id,
+/// which [`vela_core::apply_command`] applies as a no-op against a non-member.
+pub fn cluster_command_from_proto(command: &v1::ClusterCommand) -> ClusterCommand {
+    match &command.command {
+        Some(v1::cluster_command::Command::CreateTopic(create)) => ClusterCommand::CreateTopic {
+            name: create.name.clone(),
+            partitions: create.partitions.iter().map(partition_from_proto).collect(),
+            backend: log_backend_from_proto_lenient(create.log_backend),
+        },
+        Some(v1::cluster_command::Command::DeleteTopic(delete)) => ClusterCommand::DeleteTopic {
+            name: delete.name.clone(),
+        },
+        Some(v1::cluster_command::Command::SetAvailability(set)) => {
+            ClusterCommand::SetAvailability {
+                node: NodeId::new(&set.node),
+                availability: availability_from_proto(set.availability),
+            }
+        }
+        None => ClusterCommand::SetAvailability {
+            node: NodeId::new(""),
+            availability: NodeAvailability::Unavailable,
+        },
+    }
+}
+
+/// Encode a domain [`ClusterCommand`] into the prost bytes stored in a
+/// `PayloadKind::Cluster` log entry of the durable metadata group.
+pub fn cluster_command_to_bytes(command: &ClusterCommand) -> Vec<u8> {
+    cluster_command_to_proto(command).encode_to_vec()
+}
+
+/// Decode the prost bytes of a committed `PayloadKind::Cluster` log entry back
+/// into a domain [`ClusterCommand`].
+///
+/// This is the decoder the server hands to
+/// [`MetadataController::recover_durable`](vela_core::MetadataController::recover_durable)
+/// so `vela-core` can rebuild the catalogue without knowing the wire encoding.
+/// Bytes that fail to decode (only possible from corruption) fold into the same
+/// benign no-op [`cluster_command_from_proto`] uses for an unset command.
+pub fn cluster_command_from_bytes(bytes: &[u8]) -> ClusterCommand {
+    let command = v1::ClusterCommand::decode(bytes).unwrap_or(v1::ClusterCommand { command: None });
+    cluster_command_from_proto(&command)
+}
+
+// ---------------------------------------------------------------------------
 // Typed errors (Requirement 12.4, 11.2)
 // ---------------------------------------------------------------------------
 //
@@ -382,7 +525,8 @@ pub fn core_error_to_vela_error(error: &CoreError) -> v1::VelaError {
     let (code, leader) = match error {
         CoreError::InvalidTopicName
         | CoreError::InvalidPartitionCount(_)
-        | CoreError::InvalidConsumeParams => (v1::ErrorCode::Validation, None),
+        | CoreError::InvalidConsumeParams
+        | CoreError::InvalidLogBackend => (v1::ErrorCode::Validation, None),
         CoreError::TopicNotFound(_) => (v1::ErrorCode::TopicNotFound, None),
         CoreError::PartitionNotFound { .. } => (v1::ErrorCode::PartitionNotFound, None),
         CoreError::TopicExists(_) => (v1::ErrorCode::TopicExists, None),
@@ -478,6 +622,7 @@ pub fn vela_error_from_status(status: &tonic::Status) -> Option<v1::VelaError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     // ---- payloads and records --------------------------------------------
 
@@ -706,6 +851,7 @@ mod tests {
                 },
             ],
             state: TopicState::Active,
+            backend: LogBackend::Durable,
         };
         let proto = topic_to_proto(&topic);
         assert_eq!(proto.partition_count, 2);
@@ -715,6 +861,7 @@ mod tests {
         assert_eq!(back.name, topic.name);
         assert_eq!(back.partitions, topic.partitions);
         assert_eq!(back.state, TopicState::Active);
+        assert_eq!(back.backend, topic.backend);
     }
 
     #[test]
@@ -757,6 +904,7 @@ mod tests {
                     leader: Some(NodeId::new("node-a")),
                 }],
                 state: TopicState::Active,
+                backend: LogBackend::Durable,
             },
         );
 
@@ -764,7 +912,62 @@ mod tests {
         assert_eq!(back, metadata);
     }
 
-    // ---- error mapping ----------------------------------------------------
+    // ---- cluster commands -------------------------------------------------
+
+    #[test]
+    fn create_topic_command_round_trips_with_backend() {
+        for backend in [LogBackend::Durable, LogBackend::InMemory] {
+            let command = ClusterCommand::CreateTopic {
+                name: "orders".to_string(),
+                partitions: vec![Partition {
+                    index: PartitionIndex(0),
+                    replicas: vec![NodeId::new("node-a"), NodeId::new("node-b")],
+                    leader: Some(NodeId::new("node-a")),
+                }],
+                backend,
+            };
+            // Through the wire type and through the prost bytes the metadata log
+            // stores, the command (including its backend) round-trips intact.
+            let back = cluster_command_from_proto(&cluster_command_to_proto(&command));
+            assert_eq!(back, command);
+            let from_bytes = cluster_command_from_bytes(&cluster_command_to_bytes(&command));
+            assert_eq!(from_bytes, command);
+        }
+    }
+
+    #[test]
+    fn delete_and_set_availability_commands_round_trip() {
+        let delete = ClusterCommand::DeleteTopic {
+            name: "orders".to_string(),
+        };
+        assert_eq!(
+            cluster_command_from_bytes(&cluster_command_to_bytes(&delete)),
+            delete
+        );
+
+        let set = ClusterCommand::SetAvailability {
+            node: NodeId::new("node-a"),
+            availability: NodeAvailability::Unavailable,
+        };
+        assert_eq!(
+            cluster_command_from_bytes(&cluster_command_to_bytes(&set)),
+            set
+        );
+    }
+
+    #[test]
+    fn corrupt_cluster_command_bytes_decode_to_a_benign_noop() {
+        // Bytes that are not a valid ClusterCommand fold into a SetAvailability
+        // for the empty node id, which applies as a no-op against any metadata.
+        let command = cluster_command_from_bytes(b"not a valid cluster command");
+        assert_eq!(
+            command,
+            ClusterCommand::SetAvailability {
+                node: NodeId::new(""),
+                availability: NodeAvailability::Unavailable,
+            }
+        );
+    }
 
     #[test]
     fn core_errors_map_to_their_error_codes() {
@@ -775,6 +978,7 @@ mod tests {
                 v1::ErrorCode::Validation,
             ),
             (CoreError::InvalidConsumeParams, v1::ErrorCode::Validation),
+            (CoreError::InvalidLogBackend, v1::ErrorCode::Validation),
             (
                 CoreError::TopicNotFound("x".to_string()),
                 v1::ErrorCode::TopicNotFound,
@@ -936,5 +1140,95 @@ mod tests {
         assert_eq!(recovered.code, v1::ErrorCode::Internal as i32);
         assert_eq!(recovered.message, error.to_string());
         assert_eq!(recovered.leader, None);
+    }
+
+    // ---- log-backend decoding (Requirement 2.2, 2.5) ----------------------
+
+    #[test]
+    fn unspecified_backend_decodes_to_durable() {
+        // An omitted/unspecified wire selection defaults to Durable (R2.2).
+        assert_eq!(
+            log_backend_from_proto(v1::LogBackend::Unspecified as i32),
+            Ok(LogBackend::Durable)
+        );
+    }
+
+    #[test]
+    fn durable_backend_decodes_to_durable() {
+        assert_eq!(
+            log_backend_from_proto(v1::LogBackend::Durable as i32),
+            Ok(LogBackend::Durable)
+        );
+    }
+
+    #[test]
+    fn in_memory_backend_decodes_to_in_memory() {
+        assert_eq!(
+            log_backend_from_proto(v1::LogBackend::InMemory as i32),
+            Ok(LogBackend::InMemory)
+        );
+    }
+
+    #[test]
+    fn out_of_range_backend_is_rejected_as_validation_error() {
+        // A value outside the defined enum is a validation error (R2.5).
+        for value in [3, 4, 99, -1, i32::MAX, i32::MIN] {
+            assert_eq!(
+                log_backend_from_proto(value),
+                Err(CoreError::InvalidLogBackend),
+                "value {value} must be rejected"
+            );
+            // And that error classifies as a validation error on the wire.
+            let vela = core_error_to_vela_error(&CoreError::InvalidLogBackend);
+            assert_eq!(vela.code, v1::ErrorCode::Validation as i32);
+        }
+    }
+
+    // Feature: per-topic-log-durability, Property 5
+    //
+    // Property 5: for any integer that is neither the unspecified sentinel nor a
+    // defined backend value, the wire-to-domain decoder yields a validation
+    // error and the cluster metadata is left unchanged (no topic created).
+    //
+    // Validates: Requirements 2.5
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(256))]
+
+        #[test]
+        fn out_of_range_backend_rejected_with_no_side_effects(
+            value in any::<i32>().prop_filter(
+                "exclude the unspecified sentinel and defined backend values",
+                |v| !(0..=2).contains(v),
+            ),
+        ) {
+            // The decode-before-create ordering means a rejected decode never
+            // reaches `create_topic`: model that here with a fresh metadata view
+            // that is only mutated *after* a successful decode.
+            let mut metadata = ClusterMetadata::new();
+            metadata.members = vec![Member {
+                id: NodeId::new("node-0"),
+                addr: "node-0:7001".to_string(),
+                availability: NodeAvailability::Available,
+            }];
+            let before = metadata.clone();
+
+            let decoded = log_backend_from_proto(value);
+
+            // The decoder yields the validation error ...
+            prop_assert_eq!(decoded.clone(), Err(CoreError::InvalidLogBackend));
+            // ... which maps to a validation error on the wire (R2.5).
+            let vela = core_error_to_vela_error(&CoreError::InvalidLogBackend);
+            prop_assert_eq!(vela.code, v1::ErrorCode::Validation as i32);
+
+            // Mirroring the service path: a create is attempted only on a
+            // successful decode, so an error leaves the metadata untouched —
+            // no topic is created.
+            if let Ok(backend) = decoded {
+                metadata
+                    .create_topic("orders", 1, 1, backend)
+                    .expect("valid create");
+            }
+            prop_assert_eq!(metadata, before, "metadata must be unchanged when decode fails");
+        }
     }
 }

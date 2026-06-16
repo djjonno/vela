@@ -101,6 +101,7 @@ fn metadata_with_leader(topic: &str, believed_leader: Option<NodeId>) -> Cluster
                 leader: believed_leader,
             }],
             state: TopicState::Active,
+            backend: vela_core::LogBackend::Durable,
         },
     );
     meta

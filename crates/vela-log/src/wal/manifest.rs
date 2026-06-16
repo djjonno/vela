@@ -22,8 +22,10 @@
 //! 31      1+8   durable_last    tag(u8) + u64 LE   (0 => None, 1 => Some)
 //! 40      8     durable_segment u64 LE  (base index of the segment holding durable_last)
 //! 48      8     durable_offset  u64 LE  (byte offset just past durable_last's frame)
-//! 56      4     crc     u32 LE  (CRC32C over bytes [0 .. 56), i.e. all preceding fields)
-//! 60..128       zero padding
+//! 56      8     hs_current_term u64 LE  (Raft hard state: persisted current term)
+//! 64      1+8   hs_voted_for    tag(u8) + u64 LE   (0 => None, 1 => Some) Raft vote
+//! 73      4     crc     u32 LE  (CRC32C over bytes [0 .. 73), i.e. all preceding fields)
+//! 77..128       zero padding
 //! ```
 //!
 //! # Crash-atomic double-buffering (Requirement 6.8)
@@ -63,7 +65,12 @@ const MAGIC: u32 = u32::from_le_bytes(*b"VWAL");
 
 /// On-disk slot format version. A slot carrying any other version is rejected
 /// by [`decode_slot`], so a future format change cannot be misread as valid.
-const VERSION: u16 = 1;
+///
+/// Bumped from `1` to `2` when the Raft hard state (`hs_current_term`,
+/// `hs_voted_for`) was added to the slot: a slot written by the older format is
+/// rejected on read and recovery falls back to the empty state rather than
+/// misreading the shorter layout.
+const VERSION: u16 = 2;
 
 /// Number of double-buffering slots in the manifest file.
 const SLOT_COUNT: u64 = 2;
@@ -84,7 +91,10 @@ const OFF_DLAST_TAG: usize = 31;
 const OFF_DLAST_VAL: usize = 32;
 const OFF_DSEG: usize = 40;
 const OFF_DOFF: usize = 48;
-const OFF_CRC: usize = 56;
+const OFF_HS_TERM: usize = 56;
+const OFF_HS_VOTE_TAG: usize = 64;
+const OFF_HS_VOTE_VAL: usize = 65;
+const OFF_CRC: usize = 73;
 
 /// Number of bytes a slot actually uses: the fields plus the trailing CRC. The
 /// rest of the slot (up to [`SLOT_SIZE`]) is zero padding.
@@ -114,6 +124,13 @@ pub(crate) struct ManifestState {
     pub durable_segment: u64,
     /// Byte offset just past `durable_last`'s frame within its segment.
     pub durable_offset: u64,
+    /// Raft hard state: the replica's persisted `current_term` (Requirement
+    /// 9.2, 10.1). `0` for a fresh log that has never persisted hard state.
+    pub hs_current_term: u64,
+    /// Raft hard state: the candidate this replica persisted a vote for in
+    /// `hs_current_term`, or `None` when it has not voted in that term
+    /// (Requirements 9.1, 10.2).
+    pub hs_voted_for: Option<u64>,
 }
 
 /// Encode `(seq, state)` into a fixed [`SLOT_SIZE`]-byte slot buffer.
@@ -131,6 +148,13 @@ fn encode_slot(seq: u64, state: &ManifestState) -> [u8; SLOT_SIZE as usize] {
     put_option(&mut buf, OFF_DLAST_TAG, OFF_DLAST_VAL, state.durable_last);
     buf[OFF_DSEG..OFF_DSEG + 8].copy_from_slice(&state.durable_segment.to_le_bytes());
     buf[OFF_DOFF..OFF_DOFF + 8].copy_from_slice(&state.durable_offset.to_le_bytes());
+    buf[OFF_HS_TERM..OFF_HS_TERM + 8].copy_from_slice(&state.hs_current_term.to_le_bytes());
+    put_option(
+        &mut buf,
+        OFF_HS_VOTE_TAG,
+        OFF_HS_VOTE_VAL,
+        state.hs_voted_for,
+    );
 
     let crc = Crc32c::checksum(&buf[..OFF_CRC]);
     buf[OFF_CRC..OFF_CRC + 4].copy_from_slice(&crc.to_le_bytes());
@@ -166,6 +190,7 @@ fn decode_slot(buf: &[u8]) -> Option<(u64, ManifestState)> {
     let seq = read_u64(buf, OFF_SEQ);
     let commit_index = get_option(buf, OFF_COMMIT_TAG, OFF_COMMIT_VAL)?;
     let durable_last = get_option(buf, OFF_DLAST_TAG, OFF_DLAST_VAL)?;
+    let hs_voted_for = get_option(buf, OFF_HS_VOTE_TAG, OFF_HS_VOTE_VAL)?;
 
     let state = ManifestState {
         log_start_index: read_u64(buf, OFF_LOG_START),
@@ -173,6 +198,8 @@ fn decode_slot(buf: &[u8]) -> Option<(u64, ManifestState)> {
         durable_last,
         durable_segment: read_u64(buf, OFF_DSEG),
         durable_offset: read_u64(buf, OFF_DOFF),
+        hs_current_term: read_u64(buf, OFF_HS_TERM),
+        hs_voted_for,
     };
     Some((seq, state))
 }
@@ -357,7 +384,8 @@ mod tests {
         PathBuf::from(DIR).join(MANIFEST_FILE_NAME)
     }
 
-    /// A representative, fully-populated state for round-trip tests.
+    /// A representative, fully-populated state for round-trip tests. Includes a
+    /// non-default Raft hard state so the version-2 fields are exercised.
     fn sample_state() -> ManifestState {
         ManifestState {
             log_start_index: 4,
@@ -365,6 +393,8 @@ mod tests {
             durable_last: Some(12),
             durable_segment: 4,
             durable_offset: 512,
+            hs_current_term: 7,
+            hs_voted_for: Some(3),
         }
     }
 
@@ -404,6 +434,8 @@ mod tests {
                 durable_last: None,
                 durable_segment: 0,
                 durable_offset: 0,
+                hs_current_term: 0,
+                hs_voted_for: None,
             }
         );
     }
@@ -436,6 +468,8 @@ mod tests {
             durable_last: None,
             durable_segment: 0,
             durable_offset: 0,
+            hs_current_term: 0,
+            hs_voted_for: None,
         };
 
         let (mut manifest, _) = Manifest::open(&fs, Path::new(DIR)).unwrap();
@@ -443,6 +477,93 @@ mod tests {
 
         let (_, recovered) = Manifest::open(&fs, Path::new(DIR)).unwrap();
         assert_eq!(recovered, Some(state));
+    }
+
+    // --- hard state (version-2 fields) round-trip --------------------------
+
+    #[test]
+    fn round_trips_hard_state_fields() {
+        let fs = mem_fs();
+        // A populated hard state (term + a vote) must survive encode/decode and
+        // a reopen byte-for-byte, exercising the new version-2 slot fields.
+        let state = ManifestState {
+            hs_current_term: 42,
+            hs_voted_for: Some(7),
+            ..ManifestState::default()
+        };
+
+        let (mut manifest, _) = Manifest::open(&fs, Path::new(DIR)).unwrap();
+        manifest.write(&fs, &state).unwrap();
+
+        let (_, recovered) = Manifest::open(&fs, Path::new(DIR)).unwrap();
+        assert_eq!(recovered, Some(state));
+        assert_eq!(recovered.unwrap().hs_current_term, 42);
+        assert_eq!(recovered.unwrap().hs_voted_for, Some(7));
+    }
+
+    #[test]
+    fn round_trips_hard_state_without_a_vote() {
+        let fs = mem_fs();
+        // A term advanced with no vote yet (`voted_for == None`) must round-trip
+        // with its `None` tag preserved.
+        let state = ManifestState {
+            hs_current_term: 9,
+            hs_voted_for: None,
+            ..ManifestState::default()
+        };
+
+        let (mut manifest, _) = Manifest::open(&fs, Path::new(DIR)).unwrap();
+        manifest.write(&fs, &state).unwrap();
+
+        let (_, recovered) = Manifest::open(&fs, Path::new(DIR)).unwrap();
+        assert_eq!(recovered, Some(state));
+    }
+
+    #[test]
+    fn slot_uses_the_bumped_version() {
+        // The hard-state-bearing slot is written under version 2; a slot
+        // claiming the older version 1 is rejected, so a pre-upgrade slot can
+        // never be misread as the longer version-2 layout.
+        assert_eq!(VERSION, 2);
+        let fs = mem_fs();
+        let (mut manifest, _) = Manifest::open(&fs, Path::new(DIR)).unwrap();
+        manifest.write(&fs, &sample_state()).unwrap();
+
+        // The persisted slot carries the current version in its version field.
+        let bytes = fs.file_bytes(&manifest_path()).unwrap();
+        let stored = u16::from_le_bytes([bytes[OFF_VERSION], bytes[OFF_VERSION + 1]]);
+        assert_eq!(stored, VERSION);
+    }
+
+    #[test]
+    fn torn_newest_slot_falls_back_to_prior_hard_state() {
+        let fs = mem_fs();
+        let (mut manifest, _) = Manifest::open(&fs, Path::new(DIR)).unwrap();
+
+        // Two slots with distinct hard states: the older grants a vote in
+        // term 3, the newer advances to term 4.
+        let older = ManifestState {
+            hs_current_term: 3,
+            hs_voted_for: Some(1),
+            ..ManifestState::default()
+        }; // seq 1 -> slot 0
+        let newer = ManifestState {
+            hs_current_term: 4,
+            hs_voted_for: Some(2),
+            ..ManifestState::default()
+        }; // seq 2 -> slot 1
+        manifest.write(&fs, &older).unwrap();
+        manifest.write(&fs, &newer).unwrap();
+
+        // Tear the newest slot (slot 1) so it no longer decodes.
+        fs.truncate_file(&manifest_path(), SLOT_SIZE + OFF_CRC as u64);
+
+        // Recovery falls back to the prior intact slot, restoring its exact
+        // hard state rather than trusting the torn newest slot.
+        let (_, recovered) = Manifest::open(&fs, Path::new(DIR)).unwrap();
+        assert_eq!(recovered, Some(older));
+        assert_eq!(recovered.unwrap().hs_current_term, 3);
+        assert_eq!(recovered.unwrap().hs_voted_for, Some(1));
     }
 
     // --- alternation across writes (double-buffering) ----------------------
@@ -458,6 +579,8 @@ mod tests {
             durable_last: Some(0),
             durable_segment: 0,
             durable_offset: 10,
+            hs_current_term: 0,
+            hs_voted_for: None,
         };
         let b = ManifestState {
             commit_index: Some(1),

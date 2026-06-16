@@ -16,7 +16,7 @@
 //! Validates: Requirements 2.1, 2.2
 
 use proptest::prelude::*;
-use vela_core::{ClusterMetadata, Member, NodeAvailability, NodeId, PartitionIndex};
+use vela_core::{ClusterMetadata, LogBackend, Member, NodeAvailability, NodeId, PartitionIndex};
 
 /// The replication factor used throughout this test. The cluster is built with
 /// at least this many available members so that creation is never rejected for
@@ -58,7 +58,7 @@ proptest! {
 
         // A valid name and in-range partition count must create successfully
         // (Requirement 2.1).
-        meta.create_topic(&name, partition_count, REPLICATION_FACTOR)
+        meta.create_topic(&name, partition_count, REPLICATION_FACTOR, LogBackend::Durable)
             .expect("valid topic creation must succeed");
 
         let topic = meta

@@ -13,7 +13,8 @@
 //! produces the topic-creation variants.
 
 use crate::model::{
-    ClusterMetadata, Member, NodeAvailability, NodeId, Partition, PartitionIndex, Topic, TopicState,
+    ClusterMetadata, LogBackend, Member, NodeAvailability, NodeId, Partition, PartitionIndex,
+    Topic, TopicState,
 };
 
 /// The minimum topic name length (Requirement 2.1, 2.6).
@@ -65,6 +66,11 @@ pub enum CoreError {
     /// Consume parameters (offset or max count) are invalid (Requirement 5.7).
     #[error("invalid consume parameters")]
     InvalidConsumeParams,
+    /// A create-topic request carried a log-backend value on the wire that is
+    /// neither unspecified, `Durable`, nor `In_Memory` (Requirement 2.5). The
+    /// request is rejected as a validation error and no topic is created.
+    #[error("invalid log backend")]
+    InvalidLogBackend,
     /// Fewer available nodes than the replication factor (Requirement 2.7).
     #[error("insufficient nodes: have {have}, need {need}")]
     InsufficientNodes {
@@ -142,11 +148,17 @@ impl ClusterMetadata {
     /// - [`CoreError::TopicExists`] if a topic of that name already exists.
     /// - [`CoreError::InsufficientNodes`] if fewer than `replication_factor`
     ///   members are available.
+    ///
+    /// The topic records `backend` as its log backend; it is fixed at creation
+    /// and immutable for the topic's lifetime (Requirement 3.1, 3.3). Callers
+    /// that do not care about durability pass [`LogBackend::Durable`], the
+    /// default backend (Requirement 1.2).
     pub fn create_topic(
         &mut self,
         name: &str,
         partition_count: u32,
         replication_factor: usize,
+        backend: LogBackend,
     ) -> Result<(), CoreError> {
         // --- Validate everything before touching `self` (Requirement 2.4–2.7). ---
         if !is_valid_topic_name(name) {
@@ -175,6 +187,7 @@ impl ClusterMetadata {
                 name: name.to_string(),
                 partitions,
                 state: TopicState::Active,
+                backend,
             },
         );
         self.epoch += 1;
@@ -377,7 +390,8 @@ mod tests {
     #[test]
     fn happy_path_registers_partitions_with_distinct_balanced_replicas() {
         let mut meta = cluster(3);
-        meta.create_topic("orders", 6, 3).unwrap();
+        meta.create_topic("orders", 6, 3, LogBackend::Durable)
+            .unwrap();
 
         let topic = &meta.topics["orders"];
         assert_eq!(topic.name, "orders");
@@ -408,7 +422,8 @@ mod tests {
     #[test]
     fn leadership_is_balanced_per_topic() {
         let mut meta = cluster(4);
-        meta.create_topic("events", 10, 2).unwrap();
+        meta.create_topic("events", 10, 2, LogBackend::Durable)
+            .unwrap();
         let topic = &meta.topics["events"];
 
         let mut leader_counts = std::collections::BTreeMap::new();
@@ -427,7 +442,7 @@ mod tests {
     #[test]
     fn replication_factor_equal_to_node_count_uses_every_node() {
         let mut meta = cluster(3);
-        meta.create_topic("rf3", 3, 3).unwrap();
+        meta.create_topic("rf3", 3, 3, LogBackend::Durable).unwrap();
         for p in &meta.topics["rf3"].partitions {
             let distinct: BTreeSet<&NodeId> = p.replicas.iter().collect();
             assert_eq!(distinct.len(), 3);
@@ -439,7 +454,7 @@ mod tests {
         let mut meta = cluster(3);
         let before = meta.clone();
         assert_eq!(
-            meta.create_topic("", 1, 1),
+            meta.create_topic("", 1, 1, LogBackend::Durable),
             Err(CoreError::InvalidTopicName)
         );
         assert_eq!(meta, before, "metadata must be unchanged on rejection");
@@ -450,7 +465,7 @@ mod tests {
         let mut meta = cluster(3);
         let before = meta.clone();
         assert_eq!(
-            meta.create_topic("bad name!", 1, 1),
+            meta.create_topic("bad name!", 1, 1, LogBackend::Durable),
             Err(CoreError::InvalidTopicName)
         );
         assert_eq!(meta, before);
@@ -462,7 +477,7 @@ mod tests {
         let long = "a".repeat(256);
         let before = meta.clone();
         assert_eq!(
-            meta.create_topic(&long, 1, 1),
+            meta.create_topic(&long, 1, 1, LogBackend::Durable),
             Err(CoreError::InvalidTopicName)
         );
         assert_eq!(meta, before);
@@ -471,9 +486,9 @@ mod tests {
     #[test]
     fn accepts_name_at_length_boundaries() {
         let mut meta = cluster(1);
-        meta.create_topic("a", 1, 1).unwrap();
+        meta.create_topic("a", 1, 1, LogBackend::Durable).unwrap();
         let max = "a".repeat(255);
-        meta.create_topic(&max, 1, 1).unwrap();
+        meta.create_topic(&max, 1, 1, LogBackend::Durable).unwrap();
         assert!(meta.topics.contains_key("a"));
         assert!(meta.topics.contains_key(&max));
     }
@@ -483,7 +498,7 @@ mod tests {
         let mut meta = cluster(3);
         let before = meta.clone();
         assert_eq!(
-            meta.create_topic("orders", 0, 1),
+            meta.create_topic("orders", 0, 1, LogBackend::Durable),
             Err(CoreError::InvalidPartitionCount(0))
         );
         assert_eq!(meta, before);
@@ -494,7 +509,7 @@ mod tests {
         let mut meta = cluster(3);
         let before = meta.clone();
         assert_eq!(
-            meta.create_topic("orders", 10_001, 1),
+            meta.create_topic("orders", 10_001, 1, LogBackend::Durable),
             Err(CoreError::InvalidPartitionCount(10_001))
         );
         assert_eq!(meta, before);
@@ -503,8 +518,9 @@ mod tests {
     #[test]
     fn accepts_partition_count_at_boundaries() {
         let mut meta = cluster(1);
-        meta.create_topic("one", 1, 1).unwrap();
-        meta.create_topic("many", 10_000, 1).unwrap();
+        meta.create_topic("one", 1, 1, LogBackend::Durable).unwrap();
+        meta.create_topic("many", 10_000, 1, LogBackend::Durable)
+            .unwrap();
         assert_eq!(meta.topics["one"].partitions.len(), 1);
         assert_eq!(meta.topics["many"].partitions.len(), 10_000);
     }
@@ -512,10 +528,11 @@ mod tests {
     #[test]
     fn rejects_duplicate_topic_without_side_effects() {
         let mut meta = cluster(3);
-        meta.create_topic("orders", 4, 2).unwrap();
+        meta.create_topic("orders", 4, 2, LogBackend::Durable)
+            .unwrap();
         let before = meta.clone();
         assert_eq!(
-            meta.create_topic("orders", 8, 3),
+            meta.create_topic("orders", 8, 3, LogBackend::Durable),
             Err(CoreError::TopicExists("orders".to_string()))
         );
         // The existing topic (and epoch) are untouched by the rejected request.
@@ -527,7 +544,7 @@ mod tests {
         let mut meta = cluster(2);
         let before = meta.clone();
         assert_eq!(
-            meta.create_topic("orders", 4, 3),
+            meta.create_topic("orders", 4, 3, LogBackend::Durable),
             Err(CoreError::InsufficientNodes { have: 2, need: 3 })
         );
         assert_eq!(meta, before);
@@ -544,14 +561,15 @@ mod tests {
         let before = meta.clone();
         // Only 2 available, replication factor 3 -> insufficient.
         assert_eq!(
-            meta.create_topic("orders", 2, 3),
+            meta.create_topic("orders", 2, 3, LogBackend::Durable),
             Err(CoreError::InsufficientNodes { have: 2, need: 3 })
         );
         assert_eq!(meta, before);
 
         // With replication factor 2 it succeeds, and never assigns the
         // unavailable node (Requirement 9.6).
-        meta.create_topic("orders", 2, 2).unwrap();
+        meta.create_topic("orders", 2, 2, LogBackend::Durable)
+            .unwrap();
         for p in &meta.topics["orders"].partitions {
             assert!(!p.replicas.contains(&NodeId::new("node-2")));
         }
@@ -560,8 +578,10 @@ mod tests {
     #[test]
     fn delete_topic_removes_topic_and_all_partitions_atomically() {
         let mut meta = cluster(3);
-        meta.create_topic("orders", 6, 3).unwrap();
-        meta.create_topic("events", 2, 2).unwrap();
+        meta.create_topic("orders", 6, 3, LogBackend::Durable)
+            .unwrap();
+        meta.create_topic("events", 2, 2, LogBackend::Durable)
+            .unwrap();
         let epoch_before = meta.epoch;
 
         meta.delete_topic("orders").unwrap();
@@ -578,7 +598,8 @@ mod tests {
     #[test]
     fn delete_topic_stops_every_partition_before_removal() {
         let mut meta = cluster(3);
-        meta.create_topic("orders", 4, 2).unwrap();
+        meta.create_topic("orders", 4, 2, LogBackend::Durable)
+            .unwrap();
 
         // The hook fires once per partition, and the topic still exists at the
         // moment each partition is torn down (stop happens before removal).
@@ -594,7 +615,8 @@ mod tests {
     #[test]
     fn delete_topic_hook_observes_topic_still_present() {
         let mut meta = cluster(2);
-        meta.create_topic("orders", 3, 2).unwrap();
+        meta.create_topic("orders", 3, 2, LogBackend::Durable)
+            .unwrap();
 
         // Capture how many partitions remained registered while the hook ran:
         // teardown must run before the atomic metadata removal.
@@ -606,7 +628,8 @@ mod tests {
     #[test]
     fn delete_missing_topic_returns_not_found_without_side_effects() {
         let mut meta = cluster(3);
-        meta.create_topic("orders", 2, 2).unwrap();
+        meta.create_topic("orders", 2, 2, LogBackend::Durable)
+            .unwrap();
         let before = meta.clone();
 
         assert_eq!(
@@ -636,17 +659,20 @@ mod tests {
     #[test]
     fn delete_then_recreate_same_name_succeeds() {
         let mut meta = cluster(3);
-        meta.create_topic("orders", 2, 2).unwrap();
+        meta.create_topic("orders", 2, 2, LogBackend::Durable)
+            .unwrap();
         meta.delete_topic("orders").unwrap();
         // The name is free again after deletion.
-        meta.create_topic("orders", 5, 3).unwrap();
+        meta.create_topic("orders", 5, 3, LogBackend::Durable)
+            .unwrap();
         assert_eq!(meta.topics["orders"].partitions.len(), 5);
     }
 
     #[test]
     fn begin_delete_marks_topic_deleting_and_bumps_epoch() {
         let mut meta = cluster(3);
-        meta.create_topic("orders", 4, 2).unwrap();
+        meta.create_topic("orders", 4, 2, LogBackend::Durable)
+            .unwrap();
         let epoch_before = meta.epoch;
 
         meta.begin_delete("orders").unwrap();
@@ -658,7 +684,8 @@ mod tests {
     #[test]
     fn begin_delete_missing_topic_returns_not_found_without_side_effects() {
         let mut meta = cluster(3);
-        meta.create_topic("orders", 2, 2).unwrap();
+        meta.create_topic("orders", 2, 2, LogBackend::Durable)
+            .unwrap();
         let before = meta.clone();
 
         assert_eq!(
@@ -671,7 +698,8 @@ mod tests {
     #[test]
     fn begin_delete_on_already_deleting_topic_is_rejected_without_side_effects() {
         let mut meta = cluster(3);
-        meta.create_topic("orders", 2, 2).unwrap();
+        meta.create_topic("orders", 2, 2, LogBackend::Durable)
+            .unwrap();
         meta.begin_delete("orders").unwrap();
         let before = meta.clone();
 
@@ -685,7 +713,8 @@ mod tests {
     #[test]
     fn duplicate_delete_of_deleting_topic_is_rejected_without_side_effects() {
         let mut meta = cluster(3);
-        meta.create_topic("orders", 4, 2).unwrap();
+        meta.create_topic("orders", 4, 2, LogBackend::Durable)
+            .unwrap();
         meta.begin_delete("orders").unwrap();
         let before = meta.clone();
 
@@ -702,7 +731,8 @@ mod tests {
     #[test]
     fn duplicate_delete_does_not_invoke_teardown_hook() {
         let mut meta = cluster(3);
-        meta.create_topic("orders", 3, 2).unwrap();
+        meta.create_topic("orders", 3, 2, LogBackend::Durable)
+            .unwrap();
         meta.begin_delete("orders").unwrap();
 
         let mut called = false;
@@ -715,7 +745,8 @@ mod tests {
     #[test]
     fn ensure_producible_rejects_deleting_topic() {
         let mut meta = cluster(3);
-        meta.create_topic("orders", 2, 2).unwrap();
+        meta.create_topic("orders", 2, 2, LogBackend::Durable)
+            .unwrap();
         meta.begin_delete("orders").unwrap();
         let before = meta.clone();
 
@@ -730,7 +761,8 @@ mod tests {
     #[test]
     fn ensure_producible_accepts_active_topic_and_rejects_missing() {
         let mut meta = cluster(3);
-        meta.create_topic("orders", 2, 2).unwrap();
+        meta.create_topic("orders", 2, 2, LogBackend::Durable)
+            .unwrap();
 
         assert_eq!(meta.ensure_producible("orders"), Ok(()));
         assert_eq!(

@@ -6,7 +6,7 @@
 //!
 //! Validates: Requirements 2.4
 
-use vela_core::{ClusterMetadata, CoreError, Member, NodeAvailability, NodeId};
+use vela_core::{ClusterMetadata, CoreError, LogBackend, Member, NodeAvailability, NodeId};
 
 /// Build cluster metadata with `n` available members named `node-0..node-{n-1}`,
 /// enough to satisfy the replication factors used below.
@@ -29,7 +29,7 @@ fn duplicate_topic_is_rejected_and_metadata_unchanged() {
     let mut meta = cluster(3);
 
     // First creation succeeds and registers the topic.
-    meta.create_topic("orders", 4, 2)
+    meta.create_topic("orders", 4, 2, LogBackend::Durable)
         .expect("first create_topic should succeed");
     assert!(meta.topics.contains_key("orders"));
 
@@ -38,7 +38,7 @@ fn duplicate_topic_is_rejected_and_metadata_unchanged() {
 
     // A second creation of the *same name* with a different partition count
     // must be rejected as a duplicate.
-    let result = meta.create_topic("orders", 8, 3);
+    let result = meta.create_topic("orders", 8, 3, LogBackend::Durable);
     assert_eq!(
         result,
         Err(CoreError::TopicExists("orders".to_string())),

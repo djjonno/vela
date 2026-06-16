@@ -95,6 +95,26 @@ pub enum TopicState {
     Deleting,
 }
 
+/// A topic's log storage backend: exactly one of two values (locked decision
+/// 2). [`LogBackend::Durable`] is the default — an omitted selection on the
+/// create path resolves to it (Requirement 1.2, 2.2) — and is backed by
+/// `vela_log::DurableWal`; [`LogBackend::InMemory`] is backed by the existing
+/// `vela_log::InMemoryLog`.
+///
+/// The backend a topic is created with is recorded in [`ClusterMetadata`] and
+/// is immutable for the topic's lifetime (Requirement 3.1, 3.3). Mapping a
+/// backend to the concrete log variant to construct at spawn time is the job of
+/// the spawn-selection helper on [`PartitionLog`](crate::partition_log::PartitionLog).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LogBackend {
+    /// The durable Write-Ahead-Log backend (`vela_log::DurableWal`). The default
+    /// when a create request does not specify a backend (Requirement 1.2).
+    #[default]
+    Durable,
+    /// The volatile in-memory backend (`vela_log::InMemoryLog`).
+    InMemory,
+}
+
 /// A named stream of event records, divided into one or more partitions.
 ///
 /// The `name` is 1–255 characters of `[A-Za-z0-9_-]` and the partition count is
@@ -108,6 +128,9 @@ pub struct Topic {
     pub partitions: Vec<Partition>,
     /// The topic's lifecycle state (Requirement 3.7).
     pub state: TopicState,
+    /// The topic's log backend, fixed at creation and recorded here for the
+    /// topic's lifetime (Requirement 3.1, 3.3).
+    pub backend: LogBackend,
 }
 
 /// The availability of a cluster member, which is exactly one of two states
@@ -165,6 +188,9 @@ pub enum ClusterCommand {
         name: String,
         /// The partitions (with replica assignments) for the topic.
         partitions: Vec<Partition>,
+        /// The log backend every node must record for the topic (Requirement
+        /// 2.3, 3.2).
+        backend: LogBackend,
     },
     /// Remove an existing topic and all of its partitions.
     DeleteTopic {
@@ -223,10 +249,12 @@ mod tests {
                 leader: None,
             }],
             state: TopicState::Active,
+            backend: LogBackend::Durable,
         };
         assert_eq!(topic.name, "orders");
         assert_eq!(topic.partitions.len(), 1);
         assert_eq!(topic.state, TopicState::Active);
+        assert_eq!(topic.backend, LogBackend::Durable);
     }
 
     #[test]
@@ -258,6 +286,7 @@ mod tests {
                 name: "orders".to_string(),
                 partitions: Vec::new(),
                 state: TopicState::Active,
+                backend: LogBackend::Durable,
             },
         );
         assert!(meta.topics.contains_key("orders"));
@@ -273,6 +302,7 @@ mod tests {
                 replicas: vec![NodeId::new("a")],
                 leader: None,
             }],
+            backend: LogBackend::Durable,
         };
         let delete = ClusterCommand::DeleteTopic {
             name: "orders".to_string(),

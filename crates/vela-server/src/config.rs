@@ -17,6 +17,7 @@
 //!    letting `clap` print to stderr and `exit(2)` out from under us.
 
 use std::net::SocketAddr;
+use std::path::PathBuf;
 
 use clap::Parser;
 use thiserror::Error;
@@ -50,6 +51,10 @@ pub struct CliArgs {
     /// Number of replicas per partition (Raft group size).
     #[arg(long, env = "VELA_REPLICATION_FACTOR")]
     pub replication_factor: Option<String>,
+
+    /// Root directory under which durable partition logs store their segments.
+    #[arg(long, env = "VELA_DATA_DIR")]
+    pub data_dir: Option<String>,
 }
 
 /// A validated `velad` configuration, ready for the daemon to act on.
@@ -64,6 +69,9 @@ pub struct Config {
     pub peers: Vec<String>,
     /// Number of replicas assigned to each partition's Raft group.
     pub replication_factor: u32,
+    /// Root directory under which all Durable partition logs hosted on this
+    /// node store their segments (Requirement 6.1, 6.3).
+    pub data_dir: PathBuf,
 }
 
 /// A configuration value that is missing, malformed, or out of range.
@@ -132,11 +140,19 @@ impl Config {
 
         let peers = normalize_peers(args.peers)?;
 
+        // `VELA_DATA_DIR` is required at startup (assumption A1): because
+        // `durable` is the default backend, any node may be asked to host a
+        // durable partition, so the directory is validated like the other
+        // required values and the node fails fast when it is absent
+        // (Requirement 6.1, 6.2).
+        let data_dir = PathBuf::from(require(args.data_dir.as_deref(), "data_dir")?);
+
         Ok(Config {
             node_id: NodeId::new(node_id),
             listen_addr,
             peers,
             replication_factor,
+            data_dir,
         })
     }
 }
@@ -194,12 +210,14 @@ mod tests {
         listen_addr: Option<&str>,
         peers: &[&str],
         replication_factor: Option<&str>,
+        data_dir: Option<&str>,
     ) -> CliArgs {
         CliArgs {
             node_id: node_id.map(str::to_string),
             listen_addr: listen_addr.map(str::to_string),
             peers: peers.iter().map(|p| p.to_string()).collect(),
             replication_factor: replication_factor.map(str::to_string),
+            data_dir: data_dir.map(str::to_string),
         }
     }
 
@@ -210,6 +228,7 @@ mod tests {
             Some("127.0.0.1:7001"),
             &["node-b:7001", "node-c:7001"],
             Some("3"),
+            Some("/var/lib/vela"),
         ))
         .expect("valid config must parse");
 
@@ -217,41 +236,66 @@ mod tests {
         assert_eq!(config.listen_addr, "127.0.0.1:7001".parse().unwrap());
         assert_eq!(config.peers, vec!["node-b:7001", "node-c:7001"]);
         assert_eq!(config.replication_factor, 3);
+        assert_eq!(config.data_dir, PathBuf::from("/var/lib/vela"));
     }
 
     #[test]
     fn empty_peer_list_is_valid_for_single_node() {
-        let config = Config::from_cli(cli(Some("solo"), Some("0.0.0.0:7001"), &[], Some("1")))
-            .expect("single-node config must parse");
+        let config = Config::from_cli(cli(
+            Some("solo"),
+            Some("0.0.0.0:7001"),
+            &[],
+            Some("1"),
+            Some("/var/lib/vela"),
+        ))
+        .expect("single-node config must parse");
         assert!(config.peers.is_empty());
         assert_eq!(config.replication_factor, MIN_REPLICATION_FACTOR);
     }
 
     #[test]
     fn missing_node_id_is_rejected() {
-        let err = Config::from_cli(cli(None, Some("127.0.0.1:7001"), &[], Some("1")))
-            .expect_err("missing node_id must error");
+        let err = Config::from_cli(cli(
+            None,
+            Some("127.0.0.1:7001"),
+            &[],
+            Some("1"),
+            Some("/var/lib/vela"),
+        ))
+        .expect_err("missing node_id must error");
         assert_eq!(err, ConfigError::MissingRequired("node_id"));
     }
 
     #[test]
     fn blank_node_id_is_treated_as_missing() {
-        let err = Config::from_cli(cli(Some("   "), Some("127.0.0.1:7001"), &[], Some("1")))
-            .expect_err("blank node_id must error");
+        let err = Config::from_cli(cli(
+            Some("   "),
+            Some("127.0.0.1:7001"),
+            &[],
+            Some("1"),
+            Some("/var/lib/vela"),
+        ))
+        .expect_err("blank node_id must error");
         assert_eq!(err, ConfigError::MissingRequired("node_id"));
     }
 
     #[test]
     fn missing_listen_addr_is_rejected() {
-        let err = Config::from_cli(cli(Some("n"), None, &[], Some("1")))
+        let err = Config::from_cli(cli(Some("n"), None, &[], Some("1"), Some("/var/lib/vela")))
             .expect_err("missing listen_addr must error");
         assert_eq!(err, ConfigError::MissingRequired("listen_addr"));
     }
 
     #[test]
     fn invalid_listen_addr_is_rejected() {
-        let err = Config::from_cli(cli(Some("n"), Some("not-an-addr"), &[], Some("1")))
-            .expect_err("invalid listen_addr must error");
+        let err = Config::from_cli(cli(
+            Some("n"),
+            Some("not-an-addr"),
+            &[],
+            Some("1"),
+            Some("/var/lib/vela"),
+        ))
+        .expect_err("invalid listen_addr must error");
         match err {
             ConfigError::InvalidListenAddr { value, .. } => assert_eq!(value, "not-an-addr"),
             other => panic!("expected InvalidListenAddr, got {other:?}"),
@@ -260,15 +304,27 @@ mod tests {
 
     #[test]
     fn missing_replication_factor_is_rejected() {
-        let err = Config::from_cli(cli(Some("n"), Some("127.0.0.1:7001"), &[], None))
-            .expect_err("missing replication_factor must error");
+        let err = Config::from_cli(cli(
+            Some("n"),
+            Some("127.0.0.1:7001"),
+            &[],
+            None,
+            Some("/var/lib/vela"),
+        ))
+        .expect_err("missing replication_factor must error");
         assert_eq!(err, ConfigError::MissingRequired("replication_factor"));
     }
 
     #[test]
     fn non_numeric_replication_factor_is_rejected() {
-        let err = Config::from_cli(cli(Some("n"), Some("127.0.0.1:7001"), &[], Some("three")))
-            .expect_err("non-numeric replication_factor must error");
+        let err = Config::from_cli(cli(
+            Some("n"),
+            Some("127.0.0.1:7001"),
+            &[],
+            Some("three"),
+            Some("/var/lib/vela"),
+        ))
+        .expect_err("non-numeric replication_factor must error");
         match err {
             ConfigError::InvalidReplicationFactor { value, .. } => assert_eq!(value, "three"),
             other => panic!("expected InvalidReplicationFactor, got {other:?}"),
@@ -277,8 +333,14 @@ mod tests {
 
     #[test]
     fn zero_replication_factor_is_rejected() {
-        let err = Config::from_cli(cli(Some("n"), Some("127.0.0.1:7001"), &[], Some("0")))
-            .expect_err("zero replication_factor must error");
+        let err = Config::from_cli(cli(
+            Some("n"),
+            Some("127.0.0.1:7001"),
+            &[],
+            Some("0"),
+            Some("/var/lib/vela"),
+        ))
+        .expect_err("zero replication_factor must error");
         match err {
             ConfigError::InvalidReplicationFactor { value, reason } => {
                 assert_eq!(value, "0");
@@ -295,6 +357,7 @@ mod tests {
             Some("127.0.0.1:7001"),
             &["  node-b:7001  ", "node-c:7001"],
             Some("2"),
+            Some("/var/lib/vela"),
         ))
         .expect("config with padded peers must parse");
         assert_eq!(config.peers, vec!["node-b:7001", "node-c:7001"]);
@@ -307,9 +370,35 @@ mod tests {
             Some("127.0.0.1:7001"),
             &["node-b:7001", "   "],
             Some("2"),
+            Some("/var/lib/vela"),
         ))
         .expect_err("empty peer entry must error");
         assert_eq!(err, ConfigError::EmptyPeer);
+    }
+
+    #[test]
+    fn data_dir_is_read_from_env_value() {
+        // `VELA_DATA_DIR` is collected onto `CliArgs::data_dir` (via the
+        // `env = "VELA_DATA_DIR"` binding) and validated into `Config::data_dir`
+        // (Requirement 6.1, 6.3).
+        let config = Config::from_cli(cli(
+            Some("node-a"),
+            Some("127.0.0.1:7001"),
+            &[],
+            Some("1"),
+            Some("/srv/vela/data"),
+        ))
+        .expect("config with a data_dir must parse");
+        assert_eq!(config.data_dir, PathBuf::from("/srv/vela/data"));
+    }
+
+    #[test]
+    fn missing_data_dir_is_rejected() {
+        // An absent `VELA_DATA_DIR` fails fast with a structured configuration
+        // error, which the binary maps to a non-zero exit (Requirement 6.2).
+        let err = Config::from_cli(cli(Some("n"), Some("127.0.0.1:7001"), &[], Some("1"), None))
+            .expect_err("missing data_dir must error");
+        assert_eq!(err, ConfigError::MissingRequired("data_dir"));
     }
 
     #[test]
@@ -324,6 +413,8 @@ mod tests {
             "node-b:7001,node-c:7001",
             "--replication-factor",
             "3",
+            "--data-dir",
+            "/var/lib/vela",
         ])
         .expect("well-formed argv must parse");
 

@@ -8,6 +8,7 @@
 #   VELA_LISTEN_ADDR        address the gRPC listener binds on (in-container)
 #   VELA_PEERS              comma-separated host:port list of the OTHER nodes
 #   VELA_REPLICATION_FACTOR replicas per partition (Raft group size)
+#   VELA_DATA_DIR           in-container root for durable partition logs
 #
 # Each service joins the Compose default network, so nodes resolve one another
 # by service name (node1..node4) via Docker DNS. Every node's peer list points
@@ -17,6 +18,13 @@
 #
 # Container port 7001 is mapped to a distinct host port per node (7001..7004)
 # so a local client or `vela-ctl` can reach any individual node.
+#
+# Durability (Requirement 15): each node sets `VELA_DATA_DIR` to the in-container
+# path `/var/lib/vela` and mounts its OWN distinct named volume there
+# (node1-data..node4-data). The per-node volumes keep durable partition state
+# (and the durable `__meta` group) isolated per node and surviving container
+# restarts: when a container is recreated with its volume reattached, the node
+# recovers the durable data written before the restart (Req 15.3).
 #
 # Usage:
 #   docker compose up --build
@@ -36,10 +44,13 @@ services:
       VELA_LISTEN_ADDR: 0.0.0.0:7001
       VELA_PEERS: node2:7001,node3:7001,node4:7001
       VELA_REPLICATION_FACTOR: "3"
+      VELA_DATA_DIR: /var/lib/vela
     ports:
       - "7001:7001"
     networks:
       - vela
+    volumes:
+      - node1-data:/var/lib/vela
     restart: unless-stopped
 
   node2:
@@ -54,10 +65,13 @@ services:
       VELA_LISTEN_ADDR: 0.0.0.0:7001
       VELA_PEERS: node1:7001,node3:7001,node4:7001
       VELA_REPLICATION_FACTOR: "3"
+      VELA_DATA_DIR: /var/lib/vela
     ports:
       - "7002:7001"
     networks:
       - vela
+    volumes:
+      - node2-data:/var/lib/vela
     restart: unless-stopped
 
   node3:
@@ -72,10 +86,13 @@ services:
       VELA_LISTEN_ADDR: 0.0.0.0:7001
       VELA_PEERS: node1:7001,node2:7001,node4:7001
       VELA_REPLICATION_FACTOR: "3"
+      VELA_DATA_DIR: /var/lib/vela
     ports:
       - "7003:7001"
     networks:
       - vela
+    volumes:
+      - node3-data:/var/lib/vela
     restart: unless-stopped
 
   node4:
@@ -90,12 +107,25 @@ services:
       VELA_LISTEN_ADDR: 0.0.0.0:7001
       VELA_PEERS: node1:7001,node2:7001,node3:7001
       VELA_REPLICATION_FACTOR: "3"
+      VELA_DATA_DIR: /var/lib/vela
     ports:
       - "7004:7001"
     networks:
       - vela
+    volumes:
+      - node4-data:/var/lib/vela
     restart: unless-stopped
 
 networks:
   vela:
     driver: bridge
+
+# Per-node named volumes (Requirement 15.2): each node mounts its own distinct
+# volume at VELA_DATA_DIR (/var/lib/vela), so durable partition logs and the
+# durable `__meta` group persist across container restarts and nodes never
+# share storage.
+volumes:
+  node1-data:
+  node2-data:
+  node3-data:
+  node4-data:

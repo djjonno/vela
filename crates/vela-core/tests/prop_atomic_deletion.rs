@@ -29,7 +29,7 @@ use std::panic::AssertUnwindSafe;
 use std::sync::Once;
 
 use proptest::prelude::*;
-use vela_core::{ClusterMetadata, Member, NodeAvailability, NodeId};
+use vela_core::{ClusterMetadata, LogBackend, Member, NodeAvailability, NodeId};
 
 /// The replication factor used throughout this test. The cluster is built with
 /// exactly this many available members so creation is never rejected for
@@ -72,7 +72,7 @@ fn build_metadata_with_topics(counts: &[u32]) -> (ClusterMetadata, Vec<String>) 
     let mut meta = cluster(REPLICATION_FACTOR);
     let names: Vec<String> = (0..counts.len()).map(|i| format!("topic-{i}")).collect();
     for (name, &count) in names.iter().zip(counts.iter()) {
-        meta.create_topic(name, count, REPLICATION_FACTOR)
+        meta.create_topic(name, count, REPLICATION_FACTOR, LogBackend::Durable)
             .expect("valid topic creation must succeed");
     }
     (meta, names)

@@ -22,7 +22,9 @@
 
 use std::time::{Duration, Instant};
 
-use vela_core::{ClusterCommand, CoreError, MetadataController, NodeId, Partition, PartitionIndex};
+use vela_core::{
+    ClusterCommand, CoreError, LogBackend, MetadataController, NodeId, Partition, PartitionIndex,
+};
 use vela_raft::NodeId as RaftNodeId;
 
 /// The Requirement 10.6 leader-unavailable deadline, mirrored from
@@ -47,6 +49,7 @@ fn controller_with_orders(partitions: Vec<Partition>) -> MetadataController {
     controller.apply(&ClusterCommand::CreateTopic {
         name: "orders".to_string(),
         partitions,
+        backend: LogBackend::Durable,
     });
     controller
 }

@@ -79,6 +79,7 @@ fn valid_args() -> CliArgs {
         listen_addr: Some("127.0.0.1:7001".to_string()),
         peers: vec!["node-b:7001".to_string()],
         replication_factor: Some("3".to_string()),
+        data_dir: Some("/var/lib/vela".to_string()),
     }
 }
 

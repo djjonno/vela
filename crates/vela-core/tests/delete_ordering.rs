@@ -17,7 +17,9 @@
 //! stop-before-release ordering, so the tests can assert the ordering and that
 //! the topic is removed only after every partition has been torn down.
 
-use vela_core::{ClusterMetadata, CoreError, Member, NodeAvailability, NodeId, Partition};
+use vela_core::{
+    ClusterMetadata, CoreError, LogBackend, Member, NodeAvailability, NodeId, Partition,
+};
 
 /// A single action the fleet performs while tearing down a partition.
 ///
@@ -78,7 +80,8 @@ fn cluster(n: usize) -> ClusterMetadata {
 fn raft_group_is_stopped_before_log_is_released_for_every_partition() {
     let mut meta = cluster(3);
     let partition_count = 5u32;
-    meta.create_topic("orders", partition_count, 3).unwrap();
+    meta.create_topic("orders", partition_count, 3, LogBackend::Durable)
+        .unwrap();
 
     let mut fleet = MockFleet::default();
     meta.delete_topic_with("orders", |partition| fleet.stop_partition(partition))
@@ -117,7 +120,8 @@ fn raft_group_is_stopped_before_log_is_released_for_every_partition() {
 #[test]
 fn each_partition_is_stopped_and_released_exactly_once() {
     let mut meta = cluster(2);
-    meta.create_topic("events", 4, 2).unwrap();
+    meta.create_topic("events", 4, 2, LogBackend::Durable)
+        .unwrap();
 
     let mut fleet = MockFleet::default();
     meta.delete_topic_with("events", |partition| fleet.stop_partition(partition))
@@ -145,7 +149,8 @@ fn each_partition_is_stopped_and_released_exactly_once() {
 #[test]
 fn deleting_a_missing_topic_returns_not_found_and_changes_nothing() {
     let mut meta = cluster(3);
-    meta.create_topic("orders", 3, 3).unwrap();
+    meta.create_topic("orders", 3, 3, LogBackend::Durable)
+        .unwrap();
     let before = meta.clone();
 
     // The plain convenience form returns the not-found error with the name.

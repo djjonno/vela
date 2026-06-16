@@ -77,6 +77,7 @@ fn metadata_with_topic(
             name: name.to_string(),
             partitions,
             state: TopicState::Active,
+            backend: vela_core::LogBackend::Durable,
         },
     );
     meta

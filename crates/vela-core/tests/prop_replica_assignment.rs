@@ -12,7 +12,7 @@
 use std::collections::BTreeSet;
 
 use proptest::prelude::*;
-use vela_core::{ClusterMetadata, Member, NodeAvailability, NodeId};
+use vela_core::{ClusterMetadata, LogBackend, Member, NodeAvailability, NodeId};
 
 /// A cluster of `n` available members named `node-0..node-{n-1}`.
 fn cluster(n: usize) -> ClusterMetadata {
@@ -51,7 +51,7 @@ proptest! {
         // The set of current cluster member ids, for membership checks below.
         let members: BTreeSet<NodeId> = meta.members.iter().map(|m| m.id.clone()).collect();
 
-        meta.create_topic("topic", partition_count, replication_factor)
+        meta.create_topic("topic", partition_count, replication_factor, LogBackend::Durable)
             .expect("creation must succeed when members >= replication_factor");
 
         let topic = &meta.topics["topic"];
