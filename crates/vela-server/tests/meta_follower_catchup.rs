@@ -152,7 +152,16 @@ async fn create_on_majority(
         // durable `__meta` WAL, but client partitions write nothing to disk.
         log_backend: v1::LogBackend::InMemory as i32,
     };
-    for _ in 0..200 {
+    // This is the coldest start in the test: a *fresh* metadata election must
+    // settle AND the first `ClusterCommand` must commit, all while one of the
+    // three voters (node-c) is down and its failed vote/heartbeat connects add
+    // scheduling churn. On a loaded 2-core CI runner — every test binary plus
+    // several 3-node in-process clusters competing for the same cores — that can
+    // take well over 5 s, so the budget matches the sibling cross-node test's
+    // cold-election budget (`discover_metadata_leader`, 20 s) rather than the
+    // tighter post-election convergence budgets elsewhere in this file. A
+    // genuinely stuck cluster still fails the test instead of hanging.
+    for _ in 0..800 {
         for client in clients.iter_mut() {
             if let Ok(response) = client.create_topic(request.clone()).await {
                 return response
