@@ -80,6 +80,67 @@ pub(crate) fn plan_retry(redirect: Option<Option<String>>, redirects_done: u32) 
     }
 }
 
+/// One node's answer to a `FindLeader` probe during multi-node leader
+/// resolution.
+///
+/// Leader resolution asks each configured node in turn (see
+/// [`ClientCore::refresh_leader`]); this classifies what each answered so the
+/// decision of which outcome to surface is a pure fold ([`resolve_leader`]),
+/// testable without a live server.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum LeaderProbe {
+    /// The node named the partition's live leader (a node id). A replica — even
+    /// a follower — answers with the leader it knows (Requirement 8.2).
+    Leader(String),
+    /// The node was reachable and knows the partition but reports no current
+    /// leader: it does not host the partition's replica (so it has no live
+    /// leader to report, only the cluster does), or an election is in progress.
+    NoLeader,
+    /// The probe did not yield a usable answer — the node was unreachable or
+    /// rejected the request (e.g. it has not yet applied the topic's creation).
+    Failed,
+}
+
+/// The decision reached by folding the per-node [`LeaderProbe`]s gathered across
+/// the configured nodes, in order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum LeaderResolution {
+    /// A node named the live leader; resolve and dial this node id.
+    Found(String),
+    /// At least one node was reachable and knew the partition, but none named a
+    /// current leader — the partition has no elected leader right now.
+    NoLeaderElected,
+    /// No node yielded a usable answer; surface the underlying failure.
+    AllFailed,
+}
+
+/// Decide leader resolution from the `probes` gathered across the configured
+/// nodes, in order.
+///
+/// The first node to name a leader wins (Requirement 8.2 — any replica that
+/// knows the live leader resolves it, regardless of which node leads the
+/// partition or which endpoint was listed first). If none names a leader but at
+/// least one node was reachable and knew the partition, the partition simply has
+/// no elected leader. If no node yielded a usable answer, the caller surfaces the
+/// underlying transport/RPC failure.
+pub(crate) fn resolve_leader<'a>(
+    probes: impl IntoIterator<Item = &'a LeaderProbe>,
+) -> LeaderResolution {
+    let mut any_reachable = false;
+    for probe in probes {
+        match probe {
+            LeaderProbe::Leader(node) => return LeaderResolution::Found(node.clone()),
+            LeaderProbe::NoLeader => any_reachable = true,
+            LeaderProbe::Failed => {}
+        }
+    }
+    if any_reachable {
+        LeaderResolution::NoLeaderElected
+    } else {
+        LeaderResolution::AllFailed
+    }
+}
+
 /// Inspect a client error and, if it is a `NotLeader` redirect, return its
 /// optional leader node-id hint.
 ///
@@ -184,34 +245,78 @@ impl ClientCore {
 
     /// Force a `FindLeader` lookup for `(topic, partition)`, updating the cache.
     ///
-    /// Exposed so the retry layer can re-resolve after invalidating a stale
-    /// entry.
+    /// Asks **each configured node in turn** until one names the partition's
+    /// live leader, then resolves that node id to an address, caches it, and
+    /// returns it (Requirement 8.2, 11.1). Trying every node — rather than only
+    /// the first bootstrap node — is what lets resolution succeed no matter
+    /// which node leads the partition or which endpoint was listed first: a node
+    /// that does not host the partition's replica answers "no leader" (Req 8.2),
+    /// and the lookup falls through to the next until a replica (leader or
+    /// follower) reports the live leader.
+    ///
+    /// When no node names a leader, the outcome distinguishes a partition with
+    /// no elected leader yet ([`ClientError::NoLeader`]) from a cluster none of
+    /// whose nodes could be reached or which rejected the probe (the last
+    /// transport/RPC error is surfaced, so an all-unreachable cluster is
+    /// reported as a connection failure). Exposed so the retry layer can
+    /// re-resolve after invalidating a stale entry.
     pub async fn refresh_leader(&self, topic: &str, partition: u32) -> Result<String> {
-        let mut client = self.bootstrap_client()?;
-        let response = client
-            .find_leader(FindLeaderRequest {
+        let mut probes: Vec<LeaderProbe> = Vec::with_capacity(self.bootstrap.len());
+        // Retained so an all-failed resolution surfaces the real error (e.g. a
+        // transport `Unavailable`, which the CLI classifies as a connection
+        // failure) rather than a synthesized one.
+        let mut last_error: Option<ClientError> = None;
+
+        for addr in &self.bootstrap {
+            let mut client = match self.client_for(addr) {
+                Ok(client) => client,
+                Err(err) => {
+                    last_error = Some(err);
+                    probes.push(LeaderProbe::Failed);
+                    continue;
+                }
+            };
+            match client
+                .find_leader(FindLeaderRequest {
+                    topic: topic.to_string(),
+                    partition,
+                })
+                .await
+            {
+                Ok(response) => match response.into_inner().leader {
+                    Some(node) => probes.push(LeaderProbe::Leader(node)),
+                    None => probes.push(LeaderProbe::NoLeader),
+                },
+                Err(status) => {
+                    last_error = Some(ClientError::from(status));
+                    probes.push(LeaderProbe::Failed);
+                }
+            }
+        }
+
+        match resolve_leader(&probes) {
+            LeaderResolution::Found(node) => {
+                let addr =
+                    self.registry
+                        .addr_of(&node)
+                        .ok_or_else(|| ClientError::UnknownNode {
+                            node,
+                            topic: topic.to_string(),
+                            partition,
+                        })?;
+                self.leaders.insert(topic, partition, addr.clone());
+                Ok(addr)
+            }
+            // At least one node was reachable and knew the partition, but none
+            // named a leader: the partition has no elected leader right now.
+            LeaderResolution::NoLeaderElected => Err(ClientError::NoLeader {
                 topic: topic.to_string(),
                 partition,
-            })
-            .await?
-            .into_inner();
-
-        let node = response.leader.ok_or_else(|| ClientError::NoLeader {
-            topic: topic.to_string(),
-            partition,
-        })?;
-
-        let addr = self
-            .registry
-            .addr_of(&node)
-            .ok_or_else(|| ClientError::UnknownNode {
-                node,
-                topic: topic.to_string(),
-                partition,
-            })?;
-
-        self.leaders.insert(topic, partition, addr.clone());
-        Ok(addr)
+            }),
+            // No node yielded a usable answer: surface the underlying failure
+            // (or "no bootstrap nodes" if none were configured).
+            LeaderResolution::AllFailed => Err(last_error.unwrap_or(ClientError::NoNodes)),
+        }
     }
 
     /// Run `operation` against the partition's believed leader, retrying on a
@@ -397,6 +502,75 @@ mod tests {
         // Requirement 11.3 (>=100 ms before each retry) and 11.4 (<=5 retries).
         assert_eq!(RETRY_DELAY_MS, 100);
         assert_eq!(MAX_RETRIES, 5);
+    }
+
+    // --- Multi-node leader resolution fold (resolve_leader) --------------
+
+    #[test]
+    fn resolve_leader_returns_the_first_named_leader() {
+        // The first node to name a leader wins, regardless of later answers.
+        let probes = [
+            LeaderProbe::Leader("node-a".to_string()),
+            LeaderProbe::Leader("node-b".to_string()),
+        ];
+        assert_eq!(
+            resolve_leader(&probes),
+            LeaderResolution::Found("node-a".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_leader_falls_through_a_no_leader_node() {
+        // A node that does not host the partition answers `NoLeader`; resolution
+        // falls through to the replica that names the live leader (the bug fix:
+        // the first endpoint need not host the partition — Req 8.2).
+        let probes = [
+            LeaderProbe::NoLeader,
+            LeaderProbe::Leader("node-d".to_string()),
+        ];
+        assert_eq!(
+            resolve_leader(&probes),
+            LeaderResolution::Found("node-d".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_leader_falls_through_a_failed_node() {
+        // An unreachable / rejecting node is skipped; a later node still resolves.
+        let probes = [
+            LeaderProbe::Failed,
+            LeaderProbe::Leader("node-c".to_string()),
+        ];
+        assert_eq!(
+            resolve_leader(&probes),
+            LeaderResolution::Found("node-c".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_leader_reports_no_leader_when_some_reachable_node_has_none() {
+        // Every node that knew the partition reported no current leader, so the
+        // partition has no elected leader right now (an election in progress).
+        let probes = [LeaderProbe::NoLeader, LeaderProbe::NoLeader];
+        assert_eq!(resolve_leader(&probes), LeaderResolution::NoLeaderElected);
+    }
+
+    #[test]
+    fn resolve_leader_treats_a_reachable_no_leader_as_authoritative_over_failures() {
+        // A reachable "no leader" mixed with unreachable nodes still means the
+        // partition exists but has no current leader (not an all-failed cluster).
+        let probes = [LeaderProbe::Failed, LeaderProbe::NoLeader];
+        assert_eq!(resolve_leader(&probes), LeaderResolution::NoLeaderElected);
+    }
+
+    #[test]
+    fn resolve_leader_reports_all_failed_when_no_node_answers_usefully() {
+        // No node was reachable / none knew the partition: the caller surfaces
+        // the underlying transport/RPC error.
+        let probes = [LeaderProbe::Failed, LeaderProbe::Failed];
+        assert_eq!(resolve_leader(&probes), LeaderResolution::AllFailed);
+        // An empty probe set (no configured nodes) is likewise all-failed.
+        assert_eq!(resolve_leader(&[]), LeaderResolution::AllFailed);
     }
 
     #[test]

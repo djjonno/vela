@@ -10,6 +10,13 @@ repository.workspace = true
 [dependencies]
 thiserror.workspace = true
 tracing.workspace = true
+# OS advisory file locking for the durable-WAL data-directory lock. An advisory
+# `flock`-style lock is released by the kernel when the holding process exits
+# (including an abrupt crash/SIGKILL), so a leftover lock file never blocks a
+# restart — unlike a create-new sentinel, which strands the directory on an
+# unclean shutdown. `fs4` is the maintained successor to `fs2`; the `sync`
+# feature is the blocking std::fs backend (no async runtime pulled in).
+fs4 = { version = "0.8", default-features = false, features = ["sync"] }
 
 [dev-dependencies]
 proptest.workspace = true

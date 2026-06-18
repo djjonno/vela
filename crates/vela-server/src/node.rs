@@ -8,40 +8,41 @@
 //! a driver for each partition this node replicates, and deleting one stops them
 //! and releases their replicas.
 //!
-//! ## Durable catalogue (task 15)
+//! ## Durable catalogue
 //!
-//! The topic catalogue is now durable. [`NodeShared`] owns the recovering
+//! The topic catalogue is durable. [`NodeShared`] owns the recovering
 //! [`MetadataController`] for the dedicated `__meta` Raft group: topic
 //! create/delete are committed through that group's durable log and then
 //! mirrored into the served [`ClusterMetadata`] view, so the catalogue (and
 //! each topic's backend) survives a full cold restart. [`NodeShared::new`]
 //! recovers the `__meta` group and rebuilds the served view from it *before*
 //! spawning any client partition, so durable topics reopen their existing
-//! segments on startup. Cross-node agreement and `SyncMetadata` ack tracking
-//! remain the membership/metadata work of later tasks; here a node starts as
-//! the sole member of its own cluster, which is sufficient to bind, serve,
-//! elect a single-node leader per partition, and drive produce/consume
-//! locally.
+//! segments on startup. Cross-node agreement is reached through the `__meta/0`
+//! Raft group itself — committed `ClusterCommand`s reach every node via
+//! `AppendEntries` and are reconciled into the running partition drivers. There
+//! is one consensus mechanism; the former bespoke `SyncMetadata` ack/laggard
+//! propagation protocol has been removed (Requirement 1.3).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
 
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot, Notify};
 
 use vela_core::{
-    apply_command, ClusterCommand, ClusterMetadata, CoreError, LogBackend, Member,
-    MetadataController, MetadataRecoverError, NodeAvailability, NodeId, Partition, PartitionLog,
-    PartitionReplica, SyncPolicy, Topic, WalConfig,
+    ClusterCommand, ClusterMetadata, CoreError, LogBackend, Member, MetadataController,
+    MetadataRecoverError, NodeAvailability, NodeId, Partition, PartitionLog, PartitionReplica,
+    SyncPolicy, Topic, WalConfig, METADATA_GROUP_PARTITION, METADATA_GROUP_TOPIC,
 };
 use vela_log::{DurableWal, InMemoryLog};
-use vela_raft::{Clock, EntryPayload, PayloadKind, RaftInput, TimerKind};
+use vela_raft::NodeId as RaftNodeId;
 
 use crate::clock::TimerClock;
 use crate::config::Config;
 use crate::convert;
-use crate::driver::{DriverCommand, DriverHandle, PartitionDriver};
+use crate::driver::{
+    DriverCommand, DriverHandle, MetadataDriver, MetadataSink, PartitionDriver, ReconcileSignal,
+};
 use crate::paths::{metadata_data_path, partition_data_path};
 use crate::registry::raft_node_id;
 use crate::transport::{GrpcTransport, PeerPool};
@@ -63,24 +64,6 @@ pub enum StartupError {
     /// An I/O error encountered while preparing the node's data directory.
     #[error("node startup I/O error: {0}")]
     Io(#[from] std::io::Error),
-}
-
-/// A minimal [`Clock`] used to drive the durable metadata Raft group to commit
-/// synchronously, at startup and on each catalogue change.
-///
-/// The `__meta` group is a single-node group stepped inline on the request /
-/// startup thread (not on an async partition driver), so it needs no real
-/// timers: `now` reads the wall clock and `arm` is a no-op. Election and
-/// proposal each complete within the step that feeds them, because the lone
-/// replica is its own majority.
-struct BootstrapClock;
-
-impl Clock for BootstrapClock {
-    fn now(&self) -> Instant {
-        Instant::now()
-    }
-
-    fn arm(&mut self, _kind: TimerKind, _dur: Duration) {}
 }
 
 /// Why [`NodeShared::spawn_partition`] could not start a partition replica.
@@ -127,7 +110,12 @@ pub struct NodeShared {
     /// The configured replication factor for new topics.
     pub(crate) replication_factor: usize,
     /// The node's view of cluster metadata.
-    pub(crate) metadata: Mutex<ClusterMetadata>,
+    ///
+    /// Held behind an [`Arc`] so the metadata commit-apply seam
+    /// ([`MetadataSink`](crate::driver::MetadataSink)) can share this one served
+    /// catalogue: committed `ClusterCommand`s fold into it as `__meta/0`
+    /// replicates, and the request path and the reconciler read the same view.
+    pub(crate) metadata: Arc<Mutex<ClusterMetadata>>,
     /// The running partition drivers, keyed by `(topic, partition)`.
     pub(crate) partitions: Mutex<HashMap<(String, u32), DriverHandle>>,
     /// Shared, lazily-connected peer channels.
@@ -145,7 +133,13 @@ pub struct NodeShared {
     /// 18). The served `metadata` mirror is what the request path reads; this
     /// controller is the durable source of truth the mirror is kept in step
     /// with on each committed command.
-    pub(crate) controller: Mutex<MetadataController>,
+    ///
+    /// Held behind an [`Arc`] so the [`MetadataDriver`] task can share the one
+    /// recovered replica: the metadata group is now driven asynchronously (real
+    /// timers + peer transport) yet a durable WAL permits only a single open, so
+    /// the driver steps this same controller under its mutex rather than opening
+    /// the `__meta` log a second time.
+    pub(crate) controller: Arc<Mutex<MetadataController>>,
 }
 
 impl NodeShared {
@@ -176,23 +170,51 @@ impl NodeShared {
         let self_raft_id = raft_node_id(&self_id);
         let data_dir = config.data_dir.clone();
 
+        // The metadata group's voter set is every statically configured node:
+        // this node plus each configured peer, each mapped through the unified
+        // identity to its numeric raft id (Req 1.2). A single-node deployment
+        // (no peers) yields a 1-voter group that self-elects through the normal
+        // election path; a multi-node deployment yields a real cluster-wide
+        // voter set that elects and replicates over the `VelaPeer` transport.
+        let meta_peers: Vec<RaftNodeId> = config
+            .peers
+            .iter()
+            .map(|peer| raft_node_id(&peer.id))
+            .collect();
+
+        // Reverse map every metadata voter's numeric raft id back to its domain
+        // id (this node plus each configured peer) so the metadata driver can
+        // report its known leader as a domain `NodeId` for the redirect hint and
+        // live-leader routing (Requirement 4.1, 8.1, 8.2).
+        let meta_lookup: HashMap<RaftNodeId, NodeId> =
+            std::iter::once((self_raft_id, NodeId::new(&self_id)))
+                .chain(
+                    config
+                        .peers
+                        .iter()
+                        .map(|peer| (raft_node_id(&peer.id), NodeId::new(&peer.id))),
+                )
+                .collect();
+
         // 1. Recover the durable metadata group and its committed catalogue
         //    before spawning any client partition (Requirement 16, 17, 18.1).
+        //
+        //    G4 — recovery reads an existing `__meta` log *compatibly*. The
+        //    voter set is construction-time configuration supplied here, not
+        //    state encoded in the log, so an old single-node `__meta` log
+        //    replays its committed `Cluster` entries identically; only the
+        //    in-memory voter set differs, which is exactly the intended
+        //    single-node -> multi-node membership change. There is therefore no
+        //    log-format ambiguity to misread. A committed entry that cannot be
+        //    decoded still fails fast through `MetadataRecoverError` rather than
+        //    being silently misapplied.
         let meta_path = metadata_data_path(&data_dir);
-        let mut controller = MetadataController::recover_durable(
+        let controller = MetadataController::recover_durable(
             self_raft_id,
-            Vec::new(),
+            meta_peers,
             &meta_path,
             convert::cluster_command_from_bytes,
         )?;
-
-        // Elect the single-node metadata group so it can accept catalogue-change
-        // proposals. The catalogue was already rebuilt from the recovered log,
-        // so the leader's election entry does not affect it.
-        {
-            let mut clock = BootstrapClock;
-            let _ = controller.step(RaftInput::Tick(TimerKind::Election), &mut clock);
-        }
 
         // 2. Build the served view from the recovered catalogue, seeding this
         //    node as the sole available member (Requirement 18.1, 18.3).
@@ -210,60 +232,82 @@ impl NodeShared {
         let node = Arc::new(Self {
             self_id,
             replication_factor: config.replication_factor as usize,
-            metadata: Mutex::new(metadata),
+            metadata: Arc::new(Mutex::new(metadata)),
             partitions: Mutex::new(HashMap::new()),
             pool: Arc::new(PeerPool::new()),
             data_dir,
-            controller: Mutex::new(controller),
+            controller: Arc::new(Mutex::new(controller)),
         });
 
-        // 3. Reopen each recovered topic's local partition replicas. Durable
-        //    topics reopen their existing segments; in-memory topics start empty
-        //    (Requirement 18.2). A per-partition failure is logged and skipped
-        //    (Requirement 8.3).
-        let topics: Vec<Topic> = node
-            .metadata
-            .lock()
-            .expect("metadata mutex poisoned")
-            .topics
-            .values()
-            .cloned()
-            .collect();
-        for topic in &topics {
-            for partition in &topic.partitions {
-                if let Err(err) = node.spawn_partition(&topic.name, partition) {
-                    tracing::error!(
-                        topic = %topic.name,
-                        partition = partition.index.0,
-                        %err,
-                        "failed to reopen partition replica during startup; leaving it unstarted"
-                    );
-                }
-            }
+        // Register every metadata voter's transport address so the metadata
+        // driver can dial its peers' `VelaPeer` endpoints, keyed by the same
+        // numeric raft id the voter set uses (Req 1.1). Idempotent with the
+        // membership subsystem, which re-registers these same peers.
+        for peer in &config.peers {
+            node.pool
+                .register_peer(raft_node_id(&peer.id), peer.addr.clone());
         }
+
+        // 3. Drive `__meta/0` as an ordinary, asynchronously-driven Raft group:
+        //    spawn its driver task wired to a real timer clock, the peer
+        //    transport, and the metadata commit-apply seam, and spawn the
+        //    off-loop reconciler the seam pokes. Registering the driver's handle
+        //    makes inbound metadata Raft RPCs route through the existing
+        //    `VelaPeerService::dispatch_rpc` (Req 1.1, 1.4, 2.1, 2.4). This
+        //    replaces stepping the metadata group *only* inline.
+        node.spawn_metadata_driver(meta_lookup);
+
+        // 4. Reconcile once after recovery so this node starts a partition
+        //    driver for every recovered partition whose Replica_Set contains it,
+        //    reopening durable topics at their derived paths and starting
+        //    in-memory topics empty (Requirement 9.2, 9.3, 18.2). This is the
+        //    same idempotent pass the reconciler runs on every later commit; a
+        //    per-partition durable-log-open failure is logged and skipped while
+        //    the rest reconcile (Requirement 6.7, 8.3).
+        crate::reconciler::reconcile(&node);
 
         Ok(node)
     }
 
-    /// Create a topic durably and return it.
+    /// Create a topic by committing it through the dedicated `__meta/0`
+    /// metadata Raft group, returning the applied topic (design §4).
     ///
     /// The request is validated and its replicas assigned against a snapshot of
-    /// the served view, so a rejection (invalid name or partition count, a
-    /// duplicate topic, or insufficient available nodes) touches neither the
-    /// durable metadata log nor the served view. On success the resulting
-    /// [`ClusterCommand::CreateTopic`] — carrying the assigned partitions and
-    /// the selected `backend` — is committed through the durable `__meta` group
-    /// and then folded into the served view, so the catalogue change survives a
-    /// cold restart (Requirement 16, 18). The caller spawns the partition
-    /// replicas for the returned topic.
-    pub(crate) fn create_topic(
-        &self,
+    /// the served (applied) catalogue — only the leader's command commits, so
+    /// validation/assignment is effectively performed against the leader's
+    /// catalogue — building the [`ClusterCommand::CreateTopic`] without mutating
+    /// anything. A rejection (invalid name or partition count, a duplicate
+    /// topic, or insufficient available nodes) proposes nothing and leaves the
+    /// catalogue untouched.
+    ///
+    /// The command is then **proposed** to the `__meta/0` group and the call
+    /// awaits its commit: the metadata group routes the proposal to its leader,
+    /// redirecting a non-leader with [`CoreError::NotLeader`] so the client can
+    /// retry against the leader (Req 4.1; Raft §8), and reports success only
+    /// once the entry is committed to a majority (Req 3.1–3.4). The same commit
+    /// is folded into the served view by the
+    /// [`MetadataSink`](crate::driver::MetadataSink) before the proposal
+    /// resolves, so the applied topic is then read back from that view (Req
+    /// 3.4).
+    ///
+    /// **Idempotent on topic name (H2).** Re-creating an existing topic is
+    /// rejected with [`CoreError::TopicExists`] and proposes nothing, so a
+    /// client retrying after an *indeterminate* [`CoreError::CommitTimeout`]
+    /// (Req 3.5) cannot corrupt the catalogue.
+    ///
+    /// Partition drivers are **not** started here: the commit-driven reconciler
+    /// starts them on every replica node (Req 6.1). This node reconciles
+    /// promptly after its own commit so a client hitting the origin sees its
+    /// drivers without waiting for the off-loop signal; every other replica node
+    /// spawns from the same committed entry when it applies (design §4, §5).
+    pub(crate) async fn create_topic(
+        self: &Arc<Self>,
         name: &str,
         partition_count: u32,
         backend: LogBackend,
     ) -> Result<Topic, CoreError> {
         // Validate + assign on a snapshot so nothing is mutated until the
-        // command is durably committed.
+        // command commits (idempotent on name: a duplicate is `TopicExists`).
         let command = {
             let metadata = self.metadata.lock().expect("metadata mutex poisoned");
             let mut snapshot = metadata.clone();
@@ -280,10 +324,14 @@ impl NodeShared {
             }
         };
 
-        // Durably commit, then mirror into the served view.
-        if !self.commit_cluster_command(&command) {
-            return Err(CoreError::CommitTimeout);
-        }
+        // Propose to `__meta/0` and await commit; a non-leader redirects (Req
+        // 4.1), a commit timeout is indeterminate (Req 3.5, H2).
+        self.propose_cluster(command).await?;
+
+        // The commit was already folded into the served view by the metadata
+        // sink, so align this node's partition drivers with the new catalogue
+        // now (Req 6.1) and read the applied topic back (Req 3.4).
+        crate::reconciler::reconcile(self);
         let topic = self
             .metadata
             .lock()
@@ -291,85 +339,90 @@ impl NodeShared {
             .topics
             .get(name)
             .cloned()
-            .expect("topic was just applied to the served view");
+            .ok_or_else(|| CoreError::TopicNotFound(name.to_string()))?;
         Ok(topic)
     }
 
-    /// Delete a topic durably, returning the partition indices the caller must
-    /// stop.
+    /// Delete a topic by committing the removal through the dedicated `__meta/0`
+    /// metadata Raft group (design §4).
     ///
-    /// The deletion is validated against a snapshot of the served view, so a
-    /// missing or already-deleting topic is rejected without touching the
-    /// durable metadata log or the served view (Requirement 3.4, 3.7). On
-    /// success the [`ClusterCommand::DeleteTopic`] is committed through the
-    /// durable `__meta` group and folded into the served view, so the deletion
-    /// survives a cold restart (Requirement 16, 18).
-    pub(crate) fn delete_topic(&self, name: &str) -> Result<Vec<u32>, CoreError> {
-        let (command, partitions) = {
+    /// The deletion is validated against the served (applied) catalogue and, for
+    /// a present topic, proposed to the `__meta/0` group as a
+    /// [`ClusterCommand::DeleteTopic`]; the call awaits its commit. As with
+    /// create, the metadata group routes the proposal to its leader and
+    /// redirects a non-leader with [`CoreError::NotLeader`] (Req 4.1; Raft §8),
+    /// reporting success only once the entry commits to a majority (Req 3).
+    ///
+    /// **Idempotent on topic name (H2).** Re-deleting an absent topic is a
+    /// **no-op success** that proposes nothing, so a client retrying after an
+    /// *indeterminate* [`CoreError::CommitTimeout`] (Req 3.5) cannot corrupt the
+    /// catalogue.
+    ///
+    /// Partition drivers are **not** stopped here directly: the commit-driven
+    /// reconciler stops the deleted topic's drivers on every replica node (Req
+    /// 6.2). This node reconciles promptly after its own commit; every other
+    /// replica node stops them from the same committed entry when it applies.
+    pub(crate) async fn delete_topic(self: &Arc<Self>, name: &str) -> Result<(), CoreError> {
+        // A present topic yields a DeleteTopic command; an absent one is an
+        // idempotent no-op success that proposes nothing (H2).
+        let command = {
             let metadata = self.metadata.lock().expect("metadata mutex poisoned");
-            let mut snapshot = metadata.clone();
-            let partitions: Vec<u32> = snapshot
-                .topics
-                .get(name)
-                .map(|t| t.partitions.iter().map(|p| p.index.0).collect())
-                .unwrap_or_default();
-            snapshot.delete_topic(name)?;
-            (
-                ClusterCommand::DeleteTopic {
-                    name: name.to_string(),
-                },
-                partitions,
-            )
+            if !metadata.topics.contains_key(name) {
+                return Ok(());
+            }
+            ClusterCommand::DeleteTopic {
+                name: name.to_string(),
+            }
         };
 
-        if !self.commit_cluster_command(&command) {
-            return Err(CoreError::CommitTimeout);
-        }
-        Ok(partitions)
+        // Propose to `__meta/0` and await commit (Req 3, 4.1).
+        self.propose_cluster(command).await?;
+
+        // The commit was already applied to the served view, so stop this
+        // node's drivers for the now-absent topic via the reconciler (running \
+        // desired); every other replica node does the same on apply (Req 6.2).
+        crate::reconciler::reconcile(self);
+        Ok(())
     }
 
-    /// Durably commit `command` through the `__meta` group, then fold it into
-    /// the served view (Requirement 16, 17, 18).
+    /// Propose an already-validated, replica-assigned `command` to the dedicated
+    /// `__meta/0` metadata Raft group and await its commit (design §3, §4).
     ///
-    /// Returns `false` if the metadata group could not commit the command, in
-    /// which case the served view is left unchanged.
-    fn commit_cluster_command(&self, command: &ClusterCommand) -> bool {
-        if !self.propose_to_metadata_group(command) {
-            return false;
-        }
-        let mut metadata = self.metadata.lock().expect("metadata mutex poisoned");
-        apply_command(&mut metadata, command);
-        true
-    }
-
-    /// Propose `command` to the durable single-node metadata group and drive it
-    /// to commit, applying it to the controller's own view on success.
+    /// The command is handed to the metadata driver through its
+    /// [`DriverHandle`] (`self.handle("__meta", 0)`) as a
+    /// [`DriverCommand::ProposeCluster`]; the driver appends and replicates it
+    /// **only on the metadata leader** and resolves the reply:
     ///
-    /// The lone metadata replica is its own majority, so a proposal on the
-    /// leader commits within the same step. If the group is somehow not the
-    /// leader (e.g. a superseded election), one election is driven and the
-    /// proposal retried once. Returns whether the command committed.
-    fn propose_to_metadata_group(&self, command: &ClusterCommand) -> bool {
-        let payload = EntryPayload::new(
-            PayloadKind::Cluster,
-            convert::cluster_command_to_bytes(command),
-        );
-        let mut clock = BootstrapClock;
-        let mut controller = self.controller.lock().expect("controller mutex poisoned");
-
-        let committed = controller
-            .step(RaftInput::Propose(payload.clone()), &mut clock)
-            .is_some_and(|out| !out.committed.is_empty());
-        let committed = committed || {
-            let _ = controller.step(RaftInput::Tick(TimerKind::Election), &mut clock);
-            controller
-                .step(RaftInput::Propose(payload), &mut clock)
-                .is_some_and(|out| !out.committed.is_empty())
-        };
-        if committed {
-            controller.apply(command);
-        }
-        committed
+    /// - `Ok(())` once the entry commits to a majority (Req 3.1–3.4);
+    /// - `Err(CoreError::NotLeader { leader })` on a non-leader, carrying the
+    ///   known metadata-leader hint so the caller can redirect (Req 4.1; Raft
+    ///   §8);
+    /// - `Err(CoreError::CommitTimeout)` if the entry has not committed within
+    ///   `COMMIT_TIMEOUT_MS` (Req 3.5).
+    ///
+    /// A [`CoreError::CommitTimeout`] is **indeterminate**, not a failure (H2):
+    /// the entry may still commit under a new leader, so the caller must
+    /// re-check (e.g. `DescribeTopic`) rather than assume the change did not take
+    /// effect. Topic-admin being idempotent on topic name makes a retry safe.
+    ///
+    /// A missing handle or a closed driver queue is surfaced as
+    /// [`CoreError::NotLeader`] (no metadata replica here is accepting the
+    /// proposal); a dropped reply is surfaced as the indeterminate
+    /// [`CoreError::CommitTimeout`].
+    async fn propose_cluster(&self, command: ClusterCommand) -> Result<(), CoreError> {
+        let handle = self
+            .handle(METADATA_GROUP_TOPIC, METADATA_GROUP_PARTITION.0)
+            .ok_or(CoreError::NotLeader { leader: None })?;
+        let (reply_tx, reply_rx) = oneshot::channel();
+        handle
+            .send(DriverCommand::ProposeCluster {
+                command,
+                reply: reply_tx,
+            })
+            .map_err(|_| CoreError::NotLeader { leader: None })?;
+        // A dropped reply (the driver stopped) is indeterminate; surface it as a
+        // commit timeout so the caller re-checks rather than assuming success.
+        reply_rx.await.unwrap_or(Err(CoreError::CommitTimeout))
     }
 
     /// The handle of the driver for `(topic, partition)`, if hosted here.
@@ -379,6 +432,76 @@ impl NodeShared {
             .expect("partitions mutex poisoned")
             .get(&(topic.to_string(), partition))
             .cloned()
+    }
+
+    /// Spawn the asynchronous driver for the dedicated metadata Raft group
+    /// `("__meta", 0)` and register its handle in the partitions table.
+    ///
+    /// The metadata group is driven exactly like a partition replica — a real
+    /// [`TimerClock`] for its election/heartbeat timers and a [`GrpcTransport`]
+    /// stamping the reserved `("__meta", 0)` key onto outbound RPCs — so it
+    /// elects a leader and replicates over the same `VelaPeer` transport the
+    /// partition groups use (Req 1.1, 1.4, 2.1, 2.4). Registering the driver's
+    /// [`DriverHandle`] under `("__meta", 0)` makes [`NodeShared::handle`]
+    /// resolve it, so inbound `AppendEntries` / `RequestVote` for the metadata
+    /// group route through the existing `VelaPeerService::dispatch_rpc` with no
+    /// change.
+    ///
+    /// The driver folds each step's committed entries through a
+    /// [`MetadataSink`](crate::driver::MetadataSink) (design §2): a committed
+    /// `ClusterCommand` is applied to the node's served catalogue and the shared
+    /// [`ReconcileSignal`](crate::driver::ReconcileSignal) is poked. A companion
+    /// reconciler task waits on that same signal and aligns this node's running
+    /// partition drivers with the served catalogue **off** the metadata Raft
+    /// loop (design §5, H1), so applying a commit never blocks metadata
+    /// heartbeats. Apply and reconcile share the one served catalogue and the
+    /// one signal (Requirement 5.1, 6.1).
+    ///
+    /// The driver shares the node's durable [`MetadataController`] replica behind
+    /// its mutex rather than opening the durable `__meta` WAL a second time (a
+    /// durable WAL permits only a single open); it is now the sole stepper of
+    /// that replica.
+    fn spawn_metadata_driver(self: &Arc<Self>, leader_lookup: HashMap<RaftNodeId, NodeId>) {
+        let key = (METADATA_GROUP_TOPIC.to_string(), METADATA_GROUP_PARTITION.0);
+        let (tx, rx) = mpsc::unbounded_channel();
+        let clock = TimerClock::new(tx.clone());
+        let transport = GrpcTransport::new(
+            METADATA_GROUP_TOPIC.to_string(),
+            METADATA_GROUP_PARTITION.0,
+            self.self_id.clone(),
+            self.pool.clone(),
+            tx.clone(),
+        );
+
+        // The reconcile signal is shared between the sink that pokes it (after
+        // applying a committed catalogue change) and the off-loop reconciler
+        // task that waits on it; `Notify` coalesces pokes into one idempotent
+        // pass (design §5, H1).
+        let signal: ReconcileSignal = Arc::new(Notify::new());
+        let sink = MetadataSink::new(self.metadata.clone(), signal.clone());
+        crate::reconciler::spawn_reconciler(self.clone(), signal.clone());
+        // Periodically re-poke the reconciler on the membership cadence so a
+        // partition left unstarted by a transient durable-log-open failure
+        // (Requirement 6.7) is retried until it starts or is unassigned
+        // (Requirement 6.8). Reconciliation is an idempotent diff, so the
+        // periodic re-runs are safe (design §5).
+        crate::reconciler::spawn_reconcile_ticker(signal);
+
+        let driver = MetadataDriver::new(
+            self.controller.clone(),
+            self.self_id.clone(),
+            clock,
+            transport,
+            rx,
+            tx.clone(),
+            sink,
+            leader_lookup,
+        );
+        driver.spawn();
+        self.partitions
+            .lock()
+            .expect("partitions mutex poisoned")
+            .insert(key, tx);
     }
 
     /// Spawn a driver for `partition` of `topic` if this node is one of its
@@ -493,6 +616,14 @@ impl NodeShared {
             self.pool.clone(),
             tx.clone(),
         );
+        // Reverse map every replica's numeric raft id back to its domain id so
+        // the driver can report its known leader as a domain `NodeId` for
+        // live-leader routing (Requirement 8.1, 8.2).
+        let leader_lookup: HashMap<RaftNodeId, NodeId> = partition
+            .replicas
+            .iter()
+            .map(|replica| (raft_node_id(replica.as_str()), replica.clone()))
+            .collect();
         let driver = PartitionDriver::new(
             topic.to_string(),
             partition.index.0,
@@ -502,6 +633,7 @@ impl NodeShared {
             transport,
             rx,
             tx.clone(),
+            leader_lookup,
         );
         driver.spawn();
 
@@ -675,8 +807,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn new_node_is_the_sole_available_member() {
+    #[tokio::test]
+    async fn new_node_is_the_sole_available_member() {
         let tmp = TempDir::new("sole-member");
         let node = NodeShared::new(&config("node-a", "127.0.0.1:7001", 1, tmp.path()))
             .expect("node startup succeeds");
@@ -871,5 +1003,113 @@ mod tests {
         assert!(node.handle("orders", 1).is_some());
 
         node.stop_partition("orders", 1);
+    }
+
+    // --- Leader-routed propose idempotency (task 6.4, H2) -------------------
+    //
+    // A single-node node is its own metadata majority, so its `__meta/0` driver
+    // self-elects through the normal asynchronous election path (the inline
+    // `BootstrapClock` shortcut has been removed); once it is leader a proposal
+    // commits on a majority-of-one. These tests exercise the topic-name
+    // idempotency that makes a retry after an *indeterminate* `CommitTimeout`
+    // safe — re-creating an existing topic is rejected as `TopicExists` and
+    // re-deleting an absent topic is a no-op success, and in both cases nothing
+    // new is proposed or committed (Requirement 3.4, 3.5, 4.1).
+
+    /// Retry `create_topic` until the single-node metadata driver has
+    /// self-elected through the normal async election path, so the first
+    /// proposal commits rather than racing the election with `NotLeader`. The
+    /// election timer fires in the randomized 150–300 ms window, so ~100
+    /// attempts at 20 ms stay bounded: a group that never elects fails the test
+    /// instead of hanging.
+    async fn create_awaiting_metadata_leader(
+        node: &Arc<NodeShared>,
+        name: &str,
+        partition_count: u32,
+        backend: LogBackend,
+    ) -> Result<Topic, CoreError> {
+        for _ in 0..100 {
+            match node.create_topic(name, partition_count, backend).await {
+                Err(CoreError::NotLeader { .. }) => {
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+                other => return other,
+            }
+        }
+        node.create_topic(name, partition_count, backend).await
+    }
+
+    #[tokio::test]
+    async fn recreating_an_existing_topic_is_idempotent_topic_exists() {
+        let tmp = TempDir::new("recreate-idempotent");
+        let node = NodeShared::new(&config("node-a", "127.0.0.1:7001", 1, tmp.path()))
+            .expect("node startup succeeds");
+
+        // The first create commits once the single-node metadata driver elects.
+        let created = create_awaiting_metadata_leader(&node, "orders", 1, LogBackend::InMemory)
+            .await
+            .expect("the first create_topic commits");
+        assert_eq!(created.name, "orders");
+
+        // Re-creating the same topic is rejected as TopicExists and proposes
+        // nothing: a retry after an indeterminate CommitTimeout cannot corrupt
+        // the catalogue (H2).
+        let epoch_before = node.metadata.lock().unwrap().epoch;
+        let result = node.create_topic("orders", 1, LogBackend::InMemory).await;
+        assert_eq!(
+            result,
+            Err(CoreError::TopicExists("orders".to_string())),
+            "re-creating an existing topic must be rejected as TopicExists"
+        );
+
+        let metadata = node.metadata.lock().unwrap();
+        assert_eq!(metadata.topics.len(), 1, "no duplicate topic is added");
+        assert_eq!(
+            metadata.epoch, epoch_before,
+            "a rejected re-create must commit nothing (epoch unchanged)"
+        );
+    }
+
+    #[tokio::test]
+    async fn redeleting_an_absent_topic_is_a_no_op_success() {
+        let tmp = TempDir::new("redelete-idempotent");
+        let node = NodeShared::new(&config("node-a", "127.0.0.1:7001", 1, tmp.path()))
+            .expect("node startup succeeds");
+
+        // Deleting a topic that never existed is a no-op success that proposes
+        // nothing — the catalogue (and its epoch) is untouched (H2). This holds
+        // regardless of leadership, since the absent-topic check short-circuits
+        // before the propose.
+        assert_eq!(node.delete_topic("ghost").await, Ok(()));
+        assert_eq!(
+            node.metadata.lock().unwrap().epoch,
+            0,
+            "deleting an absent topic must commit nothing"
+        );
+
+        // Create then delete a real topic, then re-delete it: the second delete
+        // is also a no-op success, leaving the catalogue empty and unchanged.
+        create_awaiting_metadata_leader(&node, "orders", 1, LogBackend::InMemory)
+            .await
+            .expect("create commits");
+        node.delete_topic("orders")
+            .await
+            .expect("the first delete commits");
+        assert!(
+            !node.metadata.lock().unwrap().topics.contains_key("orders"),
+            "the topic is gone after the first delete"
+        );
+
+        let epoch_before = node.metadata.lock().unwrap().epoch;
+        assert_eq!(
+            node.delete_topic("orders").await,
+            Ok(()),
+            "re-deleting the now-absent topic is a no-op success"
+        );
+        assert_eq!(
+            node.metadata.lock().unwrap().epoch,
+            epoch_before,
+            "a no-op re-delete must commit nothing (epoch unchanged)"
+        );
     }
 }

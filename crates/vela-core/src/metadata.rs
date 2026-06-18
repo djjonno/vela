@@ -6,14 +6,13 @@
 //! **Option A — a dedicated metadata Raft group**, this module runs a single,
 //! well-known control group keyed `("__meta", PartitionIndex(0))` (the
 //! `__meta/p0` group). `ClusterCommand`s are entries in that group's log; once
-//! committed, [`apply_command`] folds the change into a [`ClusterMetadata`] and
-//! bumps its `epoch`. After a change commits, the leader pushes the new
-//! metadata (carrying its `epoch`) to every reachable node via `SyncMetadata`
-//! and must observe acknowledgements within
-//! [`METADATA_PROPAGATION_TIMEOUT_MS`], reporting laggards on delete
-//! (Requirement 2.8, 3.5, 3.6).
+//! committed, [`apply_command`] folds the change into a [`ClusterMetadata`].
+//! Agreement and propagation are owned entirely by the metadata Raft group's
+//! own log replication and commit semantics — committed entries reach every
+//! node via `AppendEntries`, not a separate acknowledgement or snapshot-push
+//! protocol.
 //!
-//! This module owns four concerns:
+//! This module owns three concerns:
 //!
 //! - **Availability tracking** on [`ClusterMetadata`] — each member's
 //!   availability is exactly one of [`NodeAvailability::Available`] or
@@ -21,26 +20,17 @@
 //! - **The metadata Raft group controller** — [`MetadataController`] hosts the
 //!   `__meta/p0` group in a [`RaftGroupFleet`] and applies committed
 //!   `ClusterCommand`s to its [`ClusterMetadata`] (Requirement 3.1, 9.3).
-//! - **Propagation/ack tracking** — acks are modelled at the core level as the
-//!   set of node ids that acknowledged a given `epoch`; the controller reports
-//!   the expected-but-missing nodes as [`CoreError::MetadataPropagation`] on
-//!   delete (Requirement 2.8, 3.5, 3.6).
 //! - **`FindLeader` resolution** — [`MetadataController::find_leader`] resolves
 //!   `(topic, partition)` to the current leader (Requirement 10.4).
 //!
-//! The 5-second wall-clock propagation deadline itself is enforced by the
-//! server crate (it owns the real clock and the `SyncMetadata` RPCs); this
-//! layer is given the set of nodes that acked before the deadline and computes
-//! who is missing. Likewise, decoding committed log bytes back into a
-//! [`ClusterCommand`] is the server's concern — [`apply_command`] operates on
-//! an already-decoded, already-committed command so `vela-core` stays free of
-//! the wire encoding.
+//! Decoding committed log bytes back into a [`ClusterCommand`] is the server's
+//! concern — [`apply_command`] operates on an already-decoded, already-committed
+//! command so `vela-core` stays free of the wire encoding.
 
-use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
 
 use vela_log::{DurableWal, LogError, LogStorage, PayloadKind, SyncPolicy, WalConfig};
-use vela_raft::{Clock, NodeId as RaftNodeId, RaftInput, RaftOutput};
+use vela_raft::{Clock, NodeId as RaftNodeId, RaftInput, RaftOutput, Role};
 
 use crate::fleet::{FleetError, GroupKey, RaftGroupFleet};
 use crate::model::{
@@ -58,13 +48,12 @@ pub const METADATA_GROUP_TOPIC: &str = "__meta";
 /// the control group is a single partition.
 pub const METADATA_GROUP_PARTITION: PartitionIndex = PartitionIndex(0);
 
-/// The propagation deadline for a committed metadata change: the leader must
-/// observe acknowledgements from every reachable node within this many
-/// milliseconds (Requirement 2.8, 3.5, 3.6).
-///
-/// The wall-clock enforcement of this deadline lives in the server crate, which
-/// owns the real clock and the `SyncMetadata` RPCs; this constant documents the
-/// contract and is the value the server times against.
+/// Reserved (no longer drives behavior). Cluster metadata is now agreed solely
+/// through the dedicated `__meta/0` Raft group and reaches every node via
+/// `AppendEntries` (Requirement 1.3); there is no bespoke acknowledgement
+/// deadline or `SyncMetadata` push to time against. This constant is retained
+/// only as a reserved 5-second value for any future use and no longer
+/// participates in metadata agreement.
 pub const METADATA_PROPAGATION_TIMEOUT_MS: u64 = 5000;
 
 /// The [`GroupKey`] of the dedicated metadata Raft group, `("__meta", p0)`.
@@ -105,7 +94,8 @@ impl ClusterMetadata {
 }
 
 /// Apply a committed [`ClusterCommand`] to `meta`, mutating it in place and
-/// bumping its `epoch` (Requirement 3.1, 9.3).
+/// bumping its `epoch` as a benign applied-change counter (Requirement 3.1,
+/// 9.3).
 ///
 /// This is the metadata Raft group's state-machine transition: it runs once per
 /// committed command, after the command has already been validated (at propose
@@ -120,8 +110,8 @@ impl ClusterMetadata {
 ///   every partition the topic owns) in a single map removal.
 /// - [`ClusterCommand::SetAvailability`] updates a member's availability.
 ///
-/// Every applied command bumps `epoch`, so propagated views can be ordered and
-/// acks attributed to a specific metadata version.
+/// Every applied command bumps `epoch`, a benign monotonic counter of how many
+/// commands have been applied; it is no longer a propagation-ordering device.
 pub fn apply_command(meta: &mut ClusterMetadata, command: &ClusterCommand) {
     match command {
         ClusterCommand::CreateTopic {
@@ -166,23 +156,20 @@ pub enum MetadataRecoverError {
     Fleet(#[from] FleetError),
 }
 
-/// Manages how [`ClusterMetadata`] is agreed and propagated across the cluster
-/// (design "Cluster Metadata Management").
+/// Manages how [`ClusterMetadata`] is agreed across the cluster (design
+/// "Cluster Metadata Management").
 ///
 /// The controller owns the node's view of the cluster metadata and hosts the
 /// dedicated `__meta/p0` Raft group in a [`RaftGroupFleet`]. Committed
-/// `ClusterCommand`s are applied through [`MetadataController::apply`]; the
-/// resulting metadata is propagated by the server, which records the acks it
-/// observes through [`MetadataController::record_ack`]. On a delete, the
-/// controller reports any reachable node that failed to ack within the deadline
-/// as [`CoreError::MetadataPropagation`].
+/// `ClusterCommand`s are applied through [`MetadataController::apply`];
+/// agreement and propagation are owned by the metadata group's own Raft log
+/// replication and commit semantics, so there is no separate acknowledgement or
+/// snapshot-push protocol.
 pub struct MetadataController {
     /// The node-local view of cluster metadata, mutated as commands commit.
     metadata: ClusterMetadata,
     /// The fleet hosting the single `__meta/p0` Raft group.
     fleet: RaftGroupFleet,
-    /// Per-epoch set of node ids that acknowledged the propagated metadata.
-    acks: HashMap<u64, BTreeSet<NodeId>>,
 }
 
 impl MetadataController {
@@ -202,7 +189,6 @@ impl MetadataController {
         Self {
             metadata: ClusterMetadata::new(),
             fleet,
-            acks: HashMap::new(),
         }
     }
 
@@ -226,14 +212,9 @@ impl MetadataController {
     /// caller has already populated — the path
     /// [`MetadataController::recover_durable`] uses to hand back the durable,
     /// recovered group together with the catalogue rebuilt from its committed
-    /// log. Acks start empty: they are per-process propagation bookkeeping, not
-    /// recovered state.
+    /// log.
     fn from_parts(metadata: ClusterMetadata, fleet: RaftGroupFleet) -> Self {
-        Self {
-            metadata,
-            fleet,
-            acks: HashMap::new(),
-        }
+        Self { metadata, fleet }
     }
 
     /// Open (or create) the durable `__meta/0` metadata Raft group at
@@ -316,67 +297,64 @@ impl MetadataController {
             .map(|replica| replica.step(input, clock))
     }
 
+    /// The role this node currently holds in the metadata group, or `None` if
+    /// the group is somehow absent (never for a controller built through
+    /// [`MetadataController::new`] or [`MetadataController::recover_durable`]).
+    ///
+    /// The leader-routed propose path reads this to decide whether to append a
+    /// `ClusterCommand` here or redirect the caller to the metadata leader
+    /// (Raft §8; Requirement 4.1).
+    pub fn role(&self) -> Option<Role> {
+        self.fleet.get(&metadata_group_key()).map(|r| r.role())
+    }
+
+    /// The metadata replica's known current leader, as a numeric
+    /// [`RaftNodeId`], or `None` when it knows of none — it is mid-election or
+    /// has just stepped down and not yet heard from a leader (Raft §5.2).
+    ///
+    /// This is the replica's own id once it has won the metadata election and
+    /// the `leader_id` it last accepted from an `AppendEntries` otherwise. The
+    /// server maps the numeric id back to the domain node id to use as the
+    /// redirect hint when a non-leader receives a topic-admin proposal
+    /// (Requirement 4.1, 8.1; Raft §8).
+    pub fn leader_id(&self) -> Option<RaftNodeId> {
+        self.fleet
+            .get(&metadata_group_key())
+            .and_then(|r| r.raft().leader_id())
+    }
+
+    /// The last index of the metadata group's replicated log, or `None` when the
+    /// log is empty — i.e. the index immediately preceding the one a freshly
+    /// proposed entry would occupy.
+    ///
+    /// The propose path uses this to compute the target index a `ClusterCommand`
+    /// will land at, so it can await that index committing (Requirement 3.3,
+    /// 3.4).
+    pub fn last_log_index(&self) -> Option<u64> {
+        self.fleet
+            .get(&metadata_group_key())
+            .and_then(|r| r.raft().log().last_index())
+    }
+
+    /// The highest committed index of the metadata group, or `None` if nothing
+    /// has committed yet (Raft §5.3).
+    ///
+    /// The propose path compares this against a proposal's target index to
+    /// detect when the entry has committed to a majority (Requirement 3.2, 3.3).
+    pub fn commit_index(&self) -> Option<u64> {
+        self.fleet
+            .get(&metadata_group_key())
+            .and_then(|r| r.raft().commit_index())
+    }
+
     /// Apply a committed [`ClusterCommand`] to the controller's metadata view,
     /// bumping `epoch` (Requirement 3.1, 9.3).
     ///
-    /// Returns the new `epoch` after the change, which identifies the metadata
-    /// version the server then propagates and collects acks against.
+    /// Returns the new `epoch` after the change — a benign applied-change
+    /// counter, no longer a propagation-ordering device.
     pub fn apply(&mut self, command: &ClusterCommand) -> u64 {
         apply_command(&mut self.metadata, command);
         self.metadata.epoch
-    }
-
-    /// Record that `node` acknowledged the propagated metadata at version
-    /// `epoch` (Requirement 2.8, 3.5).
-    ///
-    /// Acks are modelled as the set of node ids that acknowledged a given
-    /// epoch; recording the same `(epoch, node)` twice is idempotent.
-    pub fn record_ack(&mut self, epoch: u64, node: NodeId) {
-        self.acks.entry(epoch).or_default().insert(node);
-    }
-
-    /// The set of node ids that have acknowledged metadata version `epoch`.
-    pub fn acked(&self, epoch: u64) -> BTreeSet<NodeId> {
-        self.acks.get(&epoch).cloned().unwrap_or_default()
-    }
-
-    /// The `reachable` nodes that have **not** acknowledged metadata version
-    /// `epoch`, in the order they appear in `reachable` (Requirement 3.6).
-    ///
-    /// `reachable` is the set of nodes the server attempted to propagate to
-    /// (every reachable cluster node); a node missing from the recorded acks is
-    /// a laggard.
-    pub fn laggards(&self, epoch: u64, reachable: &[NodeId]) -> Vec<NodeId> {
-        let acked = self.acks.get(&epoch);
-        reachable
-            .iter()
-            .filter(|node| !acked.is_some_and(|set| set.contains(node)))
-            .cloned()
-            .collect()
-    }
-
-    /// Confirm that every `reachable` node acknowledged metadata version
-    /// `epoch` before the propagation deadline, as required on a topic delete
-    /// (Requirement 2.8, 3.5, 3.6).
-    ///
-    /// Returns `Ok(())` when all reachable nodes have acked. Otherwise returns
-    /// [`CoreError::MetadataPropagation`] carrying the laggards — the nodes that
-    /// did not acknowledge — while the deletion recorded on the nodes that did
-    /// ack is retained (the controller's own metadata already reflects the
-    /// delete). The wall-clock deadline of [`METADATA_PROPAGATION_TIMEOUT_MS`]
-    /// is enforced by the server before calling this; the controller only
-    /// decides who is missing from the acks gathered in time.
-    pub fn confirm_delete_propagation(
-        &self,
-        epoch: u64,
-        reachable: &[NodeId],
-    ) -> Result<(), CoreError> {
-        let laggards = self.laggards(epoch, reachable);
-        if laggards.is_empty() {
-            Ok(())
-        } else {
-            Err(CoreError::MetadataPropagation(laggards))
-        }
     }
 
     /// Resolve the current leader of `(topic, partition)` (Requirement 10.4).
@@ -559,63 +537,6 @@ mod tests {
         });
         assert_eq!(epoch, 1);
         assert!(controller.metadata().topics.contains_key("orders"));
-    }
-
-    // --- Propagation laggard reporting (Requirement 2.8, 3.5, 3.6) ----------
-
-    #[test]
-    fn confirm_delete_propagation_ok_when_all_reachable_nodes_ack() {
-        let mut controller = MetadataController::new(RaftNodeId(0), Vec::new());
-        let epoch = controller.apply(&ClusterCommand::DeleteTopic {
-            name: "orders".to_string(),
-        });
-        let reachable = vec![NodeId::new("node-b"), NodeId::new("node-c")];
-
-        controller.record_ack(epoch, NodeId::new("node-b"));
-        controller.record_ack(epoch, NodeId::new("node-c"));
-
-        assert_eq!(
-            controller.confirm_delete_propagation(epoch, &reachable),
-            Ok(())
-        );
-    }
-
-    #[test]
-    fn confirm_delete_propagation_reports_laggards_when_some_do_not_ack() {
-        let mut controller = MetadataController::new(RaftNodeId(0), Vec::new());
-        let epoch = controller.apply(&ClusterCommand::DeleteTopic {
-            name: "orders".to_string(),
-        });
-        let reachable = vec![
-            NodeId::new("node-b"),
-            NodeId::new("node-c"),
-            NodeId::new("node-d"),
-        ];
-
-        // Only node-b acks in time; node-c and node-d are laggards.
-        controller.record_ack(epoch, NodeId::new("node-b"));
-
-        assert_eq!(
-            controller.confirm_delete_propagation(epoch, &reachable),
-            Err(CoreError::MetadataPropagation(vec![
-                NodeId::new("node-c"),
-                NodeId::new("node-d"),
-            ]))
-        );
-    }
-
-    #[test]
-    fn laggards_are_scoped_to_the_specific_epoch() {
-        let mut controller = MetadataController::new(RaftNodeId(0), Vec::new());
-        let reachable = vec![NodeId::new("node-b")];
-
-        // An ack for epoch 1 does not satisfy a check for epoch 2.
-        controller.record_ack(1, NodeId::new("node-b"));
-        assert_eq!(controller.acked(1), BTreeSet::from([NodeId::new("node-b")]));
-        assert_eq!(
-            controller.confirm_delete_propagation(2, &reachable),
-            Err(CoreError::MetadataPropagation(vec![NodeId::new("node-b")]))
-        );
     }
 
     // --- FindLeader resolution (Requirement 10.4) ---------------------------

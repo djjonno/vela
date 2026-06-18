@@ -17,6 +17,7 @@ mod driver;
 pub mod membership;
 mod node;
 mod paths;
+mod reconciler;
 mod registry;
 mod service;
 mod transport;
@@ -29,7 +30,7 @@ use vela_proto::v1::vela_peer_server::VelaPeerServer;
 use crate::node::NodeShared;
 use crate::service::{VelaClientService, VelaPeerService};
 
-pub use config::{CliArgs, Config, ConfigError};
+pub use config::{CliArgs, Config, ConfigError, Peer};
 
 /// Initialize the global `tracing` subscriber used for structured logs.
 ///

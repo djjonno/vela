@@ -31,13 +31,15 @@
 //!
 //! ## Peer identity
 //!
-//! Configured peers are plain `host:port` addresses. Until cross-node partition
-//! assignment wires real node identities through, membership keys each peer by
-//! its address: the address is used both as the [`NodeId`] recorded in the
-//! members list and (hashed via [`raft_node_id`]) as the [`PeerPool`] key the
-//! transport dials. This is consistent with how [`NodeShared`] seeds its own
-//! member entry (identity + address) and is sufficient for the local-cluster
-//! milestone.
+//! Peers are configured as `id@host:port`, so a node knows each peer by the
+//! same stable id that peer uses for itself. Membership keys each peer by that
+//! id: the id is the [`NodeId`] recorded in the members list and (hashed via
+//! [`raft_node_id`]) the [`PeerPool`](crate::transport::PeerPool) key the
+//! transport dials, while the address is stored alongside for dialing. Because
+//! every node derives the same numeric id from the same string id, Raft
+//! votes/appends and the leader reported by `FindLeader` line up across the
+//! cluster. This matches how [`NodeShared`] seeds its own member entry
+//! (its `VELA_NODE_ID` + listen address).
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -49,6 +51,7 @@ use vela_raft::NodeId as RaftNodeId;
 
 use vela_proto::v1::HeartbeatRequest;
 
+use crate::config::Peer;
 use crate::node::NodeShared;
 use crate::registry::raft_node_id;
 
@@ -163,27 +166,28 @@ impl MembershipState {
 /// (added to the members list as available, and registered in the
 /// [`PeerPool`](crate::transport::PeerPool) so the transport can dial it), then
 /// a per-peer heartbeat loop is spawned (Requirement 9.1, 9.2, 9.4, 9.5).
-pub fn spawn_membership(node: Arc<NodeShared>, peers: Vec<String>) {
+pub fn spawn_membership(node: Arc<NodeShared>, peers: Vec<Peer>) {
     register_peers(&node, &peers);
-    for addr in peers {
-        tokio::spawn(heartbeat_loop(node.clone(), addr));
+    for peer in peers {
+        tokio::spawn(heartbeat_loop(node.clone(), peer));
     }
 }
 
 /// Add each peer to the members list (as available) and register its address in
 /// the peer pool. Peers already present are left untouched.
-fn register_peers(node: &Arc<NodeShared>, peers: &[String]) {
+fn register_peers(node: &Arc<NodeShared>, peers: &[Peer]) {
     let mut metadata = node.metadata.lock().expect("metadata mutex poisoned");
-    for addr in peers {
-        let id = NodeId::new(addr);
+    for peer in peers {
+        let id = NodeId::new(&peer.id);
         if !metadata.members.iter().any(|m| m.id == id) {
             metadata.members.push(Member {
                 id: id.clone(),
-                addr: addr.clone(),
+                addr: peer.addr.clone(),
                 availability: NodeAvailability::Available,
             });
         }
-        node.pool.register_peer(raft_node_id(addr), addr.clone());
+        node.pool
+            .register_peer(raft_node_id(&peer.id), peer.addr.clone());
     }
 }
 
@@ -191,9 +195,10 @@ fn register_peers(node: &Arc<NodeShared>, peers: &[String]) {
 /// (bounded by [`PEER_CONNECT_TIMEOUT`]) and folds the outcome into a
 /// [`MembershipState`], applying any availability transition to the shared
 /// cluster metadata.
-async fn heartbeat_loop(node: Arc<NodeShared>, addr: String) {
-    let peer_id = raft_node_id(&addr);
-    let member_id = NodeId::new(&addr);
+async fn heartbeat_loop(node: Arc<NodeShared>, peer: Peer) {
+    let peer_id = raft_node_id(&peer.id);
+    let member_id = NodeId::new(&peer.id);
+    let addr = peer.addr;
     let mut state = MembershipState::new();
 
     // A 1 s tick that, after a slow heartbeat, resumes its cadence without

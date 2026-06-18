@@ -1,13 +1,19 @@
 //! The `vela-ctl` command-line surface.
 //!
 //! Defines the [`clap`] argument model ([`Cli`] + [`Command`]) and the
-//! [`run`] dispatcher that drives the [`vela_client`] admin API. The four
-//! operator commands map one-to-one onto [`AdminClient`] calls:
+//! [`run`] dispatcher that drives the [`vela_client`] API. The four operator
+//! (topic-admin) commands map one-to-one onto [`AdminClient`] calls:
 //!
 //! - `create <name> --partitions N` → [`create_topic`] (Requirement 13.1)
 //! - `delete <name>` → [`delete_topic`] (Requirement 13.2)
 //! - `list` → [`list_topics`] (Requirement 13.3)
 //! - `describe <name>` → [`describe_topic`] (Requirement 13.4)
+//!
+//! Two data-plane commands drive the produce/consume client roles:
+//!
+//! - `produce <name> --value V [--key K]` → `Producer::produce` (Requirement 4)
+//! - `consume <name> --partition P [--offset O] [--max N]` →
+//!   `Consumer::consume` (Requirement 5)
 //!
 //! Every call is wrapped in a 5 s [`tokio::time::timeout`]: if the cluster cannot
 //! be reached in time the command reports a connection error and exits non-zero
@@ -50,7 +56,9 @@ const EXIT_CONNECTION_ERROR: u8 = 2;
 pub struct Cli {
     /// Cluster endpoint(s) to contact. Repeat the flag or comma-separate several
     /// addresses; the client treats them as bootstrap nodes and routes admin
-    /// calls to whichever it can reach.
+    /// calls to whichever it can reach. To produce/consume, prefix each entry
+    /// with its cluster node id as `id=url` (e.g.
+    /// `node1=http://127.0.0.1:7001`) so partition leaders can be dialed by id.
     #[arg(
         long = "endpoints",
         visible_alias = "addr",
@@ -99,6 +107,36 @@ pub enum Command {
     Describe {
         /// Topic name.
         name: String,
+    },
+    /// Produce a single record to a topic (Requirement 4).
+    ///
+    /// The partition is resolved client-side: a `--key` maps deterministically
+    /// to a partition, while an absent key round-robins (Requirement 4.1, 4.2).
+    Produce {
+        /// Topic name.
+        name: String,
+        /// Optional record key. A non-empty key routes deterministically to a
+        /// partition; omit it to round-robin across partitions.
+        #[arg(long, short = 'k', value_name = "KEY")]
+        key: Option<String>,
+        /// Record value (payload) to append.
+        #[arg(long, short = 'v', value_name = "VALUE")]
+        value: String,
+    },
+    /// Consume committed records from a topic partition (Requirement 5).
+    Consume {
+        /// Topic name.
+        name: String,
+        /// Partition index to read from.
+        #[arg(long, short = 'p', value_name = "INDEX")]
+        partition: u32,
+        /// Offset to start reading from (0-based).
+        #[arg(long, short = 'o', value_name = "OFFSET", default_value_t = 0)]
+        offset: u64,
+        /// Maximum number of records to return (server bounds this to 1..=10000;
+        /// omitted lets the server apply its default of 500).
+        #[arg(long, short = 'm', value_name = "N")]
+        max: Option<u32>,
     },
 }
 
@@ -212,20 +250,70 @@ pub async fn run(cli: Cli) -> Result<(), CtlError> {
                 println!("  partition {} leader {}", partition.index, leader);
             }
         }
+        Command::Produce { name, key, value } => {
+            let producer = client.producer();
+            let key_bytes = key.as_deref().map(str::as_bytes);
+            let offset =
+                with_timeout(producer.produce(&name, key_bytes, value.into_bytes())).await?;
+            println!("produced to topic '{name}' at offset {offset}");
+        }
+        Command::Consume {
+            name,
+            partition,
+            offset,
+            max,
+        } => {
+            let consumer = client.consumer();
+            let outcome = with_timeout(consumer.consume(&name, partition, offset, max)).await?;
+            if outcome.records.is_empty() {
+                println!("no records");
+            } else {
+                for record in outcome.records {
+                    let value = record
+                        .record
+                        .as_ref()
+                        .map(|r| String::from_utf8_lossy(&r.value).into_owned())
+                        .unwrap_or_default();
+                    match record
+                        .record
+                        .as_ref()
+                        .and_then(|r| r.key.as_ref())
+                        .map(|k| String::from_utf8_lossy(k).into_owned())
+                    {
+                        Some(key) => {
+                            println!("offset {} key {} value {}", record.offset, key, value)
+                        }
+                        None => println!("offset {} value {}", record.offset, value),
+                    }
+                }
+            }
+            println!("next offset {}", outcome.next_offset);
+        }
     }
     Ok(())
 }
 
-/// Pair each endpoint address with a synthetic node id.
+/// Pair each endpoint with the node id used to resolve partition leaders.
 ///
-/// [`VelaClient::new`] takes `(node_id, address)` bootstrap pairs, but an
-/// operator only supplies addresses. The ids are arbitrary handles the client
-/// uses internally, so we derive stable `node-{i}` labels positionally.
+/// Produce/consume resolve a partition's leader by its *cluster* node id (the
+/// `VELA_NODE_ID` each node is configured with) via the client's node registry,
+/// so that id must be known to dial the leader. Each `--endpoints` entry may
+/// therefore carry an explicit id as `id=url` (e.g. `node1=http://127.0.0.1:7001`).
+///
+/// An entry without an `id=` prefix is a bare address: it still seeds the
+/// bootstrap set used for admin calls and the initial `FindLeader`, but is given
+/// a synthetic positional `node-{i}` id that will not match a real leader id —
+/// fine for topic admin, insufficient for produce/consume to a partition led by
+/// that node. Supply `id=url` entries (typically all cluster nodes) to use the
+/// data-plane commands.
 fn derive_nodes(endpoints: &[String]) -> Vec<(String, String)> {
     endpoints
         .iter()
         .enumerate()
-        .map(|(i, addr)| (format!("node-{i}"), addr.clone()))
+        .map(|(i, entry)| match entry.split_once('=') {
+            Some((id, addr)) if !id.is_empty() => (id.to_string(), addr.to_string()),
+            _ => (format!("node-{i}"), entry.clone()),
+        })
         .collect()
 }
 
@@ -369,6 +457,72 @@ mod tests {
     }
 
     #[test]
+    fn produce_parses_name_key_and_value() {
+        let cli = parse(&["produce", "orders", "--key", "user-1", "--value", "hi"]).expect("valid");
+        match cli.command {
+            Command::Produce { name, key, value } => {
+                assert_eq!(name, "orders");
+                assert_eq!(key.as_deref(), Some("user-1"));
+                assert_eq!(value, "hi");
+            }
+            other => panic!("expected produce, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn produce_key_is_optional() {
+        let cli = parse(&["produce", "orders", "--value", "hi"]).expect("valid");
+        assert!(matches!(cli.command, Command::Produce { key: None, .. }));
+    }
+
+    #[test]
+    fn produce_requires_a_value() {
+        // Without `--value` there is nothing to append, so it is a parse error.
+        assert!(parse(&["produce", "orders"]).is_err());
+    }
+
+    #[test]
+    fn consume_parses_partition_offset_and_max() {
+        let cli = parse(&[
+            "consume", "orders", "-p", "2", "--offset", "10", "--max", "50",
+        ])
+        .expect("valid");
+        match cli.command {
+            Command::Consume {
+                name,
+                partition,
+                offset,
+                max,
+            } => {
+                assert_eq!(name, "orders");
+                assert_eq!(partition, 2);
+                assert_eq!(offset, 10);
+                assert_eq!(max, Some(50));
+            }
+            other => panic!("expected consume, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn consume_defaults_offset_to_zero_and_max_to_none() {
+        let cli = parse(&["consume", "orders", "--partition", "0"]).expect("valid");
+        assert!(matches!(
+            cli.command,
+            Command::Consume {
+                offset: 0,
+                max: None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn consume_requires_a_partition() {
+        // Consume targets an explicit partition; omitting it is a parse error.
+        assert!(parse(&["consume", "orders"]).is_err());
+    }
+
+    #[test]
     fn a_subcommand_is_required() {
         assert!(parse(&[]).is_err());
     }
@@ -423,6 +577,40 @@ mod tests {
             vec![
                 ("node-0".to_string(), "http://a:1".to_string()),
                 ("node-1".to_string(), "http://b:2".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn derive_nodes_honors_explicit_node_ids() {
+        // An `id=url` entry seeds the registry with the real cluster node id, so
+        // partition leaders returned by FindLeader can be resolved to addresses.
+        let nodes = derive_nodes(&[
+            "node1=http://127.0.0.1:7001".to_string(),
+            "node2=http://127.0.0.1:7002".to_string(),
+        ]);
+        assert_eq!(
+            nodes,
+            vec![
+                ("node1".to_string(), "http://127.0.0.1:7001".to_string()),
+                ("node2".to_string(), "http://127.0.0.1:7002".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn derive_nodes_mixes_explicit_and_synthetic_ids() {
+        // A bare address keeps its positional synthetic id; an `id=url` entry
+        // keeps its explicit id. The synthetic id uses the entry's index.
+        let nodes = derive_nodes(&[
+            "http://a:1".to_string(),
+            "node2=http://127.0.0.1:7002".to_string(),
+        ]);
+        assert_eq!(
+            nodes,
+            vec![
+                ("node-0".to_string(), "http://a:1".to_string()),
+                ("node2".to_string(), "http://127.0.0.1:7002".to_string()),
             ]
         );
     }

@@ -53,8 +53,9 @@ fn strip_comment(line: &str) -> &str {
 #[derive(Debug)]
 struct NodeConfig {
     node_id: String,
-    /// Host portions of each `host:port` entry in `VELA_PEERS`.
-    peer_hosts: Vec<String>,
+    /// The peer node ids referenced in `VELA_PEERS` (the `id` of each
+    /// `id@host:port` entry).
+    peer_ids: Vec<String>,
 }
 
 /// Parse the `VELA_NODE_ID` / `VELA_PEERS` pairs out of the compose file.
@@ -82,24 +83,22 @@ fn parse_node_configs(compose: &str) -> Vec<NodeConfig> {
             let node_id = pending_id.take().unwrap_or_else(|| {
                 panic!("found a VELA_PEERS entry with no preceding VELA_NODE_ID: {trimmed:?}")
             });
-            let peer_hosts = value
+            let peer_ids = value
                 .split(',')
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
                 .map(|entry| {
-                    // Each entry is `host:port`; keep the host portion.
+                    // Each entry is `id@host:port`; keep the leading peer id (or
+                    // the whole entry if no `id@` prefix is present).
                     entry
-                        .split(':')
-                        .next()
-                        .expect("split always yields at least one segment")
+                        .split_once('@')
+                        .map(|(id, _addr)| id)
+                        .unwrap_or(entry)
                         .trim()
                         .to_string()
                 })
                 .collect();
-            nodes.push(NodeConfig {
-                node_id,
-                peer_hosts,
-            });
+            nodes.push(NodeConfig { node_id, peer_ids });
         }
     }
 
@@ -203,10 +202,10 @@ fn compose_peer_lists_cross_reference_every_other_node() {
     for node in &nodes {
         // A node must never list itself as a peer.
         assert!(
-            !node.peer_hosts.iter().any(|p| p == &node.node_id),
+            !node.peer_ids.iter().any(|p| p == &node.node_id),
             "node `{}` must not list itself in VELA_PEERS, found {:?}",
             node.node_id,
-            node.peer_hosts
+            node.peer_ids
         );
 
         // A node must list every *other* node as a peer (full cross-reference).
@@ -215,22 +214,22 @@ fn compose_peer_lists_cross_reference_every_other_node() {
                 continue;
             }
             assert!(
-                node.peer_hosts.iter().any(|p| p == other),
+                node.peer_ids.iter().any(|p| p == other),
                 "node `{}` must reference peer `{}` in its VELA_PEERS, found {:?}",
                 node.node_id,
                 other,
-                node.peer_hosts
+                node.peer_ids
             );
         }
 
         // And it must reference exactly the other nodes — no stray peers.
         assert_eq!(
-            node.peer_hosts.len(),
+            node.peer_ids.len(),
             all_ids.len() - 1,
             "node `{}` should reference exactly the {} other node(s), found {:?}",
             node.node_id,
             all_ids.len() - 1,
-            node.peer_hosts
+            node.peer_ids
         );
     }
 }

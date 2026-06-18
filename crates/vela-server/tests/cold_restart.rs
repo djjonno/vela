@@ -144,6 +144,48 @@ async fn await_leader(client: &mut VelaClientClient<Channel>, topic: &str, parti
     panic!("partition {topic}/{partition} did not elect a leader within the bounded window");
 }
 
+/// Issue `CreateTopic`, retrying while `__meta/0` has not yet elected a leader.
+///
+/// With the inline `BootstrapClock` bootstrap removed, even a single-node
+/// metadata group elects through the normal asynchronous election path, so a
+/// `CreateTopic` proposal is rejected with a "no metadata leader available"
+/// status until that election fires (Requirement 4.2). Retrying within a
+/// bounded window waits out the randomized election timeout and returns the
+/// first committed create.
+async fn create_topic_awaiting_metadata_leader(
+    client: &mut VelaClientClient<Channel>,
+    topic: &str,
+    partitions: u32,
+    log_backend: i32,
+) -> v1::TopicInfo {
+    let mut last_status = None;
+    for _ in 0..100 {
+        match client
+            .create_topic(v1::CreateTopicRequest {
+                name: topic.to_string(),
+                partitions,
+                log_backend,
+            })
+            .await
+        {
+            Ok(response) => {
+                return response
+                    .into_inner()
+                    .topic
+                    .expect("a committed create returns the applied topic");
+            }
+            Err(status) => {
+                last_status = Some(status);
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+    }
+    panic!(
+        "metadata group did not self-elect a leader to commit CreateTopic within the bounded \
+         window (last error: {last_status:?})"
+    );
+}
+
 /// Produce `value` to `(topic, partition)`, retrying briefly to absorb the
 /// instant between a leader being reported and the produce path observing it,
 /// and return the committed offset.
@@ -212,30 +254,24 @@ fn cold_restart_recovers_catalogue_durable_records_and_empty_in_memory() {
             let mut client = connect_client(addr).await;
 
             // A Durable topic (the default backend) and an In-Memory topic.
-            let durable = client
-                .create_topic(v1::CreateTopicRequest {
-                    name: "orders".to_string(),
-                    partitions: 1,
-                    log_backend: v1::LogBackend::Durable as i32,
-                })
-                .await
-                .expect("create durable topic succeeds")
-                .into_inner()
-                .topic
-                .expect("created topic is returned");
+            // The 1-voter `__meta/0` group self-elects asynchronously, so retry
+            // the create until that metadata election fires.
+            let durable = create_topic_awaiting_metadata_leader(
+                &mut client,
+                "orders",
+                1,
+                v1::LogBackend::Durable as i32,
+            )
+            .await;
             assert_eq!(durable.log_backend, v1::LogBackend::Durable as i32);
 
-            let in_memory = client
-                .create_topic(v1::CreateTopicRequest {
-                    name: "events".to_string(),
-                    partitions: 1,
-                    log_backend: v1::LogBackend::InMemory as i32,
-                })
-                .await
-                .expect("create in-memory topic succeeds")
-                .into_inner()
-                .topic
-                .expect("created topic is returned");
+            let in_memory = create_topic_awaiting_metadata_leader(
+                &mut client,
+                "events",
+                1,
+                v1::LogBackend::InMemory as i32,
+            )
+            .await;
             assert_eq!(in_memory.log_backend, v1::LogBackend::InMemory as i32);
 
             // Commit three records to the durable partition; offsets are gap-free
@@ -288,7 +324,10 @@ fn cold_restart_recovers_catalogue_durable_records_and_empty_in_memory() {
 
             // The durable partition reopened on its existing segments and
             // returns every previously committed record at its original offset
-            // (Requirement 14.1, 18.2).
+            // (Requirement 14.1, 18.2). Consume routes by the live Raft-elected
+            // leader, so wait for the recovered partition to re-elect before
+            // reading (Requirement 8.1).
+            await_leader(&mut client, "orders", 0).await;
             let consumed = client
                 .consume(v1::ConsumeRequest {
                     topic: "orders".to_string(),
@@ -312,7 +351,9 @@ fn cold_restart_recovers_catalogue_durable_records_and_empty_in_memory() {
 
             // The in-memory topic survives in the catalogue but starts empty:
             // its committed records did not survive the restart (Requirement
-            // 11.4, 13.2).
+            // 11.4, 13.2). Consume routes by the live leader, so wait for this
+            // partition to elect after restart before reading (Requirement 8.1).
+            await_leader(&mut client, "events", 0).await;
             let empty = client
                 .consume(v1::ConsumeRequest {
                     topic: "events".to_string(),

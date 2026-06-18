@@ -27,8 +27,8 @@ use vela_core::{
 };
 use vela_raft::NodeId as RaftNodeId;
 
-/// The Requirement 10.6 leader-unavailable deadline, mirrored from
-/// [`vela_core::METADATA_PROPAGATION_TIMEOUT_MS`]'s sibling 5-second contract.
+/// The Requirement 10.6 leader-unavailable deadline: `find_leader` must resolve
+/// well within this 5-second wall-clock bound.
 const LEADER_UNAVAILABLE_DEADLINE: Duration = Duration::from_secs(5);
 
 /// Build a `Partition` with the given index and optional leader, using a fixed

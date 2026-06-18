@@ -267,6 +267,13 @@ pub struct RaftNode<S: LogStorage> {
     /// counting this node's own self-vote. Reset at the start of each election
     /// and consulted to decide when a majority is reached (Requirement 7.4).
     votes_granted: u64,
+    /// The leader this replica currently believes is in charge: its own id once
+    /// it wins an election, the `leader_id` it last accepted from a valid
+    /// `AppendEntries`, or `None` while it is a candidate or has just stepped
+    /// down and not yet heard from a leader (Raft §5.2 — followers track the
+    /// current leader so clients can be redirected to it). Surfaced through
+    /// [`RaftNode::leader_id`] for live-leader routing (Requirement 8.1, 8.2).
+    leader_id: Option<NodeId>,
 
     // --- Volatile leader state (per peer) ---
     /// For each peer, the next log index to send.
@@ -318,6 +325,7 @@ impl<S: LogStorage> RaftNode<S> {
             // replica does not re-surface entries it already applied (R11.1).
             last_applied: commit_index,
             votes_granted: 0,
+            leader_id: None,
             next_index: HashMap::new(),
             match_index: HashMap::new(),
             replication_backoff: HashMap::new(),
@@ -360,6 +368,19 @@ impl<S: LogStorage> RaftNode<S> {
     /// Current role within the group.
     pub fn role(&self) -> Role {
         self.role
+    }
+
+    /// The leader this replica currently believes is in charge, or `None` when
+    /// it knows of none (it is a candidate, or has stepped down and not yet
+    /// heard from a leader).
+    ///
+    /// This is its own [`id`](RaftNode::id) once it has won an election and the
+    /// `leader_id` it last accepted from a valid `AppendEntries` otherwise
+    /// (Raft §5.2). The server maps this numeric id back to the domain node id
+    /// to route produce/consume and answer `FindLeader` by the live
+    /// Raft-elected leader (Requirement 8.1, 8.2).
+    pub fn leader_id(&self) -> Option<NodeId> {
+        self.leader_id
     }
 
     /// Highest log index known to be committed.
@@ -506,6 +527,9 @@ impl<S: LogStorage> RaftNode<S> {
 
         self.current_term = new_term;
         self.role = Role::Candidate;
+        // A candidate knows of no leader for the new term until one emerges
+        // (itself on winning, or another via `AppendEntries`) (Requirement 8.1).
+        self.leader_id = None;
         self.voted_for = Some(self.id);
         self.votes_granted = 1; // self-vote
         self.arm_election_timer(clock);
@@ -533,7 +557,19 @@ impl<S: LogStorage> RaftNode<S> {
         }
 
         self.role = Role::Leader;
-        self.voted_for = None;
+        // This replica now leads the current term; record itself as the known
+        // leader so it can answer "who leads?" without waiting for its own
+        // heartbeat to echo back (Requirement 8.1).
+        self.leader_id = Some(self.id);
+        // Retain the self-vote (`voted_for == Some(self.id)`, set in
+        // `start_election` and persisted there) for the leader's current term.
+        // Clearing it would let a sitting leader grant its vote to another
+        // candidate soliciting in the *same* term — `not_yet_voted` would be
+        // true — electing a second leader for that term and violating "at most
+        // one leader per term" (Raft §5.2). The vote is cleared only on the
+        // normal paths: stepping down to a higher term (`step_down`) or
+        // adopting a higher term. Keeping it `Some(self.id)` here also matches
+        // the hard state persisted at election start, so recovery is consistent.
 
         // Initialise per-peer replication cursors (refined as followers ack or
         // reject): next_index starts just past the leader's last entry and is
@@ -698,6 +734,9 @@ impl<S: LogStorage> RaftNode<S> {
         self.role = Role::Follower;
         self.voted_for = None;
         self.votes_granted = 0;
+        // The leader of the new, higher term is not yet known; it is relearned
+        // from the first valid `AppendEntries` of that term (Requirement 8.1).
+        self.leader_id = None;
     }
 
     /// Dispatch an incoming message, first adopting any higher term and
@@ -853,6 +892,11 @@ impl<S: LogStorage> RaftNode<S> {
             self.role = Role::Follower;
         }
         self.current_term = ae.term;
+        // Record the contacting leader as this term's known leader so the node
+        // can redirect clients to it (Raft §5.2; Requirement 8.1). A heartbeat
+        // that later fails the log-matching check below is still from the
+        // legitimate current-term leader, so learn it before that check.
+        self.leader_id = Some(ae.leader_id);
         self.arm_election_timer(clock);
 
         // Log-matching check: the entry at prev_log_index must match in term
@@ -1183,6 +1227,106 @@ mod tests {
         let reply = expect_vote_reply(&denied);
         assert!(!reply.vote_granted);
         assert_eq!(node.voted_for(), Some(NodeId(1)));
+    }
+
+    #[test]
+    fn fresh_node_knows_no_leader() {
+        // A brand-new follower has heard from no leader yet (Requirement 8.1).
+        let node = RaftNode::new(NodeId(0), vec![NodeId(1), NodeId(2)], InMemoryLog::new());
+        assert_eq!(node.leader_id(), None);
+    }
+
+    #[test]
+    fn append_entries_records_the_contacting_leader() {
+        // A valid `AppendEntries` teaches a follower who the current leader is
+        // so clients can be redirected to it (Raft §5.2; Requirement 8.1).
+        let mut node = RaftNode::new(NodeId(0), vec![NodeId(1), NodeId(2)], InMemoryLog::new());
+        let mut clock = TestClock::default();
+
+        node.step(
+            RaftInput::Message(RaftMessage::AppendEntries(AppendEntries {
+                term: 3,
+                leader_id: NodeId(1),
+                prev_log_index: None,
+                prev_log_term: None,
+                entries: Vec::new(),
+                leader_commit: None,
+            })),
+            &mut clock,
+        );
+
+        assert_eq!(node.leader_id(), Some(NodeId(1)));
+        assert_eq!(node.role(), Role::Follower);
+    }
+
+    #[test]
+    fn winning_an_election_records_self_as_leader() {
+        // A single-node group is its own majority, so the election timeout
+        // promotes it to leader; it records itself as the known leader
+        // (Requirement 8.1).
+        let mut sim = SimCluster::new(1, 1);
+        sim.arm(NodeId(0), TimerKind::Election, ELECTION_TIMEOUT_BASE);
+        sim.step();
+        assert_eq!(sim.role(NodeId(0)), Some(Role::Leader));
+        assert_eq!(sim.node(NodeId(0)).unwrap().leader_id(), Some(NodeId(0)));
+    }
+
+    #[test]
+    fn stepping_down_to_a_higher_term_clears_the_known_leader() {
+        // After learning a leader, adopting a strictly higher term (here via a
+        // higher-term vote request) steps the node down and forgets the leader
+        // until a new one contacts it (Requirement 8.1).
+        let mut node = RaftNode::new(NodeId(0), vec![NodeId(1), NodeId(2)], InMemoryLog::new());
+        let mut clock = TestClock::default();
+
+        node.step(
+            RaftInput::Message(RaftMessage::AppendEntries(AppendEntries {
+                term: 2,
+                leader_id: NodeId(1),
+                prev_log_index: None,
+                prev_log_term: None,
+                entries: Vec::new(),
+                leader_commit: None,
+            })),
+            &mut clock,
+        );
+        assert_eq!(node.leader_id(), Some(NodeId(1)));
+
+        node.step(
+            RaftInput::Message(RaftMessage::RequestVote(RequestVote {
+                term: 5,
+                candidate_id: NodeId(2),
+                last_log_index: None,
+                last_log_term: None,
+            })),
+            &mut clock,
+        );
+        assert_eq!(node.leader_id(), None);
+    }
+
+    #[test]
+    fn starting_an_election_clears_the_known_leader() {
+        // A follower that knew a leader and then times out becomes a candidate
+        // for a new term, in which it knows of no leader yet (Requirement 8.1).
+        let mut node = RaftNode::new(NodeId(0), vec![NodeId(1), NodeId(2)], InMemoryLog::new());
+        let mut clock = TestClock::default();
+
+        node.step(
+            RaftInput::Message(RaftMessage::AppendEntries(AppendEntries {
+                term: 1,
+                leader_id: NodeId(1),
+                prev_log_index: None,
+                prev_log_term: None,
+                entries: Vec::new(),
+                leader_commit: None,
+            })),
+            &mut clock,
+        );
+        assert_eq!(node.leader_id(), Some(NodeId(1)));
+
+        node.step(RaftInput::Tick(TimerKind::Election), &mut clock);
+        assert_eq!(node.role(), Role::Candidate);
+        assert_eq!(node.leader_id(), None);
     }
 
     /// A trivial [`Clock`] for direct, single-node `step` tests: time never

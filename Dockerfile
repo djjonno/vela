@@ -22,8 +22,14 @@ RUN cargo build --release -p vela-server --bin velad
 # matches the builder's glibc, so the dynamically linked binary runs as-is.
 FROM debian:bookworm-slim AS runtime
 
-# Run as an unprivileged user rather than root.
-RUN useradd --system --create-home --uid 10001 vela
+# Run as an unprivileged user rather than root. Pre-create the data directory
+# (VELA_DATA_DIR) owned by `vela` so that when docker-compose mounts a named
+# volume there, Docker initializes the volume with this ownership. Without it,
+# the volume mount point is created root-owned and the unprivileged process
+# cannot create its durable log directory (Permission denied, os error 13).
+RUN useradd --system --create-home --uid 10001 vela \
+    && mkdir -p /var/lib/vela \
+    && chown vela:vela /var/lib/vela
 USER vela
 WORKDIR /home/vela
 

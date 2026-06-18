@@ -40,12 +40,13 @@ together a broker, a coordinator, and a stream-processing framework.
 | **Topic**     | A named stream of event records.                                            |
 | **Partition** | A shard of a topic — the unit of ordering, replication, and consensus.      |
 | **Raft group**| The replicas of one partition; elect a leader and agree on log order.       |
-| **Log**       | The append-only ordered entries for a partition (in-memory for now).        |
+| **Log**       | The append-only ordered entries for a partition, persisted durably to disk. |
 | **Node**      | A cluster member hosting partition replicas and (later) processors.         |
 
 Consensus uses an **in-house Raft implementation**, run **per partition** rather than
-once per cluster. Persistence is **in-memory for now** — durable storage is a planned
-follow-up.
+once per cluster. Each partition's log is **persisted durably** to a write-ahead log
+on disk, so committed records and Raft state survive a node restart; an in-memory
+backend remains available behind the same storage trait.
 
 ## Project Layout
 
@@ -53,7 +54,7 @@ Vela is a Cargo workspace of focused crates:
 
 ```
 crates/
-├── vela-log/      # append-only log (in-memory now; storage trait for persistence later)
+├── vela-log/      # append-only log (durable write-ahead log; in-memory backend behind the same storage trait)
 ├── vela-raft/     # in-house Raft: states, elections, replication
 ├── vela-proto/    # protobuf definitions + generated gRPC types
 ├── vela-core/     # topics, partitions, routing, per-partition raft groups
@@ -79,8 +80,16 @@ cargo build
 
 ### Run a single node
 
+The daemon is configured via flags or environment variables, including a
+`--data-dir` (`VELA_DATA_DIR`) where each durable partition log stores its
+segments:
+
 ```bash
-cargo run -p vela-server
+cargo run -p vela-server -- \
+  --node-id node-a \
+  --listen-addr 127.0.0.1:7001 \
+  --replication-factor 1 \
+  --data-dir ./data
 ```
 
 ### Run a local cluster
@@ -102,11 +111,10 @@ cargo mutants                # mutation testing
 
 ## Roadmap
 
-1. **Now** — partitioned topics, per-partition Raft consensus, in-memory log,
-   produce/consume, local multi-node cluster.
-2. **Next** — durable log persistence.
-3. **Later** — embedded stream-processing runtime (code-as-data, node-local
-   execution, replayable).
+1. **Now** — partitioned topics, per-partition Raft consensus, durable log
+   persistence, produce/consume, local multi-node cluster.
+2. **Next** — embedded ark-lang stream-processing runtime (code-as-data,
+   node-local execution, replayable).
 
 ## License
 

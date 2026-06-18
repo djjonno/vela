@@ -44,7 +44,9 @@ pub struct CliArgs {
     #[arg(long, env = "VELA_LISTEN_ADDR")]
     pub listen_addr: Option<String>,
 
-    /// Peer node addresses (`host:port`), comma-separated or repeated.
+    /// Peer nodes as `id@host:port` (e.g. `node2@node2:7001`), comma-separated
+    /// or repeated. A bare `host:port` is accepted and uses the address as the
+    /// peer id (single-node/local fallback).
     #[arg(long = "peers", env = "VELA_PEERS", value_delimiter = ',', num_args = 0..)]
     pub peers: Vec<String>,
 
@@ -57,6 +59,23 @@ pub struct CliArgs {
     pub data_dir: Option<String>,
 }
 
+/// A configured peer node: its stable cluster identity and transport address.
+///
+/// Peers are configured as `id@host:port` (e.g. `node2@node2:7001`) so a node
+/// knows each peer by the *same* stable id that peer uses for itself. That
+/// shared identity is what lets every node derive a consistent numeric
+/// [`raft_node_id`](crate::registry::raft_node_id) for a given node, so Raft
+/// votes/appends and the leader reported by `FindLeader` line up across the
+/// cluster. A bare `host:port` entry (no `id@`) is accepted for the
+/// single-node/local case and falls back to using the address as the id.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Peer {
+    /// The peer's stable cluster node id (matches its own `VELA_NODE_ID`).
+    pub id: String,
+    /// The peer's transport address (`host:port`).
+    pub addr: String,
+}
+
 /// A validated `velad` configuration, ready for the daemon to act on.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
@@ -64,9 +83,9 @@ pub struct Config {
     pub node_id: NodeId,
     /// The socket address the gRPC listener binds on.
     pub listen_addr: SocketAddr,
-    /// Addresses (`host:port`) of the configured peer nodes. May be empty for a
+    /// The configured peer nodes (id + `host:port`). May be empty for a
     /// single-node cluster.
-    pub peers: Vec<String>,
+    pub peers: Vec<Peer>,
     /// Number of replicas assigned to each partition's Raft group.
     pub replication_factor: u32,
     /// Root directory under which all Durable partition logs hosted on this
@@ -187,15 +206,31 @@ fn parse_replication_factor(raw: &str) -> Result<u32, ConfigError> {
     Ok(factor)
 }
 
-/// Trim each peer entry and reject any that is empty after trimming.
-fn normalize_peers(peers: Vec<String>) -> Result<Vec<String>, ConfigError> {
+/// Parse each peer entry into a [`Peer`] and reject any that is empty after
+/// trimming.
+///
+/// An entry may be `id@host:port` (explicit id) or a bare `host:port` (the
+/// address doubles as the id, for the single-node/local fallback). The `id` and
+/// `addr` halves are trimmed; an entry that is empty, or whose `id` or `addr`
+/// half is empty (e.g. `@addr`, `id@`, or a lone `@`), is rejected.
+fn normalize_peers(peers: Vec<String>) -> Result<Vec<Peer>, ConfigError> {
     let mut out = Vec::with_capacity(peers.len());
     for peer in peers {
         let trimmed = peer.trim();
         if trimmed.is_empty() {
             return Err(ConfigError::EmptyPeer);
         }
-        out.push(trimmed.to_string());
+        let (id, addr) = match trimmed.split_once('@') {
+            Some((id, addr)) => (id.trim(), addr.trim()),
+            None => (trimmed, trimmed),
+        };
+        if id.is_empty() || addr.is_empty() {
+            return Err(ConfigError::EmptyPeer);
+        }
+        out.push(Peer {
+            id: id.to_string(),
+            addr: addr.to_string(),
+        });
     }
     Ok(out)
 }
@@ -234,7 +269,19 @@ mod tests {
 
         assert_eq!(config.node_id, NodeId::new("node-a"));
         assert_eq!(config.listen_addr, "127.0.0.1:7001".parse().unwrap());
-        assert_eq!(config.peers, vec!["node-b:7001", "node-c:7001"]);
+        assert_eq!(
+            config.peers,
+            vec![
+                Peer {
+                    id: "node-b:7001".to_string(),
+                    addr: "node-b:7001".to_string()
+                },
+                Peer {
+                    id: "node-c:7001".to_string(),
+                    addr: "node-c:7001".to_string()
+                },
+            ]
+        );
         assert_eq!(config.replication_factor, 3);
         assert_eq!(config.data_dir, PathBuf::from("/var/lib/vela"));
     }
@@ -360,7 +407,19 @@ mod tests {
             Some("/var/lib/vela"),
         ))
         .expect("config with padded peers must parse");
-        assert_eq!(config.peers, vec!["node-b:7001", "node-c:7001"]);
+        assert_eq!(
+            config.peers,
+            vec![
+                Peer {
+                    id: "node-b:7001".to_string(),
+                    addr: "node-b:7001".to_string()
+                },
+                Peer {
+                    id: "node-c:7001".to_string(),
+                    addr: "node-c:7001".to_string()
+                },
+            ]
+        );
     }
 
     #[test]
@@ -374,6 +433,67 @@ mod tests {
         ))
         .expect_err("empty peer entry must error");
         assert_eq!(err, ConfigError::EmptyPeer);
+    }
+
+    #[test]
+    fn peer_with_explicit_id_is_split() {
+        // `id@host:port` records the peer's real cluster id distinct from its
+        // address, so identity lines up across the cluster.
+        let config = Config::from_cli(cli(
+            Some("node1"),
+            Some("0.0.0.0:7001"),
+            &["node2@node2:7001", "node3@node3:7001"],
+            Some("3"),
+            Some("/var/lib/vela"),
+        ))
+        .expect("config with id@addr peers must parse");
+        assert_eq!(
+            config.peers,
+            vec![
+                Peer {
+                    id: "node2".to_string(),
+                    addr: "node2:7001".to_string()
+                },
+                Peer {
+                    id: "node3".to_string(),
+                    addr: "node3:7001".to_string()
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn peer_id_and_addr_halves_are_trimmed() {
+        let config = Config::from_cli(cli(
+            Some("node1"),
+            Some("0.0.0.0:7001"),
+            &["  node2  @  node2:7001  "],
+            Some("1"),
+            Some("/var/lib/vela"),
+        ))
+        .expect("config with padded id@addr must parse");
+        assert_eq!(
+            config.peers,
+            vec![Peer {
+                id: "node2".to_string(),
+                addr: "node2:7001".to_string()
+            }]
+        );
+    }
+
+    #[test]
+    fn peer_with_empty_id_or_addr_half_is_rejected() {
+        for bad in ["@node2:7001", "node2@", "@", "  @  "] {
+            let err = Config::from_cli(cli(
+                Some("node1"),
+                Some("0.0.0.0:7001"),
+                &[bad],
+                Some("1"),
+                Some("/var/lib/vela"),
+            ))
+            .expect_err("a half-empty id@addr peer must error");
+            assert_eq!(err, ConfigError::EmptyPeer, "input {bad:?}");
+        }
     }
 
     #[test]
@@ -419,7 +539,19 @@ mod tests {
         .expect("well-formed argv must parse");
 
         let config = Config::from_cli(args).expect("argv config must validate");
-        assert_eq!(config.peers, vec!["node-b:7001", "node-c:7001"]);
+        assert_eq!(
+            config.peers,
+            vec![
+                Peer {
+                    id: "node-b:7001".to_string(),
+                    addr: "node-b:7001".to_string()
+                },
+                Peer {
+                    id: "node-c:7001".to_string(),
+                    addr: "node-c:7001".to_string()
+                },
+            ]
+        );
         assert_eq!(config.node_id, NodeId::new("node-a"));
         assert_eq!(config.replication_factor, 3);
     }

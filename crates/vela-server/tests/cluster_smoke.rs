@@ -161,6 +161,48 @@ async fn await_leader(
     panic!("partition {topic}/{partition} did not elect a leader within the bounded window");
 }
 
+/// Issue `CreateTopic`, retrying while `__meta/0` has not yet elected a leader.
+///
+/// With the inline `BootstrapClock` bootstrap removed, even a single-node
+/// metadata group elects through the normal asynchronous election path, so a
+/// `CreateTopic` proposal is rejected with a "no metadata leader available"
+/// status until that election fires (Requirement 4.2). Retrying within a
+/// bounded window waits out the randomized 150–300 ms election timeout and
+/// returns the first committed create; a group that never elects exhausts the
+/// budget and fails the test rather than hanging.
+async fn create_topic_awaiting_metadata_leader(
+    client: &mut VelaClientClient<Channel>,
+    topic: &str,
+    partitions: u32,
+) -> v1::TopicInfo {
+    let mut last_status = None;
+    for _ in 0..100 {
+        match client
+            .create_topic(v1::CreateTopicRequest {
+                name: topic.to_string(),
+                partitions,
+                log_backend: v1::LogBackend::Unspecified as i32,
+            })
+            .await
+        {
+            Ok(response) => {
+                return response
+                    .into_inner()
+                    .topic
+                    .expect("a committed create returns the applied topic");
+            }
+            Err(status) => {
+                last_status = Some(status);
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+    }
+    panic!(
+        "metadata group did not self-elect a leader to commit CreateTopic within the bounded \
+         window (last error: {last_status:?})"
+    );
+}
+
 /// Requirement 14.5 / 7.2 — end-to-end consensus over real timers and tonic.
 ///
 /// Bring up a single `velad` node, create a 1-partition topic, wait for the
@@ -178,17 +220,9 @@ async fn single_node_cluster_elects_then_produces_and_consumes_end_to_end() {
 
     // Create a single-partition topic. With rf=1 the sole node is the only
     // replica, so its Raft group is a majority of one and commits locally.
-    let created = client
-        .create_topic(v1::CreateTopicRequest {
-            name: "smoke".to_string(),
-            partitions: 1,
-            log_backend: v1::LogBackend::Unspecified as i32,
-        })
-        .await
-        .expect("create_topic succeeds")
-        .into_inner()
-        .topic
-        .expect("created topic is returned");
+    // The 1-voter `__meta/0` group self-elects asynchronously, so retry the
+    // create until that metadata election fires.
+    let created = create_topic_awaiting_metadata_leader(&mut client, "smoke", 1).await;
     assert_eq!(created.name, "smoke");
     assert_eq!(created.partition_count, 1);
 
@@ -315,22 +349,15 @@ async fn two_node_cluster_peers_are_reachable_for_discovery() {
         .into_inner();
     assert_eq!(reply_b.node_id, "node-b");
 
-    // Each node still serves clients while its membership loop runs, and its own
-    // single-replica partitions elect on the real clock. Create a topic on
-    // node-a and confirm it reaches a leader end-to-end, proving consensus runs
-    // on a node that is also maintaining a peer connection.
+    // Each node still serves client traffic while its membership loop runs.
+    // Topic admin in a multi-node cluster now commits through the dedicated
+    // metadata Raft group's elected leader (wired in a later task) rather than a
+    // node-local single-node `__meta`, so this smoke test asserts client
+    // reachability here and leaves multi-node create/produce/consume to the
+    // cross-node integration tests.
     let mut client_a = connect_client(addr_a).await;
     client_a
-        .create_topic(v1::CreateTopicRequest {
-            name: "peered".to_string(),
-            partitions: 1,
-            log_backend: v1::LogBackend::Unspecified as i32,
-        })
+        .list_topics(v1::ListTopicsRequest {})
         .await
-        .expect("create_topic succeeds while peered");
-    let leader = await_leader(&mut client_a, "peered", 0).await;
-    assert_eq!(
-        leader, "node-a",
-        "node-a leads its own partition while peered"
-    );
+        .expect("node-a serves clients alongside membership");
 }

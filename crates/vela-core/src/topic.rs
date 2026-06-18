@@ -97,8 +97,12 @@ pub enum CoreError {
     /// returned and the committed offset is not advanced (Requirement 4.9).
     #[error("record not committed before commit timeout")]
     CommitTimeout,
-    /// Metadata was not acknowledged by the listed nodes within the deadline
-    /// (Requirement 2.8, 3.6).
+    /// Reserved (no longer produced). The bespoke metadata-acknowledgement
+    /// protocol this variant reported on has been removed in favor of agreeing
+    /// cluster metadata solely through the `__meta/0` Raft group (Requirement
+    /// 1.3). The variant and its wire mapping (`ErrorCode::PropagationTimeout`)
+    /// are kept as reserved definitions for wire compatibility; no code path
+    /// constructs it.
     #[error("metadata not acknowledged by nodes: {0:?}")]
     MetadataPropagation(Vec<NodeId>),
 }

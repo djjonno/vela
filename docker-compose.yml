@@ -6,7 +6,9 @@
 #
 #   VELA_NODE_ID            stable identity of the node
 #   VELA_LISTEN_ADDR        address the gRPC listener binds on (in-container)
-#   VELA_PEERS              comma-separated host:port list of the OTHER nodes
+#   VELA_PEERS              comma-separated `id@host:port` list of the OTHER
+#                           nodes (the id matches each peer's VELA_NODE_ID, so
+#                           node identity is consistent cluster-wide)
 #   VELA_REPLICATION_FACTOR replicas per partition (Raft group size)
 #   VELA_DATA_DIR           in-container root for durable partition logs
 #
@@ -42,7 +44,7 @@ services:
     environment:
       VELA_NODE_ID: node1
       VELA_LISTEN_ADDR: 0.0.0.0:7001
-      VELA_PEERS: node2:7001,node3:7001,node4:7001
+      VELA_PEERS: node2@node2:7001,node3@node3:7001,node4@node4:7001
       VELA_REPLICATION_FACTOR: "3"
       VELA_DATA_DIR: /var/lib/vela
     ports:
@@ -63,7 +65,7 @@ services:
     environment:
       VELA_NODE_ID: node2
       VELA_LISTEN_ADDR: 0.0.0.0:7001
-      VELA_PEERS: node1:7001,node3:7001,node4:7001
+      VELA_PEERS: node1@node1:7001,node3@node3:7001,node4@node4:7001
       VELA_REPLICATION_FACTOR: "3"
       VELA_DATA_DIR: /var/lib/vela
     ports:
@@ -84,7 +86,7 @@ services:
     environment:
       VELA_NODE_ID: node3
       VELA_LISTEN_ADDR: 0.0.0.0:7001
-      VELA_PEERS: node1:7001,node2:7001,node4:7001
+      VELA_PEERS: node1@node1:7001,node2@node2:7001,node4@node4:7001
       VELA_REPLICATION_FACTOR: "3"
       VELA_DATA_DIR: /var/lib/vela
     ports:
@@ -105,7 +107,7 @@ services:
     environment:
       VELA_NODE_ID: node4
       VELA_LISTEN_ADDR: 0.0.0.0:7001
-      VELA_PEERS: node1:7001,node2:7001,node3:7001
+      VELA_PEERS: node1@node1:7001,node2@node2:7001,node3@node3:7001
       VELA_REPLICATION_FACTOR: "3"
       VELA_DATA_DIR: /var/lib/vela
     ports:

@@ -43,8 +43,11 @@
 // the same allow.
 #![allow(dead_code)]
 
+use std::fs::File;
 use std::io;
 use std::path::{Path, PathBuf};
+
+use fs4::FileExt;
 
 /// The filesystem abstraction the WAL is built on.
 ///
@@ -187,31 +190,30 @@ pub(crate) struct RealFile {
     file: std::fs::File,
 }
 
-/// An exclusive directory lock held via a lock file.
+/// An exclusive directory lock held via an OS **advisory** lock (`flock` on
+/// unix, `LockFileEx` on Windows) on an open `.wal.lock` handle.
 ///
-/// The lock is a sentinel file (`.wal.lock`) created with `create_new(true)`:
-/// the create succeeds for exactly one holder and fails with
-/// [`io::ErrorKind::AlreadyExists`] for any other, giving a dependency-free
-/// mutual exclusion. The file is removed when this guard is dropped.
+/// The lock is taken with [`FileExt::try_lock_exclusive`] on the open file
+/// descriptor; the guard keeps that handle alive for the lifetime of the open
+/// log. Crucially the lock is an *OS advisory lock tied to the open
+/// descriptor*, not the existence of the file, so the kernel releases it
+/// automatically when the holding process exits — including an abrupt crash or
+/// `SIGKILL`. A leftover `.wal.lock` from a previous run therefore never blocks
+/// a restart: the next open simply re-opens the same file and re-acquires the
+/// lock. A *live* second holder is still excluded — its `try_lock_exclusive`
+/// fails with [`io::ErrorKind::WouldBlock`] while the first process holds the
+/// lock, giving single-writer-per-directory exclusion.
 ///
-/// **Caveat:** a process that crashes while holding the lock leaves the sentinel
-/// behind, so a later open would see a *stale* lock and refuse to start. This is
-/// the documented trade-off of the dependency-free approach; recovering from a
-/// stale lock (e.g. via an OS advisory lock crate or a liveness check) is left
-/// to a future iteration and is acceptable for the single-writer-per-partition
-/// model here.
+/// The lock file is intentionally **left in place** across runs and **not**
+/// removed on drop: its existence is not the lock (the held advisory lock is),
+/// and unlinking it would race a concurrent opener that has already created and
+/// locked a fresh file of the same name. Dropping this guard closes the handle,
+/// which releases the advisory lock.
 #[derive(Debug)]
 pub(crate) struct RealDirLock {
-    /// Path of the sentinel lock file to remove on drop.
-    path: PathBuf,
-}
-
-impl Drop for RealDirLock {
-    fn drop(&mut self) {
-        // Best-effort release: nothing actionable if removal fails (e.g. the
-        // directory was already torn down by a test).
-        let _ = std::fs::remove_file(&self.path);
-    }
+    /// The locked file handle. Held solely so that dropping the guard closes
+    /// the descriptor and releases the OS advisory lock; never read or written.
+    _file: File,
 }
 
 /// Name of the sentinel lock file created inside a locked data directory.
@@ -346,13 +348,24 @@ impl FileSystem for RealFileSystem {
 
     fn lock_exclusive(&self, dir: &Path) -> io::Result<Self::Lock> {
         let path = dir.join(LOCK_FILE_NAME);
-        // `create_new` fails with AlreadyExists if the sentinel is present,
-        // giving single-holder exclusion without a dependency.
-        std::fs::OpenOptions::new()
+        // Open (creating if absent) the lock file. Unlike `create_new`, a
+        // leftover `.wal.lock` from a previous run is reused rather than
+        // rejected — an unclean shutdown can never strand the directory, since
+        // the *advisory lock*, not the file's existence, provides exclusion.
+        // `truncate(false)` leaves any existing file untouched.
+        let file = std::fs::OpenOptions::new()
+            .read(true)
             .write(true)
-            .create_new(true)
+            .create(true)
+            .truncate(false)
             .open(&path)?;
-        Ok(RealDirLock { path })
+        // Take an OS advisory exclusive lock on the open handle, non-blocking.
+        // It is held only while THIS process is alive — the kernel releases it
+        // on exit, including a crash/SIGKILL — and is refused (WouldBlock) while
+        // another live process holds it (Requirement 11.8). The caller maps the
+        // error to `LogError::Io` without modifying the directory.
+        FileExt::try_lock_exclusive(&file)?;
+        Ok(RealDirLock { _file: file })
     }
 }
 
@@ -757,7 +770,7 @@ pub(crate) mod fault {
 #[cfg(test)]
 mod tests {
     use super::fault::MemFileSystem;
-    use super::{FileSystem, RealFileSystem, WalFile};
+    use super::{FileSystem, RealFileSystem, WalFile, LOCK_FILE_NAME};
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -886,13 +899,42 @@ mod tests {
     fn real_lock_is_exclusive_and_released_on_drop() {
         with_real_dir("lock", |fs, dir| {
             let lock = fs.lock_exclusive(dir).expect("first lock");
-            // A second acquisition while held fails.
+            // A second acquisition while the first is held fails: the advisory
+            // lock is held on a distinct open descriptor, so the non-blocking
+            // attempt is refused with WouldBlock (not a hang).
             let err = fs.lock_exclusive(dir).expect_err("second lock should fail");
-            assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+            assert_eq!(err.kind(), std::io::ErrorKind::WouldBlock);
 
-            // Releasing the guard lets a later acquisition succeed.
+            // Releasing the guard (closing its descriptor) lets a later
+            // acquisition succeed.
             drop(lock);
             let _again = fs.lock_exclusive(dir).expect("relock after release");
+        });
+    }
+
+    #[test]
+    fn real_lock_tolerates_a_stale_lock_file_from_a_crash() {
+        // Regression: an OS advisory lock is released by the kernel when its
+        // holder exits, so a `.wal.lock` file left behind by a process that
+        // crashed (or was SIGKILLed) without running its destructor must NOT
+        // block a restart. A create-new sentinel would wrongly reject this.
+        with_real_dir("stale-lock", |fs, dir| {
+            // Simulate the leftover: the lock file exists on disk but no live
+            // process holds an advisory lock on it.
+            let stale = dir.join(LOCK_FILE_NAME);
+            std::fs::write(&stale, b"").expect("create a stale lock file");
+            assert!(fs.exists(&stale), "the stale lock file is present");
+
+            // Acquiring the lock succeeds despite the pre-existing file.
+            let lock = fs
+                .lock_exclusive(dir)
+                .expect("a stale lock file must not block acquisition");
+            // And it is genuinely held: a concurrent attempt is still refused.
+            let err = fs
+                .lock_exclusive(dir)
+                .expect_err("the lock is held after reclaiming a stale file");
+            assert_eq!(err.kind(), std::io::ErrorKind::WouldBlock);
+            drop(lock);
         });
     }
 

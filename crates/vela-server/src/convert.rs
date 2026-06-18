@@ -490,6 +490,30 @@ pub fn cluster_command_from_bytes(bytes: &[u8]) -> ClusterCommand {
     cluster_command_from_proto(&command)
 }
 
+/// Fallibly decode the prost bytes of a committed `PayloadKind::Cluster` log
+/// entry into a domain [`ClusterCommand`], returning `None` when the bytes do
+/// not decode into a *valid* command (Requirement 10.4).
+///
+/// Unlike [`cluster_command_from_bytes`], which folds undecodable bytes into a
+/// benign no-op (the right behaviour for rebuilding a catalogue from an
+/// already-agreed durable log), this surfaces a decode failure so the metadata
+/// commit-apply seam can record an error and leave its served catalogue
+/// **unchanged** rather than applying a partial or default value. `None` is
+/// returned when either:
+///
+/// - the bytes are not a valid prost [`v1::ClusterCommand`] encoding (corrupt
+///   payload), or
+/// - the decoded message carries no command (an unset oneof), which is not a
+///   value [`cluster_command_to_bytes`] ever produces and is treated as a
+///   non-applicable payload rather than a no-op mutation.
+pub fn cluster_command_try_from_bytes(bytes: &[u8]) -> Option<ClusterCommand> {
+    let command = v1::ClusterCommand::decode(bytes).ok()?;
+    // An unset oneof is not a valid command: refuse it rather than folding it
+    // into a default that would still mutate the catalogue (e.g. bump `epoch`).
+    command.command.as_ref()?;
+    Some(cluster_command_from_proto(&command))
+}
+
 // ---------------------------------------------------------------------------
 // Typed errors (Requirement 12.4, 11.2)
 // ---------------------------------------------------------------------------
@@ -539,6 +563,10 @@ pub fn core_error_to_vela_error(error: &CoreError) -> v1::VelaError {
             leader.as_ref().map(|n| n.0.clone()),
         ),
         CoreError::CommitTimeout => (v1::ErrorCode::CommitTimeout, None),
+        // Reserved mapping (Requirement 1.3): `MetadataPropagation` is no longer
+        // produced now that cluster metadata is agreed solely through the
+        // `__meta/0` Raft group. Kept for wire compatibility with the reserved
+        // `PropagationTimeout` error code.
         CoreError::MetadataPropagation(_) => (v1::ErrorCode::PropagationTimeout, None),
     };
     v1::VelaError {
@@ -1229,6 +1257,148 @@ mod tests {
                     .expect("valid create");
             }
             prop_assert_eq!(metadata, before, "metadata must be unchanged when decode fails");
+        }
+    }
+
+    // ---- Property 4: serialization round-trip (Requirement 10.2, 10.3) ----
+    //
+    // Smart generators that stay inside the round-trippable input space:
+    //
+    // - `LogBackend` has exactly two values, both of which the codec preserves
+    //   (Durable<->1, InMemory<->2); the unspecified/unknown lenient fallback is
+    //   never produced by the encoder, so it is excluded here.
+    // - `Topic.state` is intentionally *not* encoded and decodes to `Active`
+    //   (see `topic_from_proto`), so snapshots are generated with `Active`
+    //   topics — anything else could not round-trip and is out of scope for the
+    //   wire shape.
+    // - A snapshot's `topics` map is keyed by topic name; the decoder rebuilds
+    //   that map from each topic's `name` field, so the generator keys every
+    //   entry by its own `name` to model a well-formed catalogue.
+
+    fn arb_node_id() -> impl Strategy<Value = NodeId> {
+        "[a-z0-9-]{1,12}".prop_map(NodeId::new)
+    }
+
+    fn arb_log_backend() -> impl Strategy<Value = LogBackend> {
+        prop_oneof![Just(LogBackend::Durable), Just(LogBackend::InMemory)]
+    }
+
+    fn arb_availability() -> impl Strategy<Value = NodeAvailability> {
+        prop_oneof![
+            Just(NodeAvailability::Available),
+            Just(NodeAvailability::Unavailable),
+        ]
+    }
+
+    fn arb_partition() -> impl Strategy<Value = Partition> {
+        (
+            any::<u32>(),
+            prop::collection::vec(arb_node_id(), 0..4),
+            prop::option::of(arb_node_id()),
+        )
+            .prop_map(|(index, replicas, leader)| Partition {
+                index: PartitionIndex(index),
+                replicas,
+                leader,
+            })
+    }
+
+    fn arb_partitions() -> impl Strategy<Value = Vec<Partition>> {
+        prop::collection::vec(arb_partition(), 0..4)
+    }
+
+    fn arb_cluster_command() -> impl Strategy<Value = ClusterCommand> {
+        prop_oneof![
+            ("[A-Za-z0-9_-]{1,16}", arb_partitions(), arb_log_backend()).prop_map(
+                |(name, partitions, backend)| ClusterCommand::CreateTopic {
+                    name,
+                    partitions,
+                    backend,
+                }
+            ),
+            "[A-Za-z0-9_-]{1,16}".prop_map(|name| ClusterCommand::DeleteTopic { name }),
+            (arb_node_id(), arb_availability()).prop_map(|(node, availability)| {
+                ClusterCommand::SetAvailability { node, availability }
+            }),
+        ]
+    }
+
+    fn arb_member() -> impl Strategy<Value = Member> {
+        (arb_node_id(), "[a-z0-9.:-]{1,20}", arb_availability()).prop_map(
+            |(id, addr, availability)| Member {
+                id,
+                addr,
+                availability,
+            },
+        )
+    }
+
+    fn arb_cluster_metadata() -> impl Strategy<Value = ClusterMetadata> {
+        (
+            prop::collection::vec(arb_member(), 0..4),
+            prop::collection::btree_map(
+                "[A-Za-z0-9_-]{1,12}",
+                (arb_partitions(), arb_log_backend()),
+                0..4,
+            ),
+            any::<u64>(),
+        )
+            .prop_map(|(members, topic_specs, epoch)| {
+                let mut metadata = ClusterMetadata::new();
+                metadata.members = members;
+                metadata.epoch = epoch;
+                for (name, (partitions, backend)) in topic_specs {
+                    metadata.topics.insert(
+                        name.clone(),
+                        Topic {
+                            name,
+                            partitions,
+                            state: TopicState::Active,
+                            backend,
+                        },
+                    );
+                }
+                metadata
+            })
+    }
+
+    // Feature: cross-node-metadata-propagation, Property 4
+    //
+    // Property 4: for all `ClusterCommand` values, encoding to the metadata log
+    // payload and decoding back yields an equal command; for all catalogue
+    // snapshots, encode then decode yields an equal snapshot.
+    //
+    // Validates: Requirements 10.2, 10.3
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(512))]
+
+        /// Requirement 10.2: every `ClusterCommand` round-trips both through the
+        /// wire `v1::ClusterCommand` type and through the prost bytes the
+        /// metadata Raft log stores, carrying the same variant and values.
+        #[test]
+        fn cluster_command_round_trips_for_all_values(command in arb_cluster_command()) {
+            // Through the wire type.
+            prop_assert_eq!(
+                cluster_command_from_proto(&cluster_command_to_proto(&command)),
+                command.clone()
+            );
+            // Through the stored log-payload bytes.
+            prop_assert_eq!(
+                cluster_command_from_bytes(&cluster_command_to_bytes(&command)),
+                command
+            );
+        }
+
+        /// Requirement 10.3: every catalogue snapshot round-trips through its
+        /// wire form — the same members in the same order, and the same topics,
+        /// each with the identical partition list, replica-set ordering, and log
+        /// backend.
+        #[test]
+        fn cluster_metadata_round_trips_for_all_snapshots(metadata in arb_cluster_metadata()) {
+            prop_assert_eq!(
+                cluster_metadata_from_proto(&cluster_metadata_to_proto(&metadata)),
+                metadata
+            );
         }
     }
 }

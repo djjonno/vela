@@ -11,8 +11,9 @@
 //! - [`VelaPeerService`] serves the server-to-server API. `AppendEntries` and
 //!   `RequestVote` are decoded and handed to the owning partition driver, which
 //!   answers synchronously so the reply can be returned in the RPC response;
-//!   `Heartbeat` and `SyncMetadata` carry the minimal membership/metadata
-//!   behaviour this task needs (the full subsystems are tasks 14.3+).
+//!   `Heartbeat` carries the minimal membership behaviour this task needs, and
+//!   `SyncMetadata` is a reserved no-op off the commit path (metadata reaches
+//!   every node via `AppendEntries`, not a snapshot push — Requirement 1.3).
 //!
 //! Errors cross the boundary as the shared typed [`VelaError`](vela_proto::v1::VelaError)
 //! carried in a [`tonic::Status`] (Requirement 12.4), via
@@ -24,7 +25,7 @@ use tokio::sync::oneshot;
 use tonic::{Request, Response, Status};
 
 use vela_core::{
-    CoreError, PartitionIndex, DEFAULT_MAX_RECORDS, MAX_MAX_RECORDS, MAX_RECORD_BYTES,
+    CoreError, NodeId, PartitionIndex, DEFAULT_MAX_RECORDS, MAX_MAX_RECORDS, MAX_RECORD_BYTES,
     MIN_MAX_RECORDS,
 };
 use vela_raft::RaftMessage;
@@ -34,7 +35,7 @@ use vela_proto::v1::vela_client_server::VelaClient;
 use vela_proto::v1::vela_peer_server::VelaPeer;
 
 use crate::convert;
-use crate::driver::{DriverCommand, ProduceError};
+use crate::driver::{DriverCommand, DriverHandle, ProduceError};
 use crate::node::NodeShared;
 
 /// The client-facing gRPC service (produce, consume, topic admin).
@@ -56,6 +57,59 @@ impl VelaClientService {
             index: partition,
         }
     }
+
+    /// Query the **live Raft-elected leader** currently known to a partition
+    /// driver, as a domain [`NodeId`] (Requirement 8.1).
+    ///
+    /// This is the authoritative source for routing produce/consume and for
+    /// answering `FindLeader`: it asks the driver task hosting the replica for
+    /// its own id when it leads, or the leader it last learned from an
+    /// `AppendEntries`, rather than reading any stale `leader` value carried in
+    /// `ClusterMetadata` (Requirement 8.4). Returns `None` when the driver knows
+    /// of no current leader or its task has stopped (the caller treats that as
+    /// "no leader yet" and the client retries).
+    async fn known_leader(handle: &DriverHandle) -> Option<NodeId> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        handle
+            .send(DriverCommand::KnownLeader { reply: reply_tx })
+            .ok()?;
+        reply_rx.await.ok().flatten()
+    }
+}
+
+/// Translate a metadata-group topic-admin error (`create_topic` /
+/// `delete_topic`) into a [`tonic::Status`] (Requirement 4.1, 4.2).
+///
+/// The dedicated `__meta/0` metadata Raft group routes an admin proposal to its
+/// leader and never commits it on a non-leader (design §4). The two leadership
+/// outcomes are distinguished by the `leader` hint the node returns:
+///
+/// - [`CoreError::NotLeader`] `{ leader: Some(_) }` — the request reached a
+///   metadata replica that is **not** the leader but knows who is. This is the
+///   Raft §8 redirect: it surfaces as the existing `NotLeader` status carrying
+///   the metadata leader hint, so the client retries against that leader
+///   (Requirement 4.1). It flows through the shared
+///   [`convert::core_error_to_status`], which already encodes the leader hint.
+/// - [`CoreError::NotLeader`] `{ leader: None }` — the metadata group currently
+///   has **no** elected leader (no majority, or an election is in progress), so
+///   the change was committed nowhere. Rather than a bare "not leader" with an
+///   empty hint, it is surfaced as a clear "no metadata leader available" error
+///   the client may retry once a leader is elected (Requirement 4.2). The wire
+///   classification stays [`v1::ErrorCode::NotLeader`] with no hint, so a client
+///   treats it as a leadership condition (re-resolve, then retry) rather than a
+///   permanent failure.
+///
+/// Every other error (validation, `TopicExists`, the indeterminate
+/// `CommitTimeout`, …) maps through [`convert::core_error_to_status`] unchanged.
+fn admin_error_to_status(error: &CoreError) -> Status {
+    match error {
+        CoreError::NotLeader { leader: None } => convert::vela_error_to_status(&v1::VelaError {
+            code: v1::ErrorCode::NotLeader as i32,
+            message: "no metadata leader is currently available".to_string(),
+            leader: None,
+        }),
+        other => convert::core_error_to_status(other),
+    }
 }
 
 #[tonic::async_trait]
@@ -70,22 +124,23 @@ impl VelaClient for VelaClientService {
             .ok_or_else(|| Status::invalid_argument("produce request is missing a record"))?;
         let partition = PartitionIndex(req.partition);
 
-        // Validate topic admission and partition existence against metadata,
-        // capturing the believed leader for a redirect (Requirement 4.5, 4.6).
-        let leader_hint = {
+        // Validate topic admission and partition existence against metadata.
+        // Any metadata `leader` field is only a non-authoritative initial hint
+        // (Requirement 8.4); the live Raft-elected leader for a redirect is read
+        // from the partition driver below (Requirement 8.1, 8.3).
+        {
             let metadata = self.node.metadata.lock().expect("metadata mutex poisoned");
             metadata
                 .ensure_producible(&req.topic)
                 .map_err(|e| convert::core_error_to_status(&e))?;
-            let part = metadata
+            metadata
                 .topics
                 .get(&req.topic)
                 .and_then(|t| t.partitions.iter().find(|p| p.index == partition))
                 .ok_or_else(|| {
                     convert::core_error_to_status(&Self::not_found(&req.topic, req.partition))
                 })?;
-            part.leader.clone()
-        };
+        }
 
         // Reject an oversized payload before any append (Requirement 4.8).
         let record = convert::record_from_proto(record);
@@ -111,8 +166,11 @@ impl VelaClient for VelaClientService {
         match reply_rx.await {
             Ok(Ok(offset)) => Ok(Response::new(v1::ProduceResponse { offset })),
             Ok(Err(ProduceError::NotLeader)) => {
+                // Redirect to the partition's live Raft-elected leader, not the
+                // stale metadata `leader` field (Requirement 8.3, 8.4).
+                let leader = Self::known_leader(&handle).await;
                 Err(convert::core_error_to_status(&CoreError::NotLeader {
-                    leader: leader_hint,
+                    leader,
                 }))
             }
             Ok(Err(ProduceError::CommitTimeout)) => {
@@ -140,27 +198,40 @@ impl VelaClient for VelaClientService {
             None => DEFAULT_MAX_RECORDS,
         } as usize;
 
-        // The partition must exist and have an elected leader (Requirement 5.4,
-        // 5.8).
+        // The partition must exist in the served catalogue (Requirement 5.4).
         {
             let metadata = self.node.metadata.lock().expect("metadata mutex poisoned");
-            let part = metadata
+            metadata
                 .topics
                 .get(&req.topic)
                 .and_then(|t| t.partitions.iter().find(|p| p.index == partition))
                 .ok_or_else(|| {
                     convert::core_error_to_status(&Self::not_found(&req.topic, req.partition))
                 })?;
-            if part.leader.is_none() {
-                return Err(convert::core_error_to_status(
-                    &CoreError::PartitionUnavailable,
-                ));
-            }
         }
 
         let handle = self.node.handle(&req.topic, req.partition).ok_or_else(|| {
             convert::core_error_to_status(&Self::not_found(&req.topic, req.partition))
         })?;
+
+        // Route by the partition's live Raft-elected leader, not any metadata
+        // `leader` field (Requirement 8.1, 8.4). With no elected leader the
+        // partition is unavailable while committed records are retained
+        // (Requirement 7.3); if this node is not the live leader, redirect the
+        // client to it rather than serving a stale local read (Requirement 8.3).
+        match Self::known_leader(&handle).await {
+            None => {
+                return Err(convert::core_error_to_status(
+                    &CoreError::PartitionUnavailable,
+                ));
+            }
+            Some(leader) if leader.as_str() != self.node.self_id => {
+                return Err(convert::core_error_to_status(&CoreError::NotLeader {
+                    leader: Some(leader),
+                }));
+            }
+            Some(_) => {}
+        }
 
         let (reply_tx, reply_rx) = oneshot::channel();
         handle
@@ -205,28 +276,23 @@ impl VelaClient for VelaClientService {
         let backend = convert::log_backend_from_proto(req.log_backend)
             .map_err(|e| convert::core_error_to_status(&e))?;
 
-        // Validate, assign replicas, and durably commit the create through the
-        // `__meta` Raft group, then install it in the served view, so the
-        // catalogue change survives a cold restart (Requirement 16, 18). A
-        // validation rejection touches neither the durable log nor the view.
+        // Validate, assign replicas, and commit the create through the
+        // dedicated `__meta/0` metadata Raft group, then read the applied topic
+        // back from the served view. The metadata group routes the proposal to
+        // its leader (redirecting a non-leader with `NotLeader`) and reports
+        // success only once the change is committed to a majority (Req 3, 4.1).
+        // Partition drivers are started by the commit-driven reconciler on every
+        // replica node, not in this handler (Req 6.1).
+        //
+        // `NotLeader { leader: Some }` carries the metadata leader hint for the
+        // client redirect (Req 4.1); `NotLeader { leader: None }` (no elected
+        // metadata leader) becomes a "no metadata leader available" error rather
+        // than a local commit (Req 4.2) — see [`admin_error_to_status`].
         let topic = self
             .node
             .create_topic(&req.name, req.partitions, backend)
-            .map_err(|e| convert::core_error_to_status(&e))?;
-
-        // Start a driver for every partition this node replicates. A durable
-        // partition whose log cannot be opened is logged and left unstarted; the
-        // remaining partitions still start (Requirement 8.1, 8.2, 8.3).
-        for partition in &topic.partitions {
-            if let Err(err) = self.node.spawn_partition(&req.name, partition) {
-                tracing::error!(
-                    topic = %req.name,
-                    partition = partition.index.0,
-                    %err,
-                    "failed to start durable partition replica; leaving it unstarted"
-                );
-            }
-        }
+            .await
+            .map_err(|e| admin_error_to_status(&e))?;
 
         Ok(Response::new(v1::CreateTopicResponse {
             topic: Some(convert::topic_to_proto(&topic)),
@@ -239,18 +305,21 @@ impl VelaClient for VelaClientService {
     ) -> Result<Response<v1::DeleteTopicResponse>, Status> {
         let req = request.into_inner();
 
-        // Durably commit the deletion through the `__meta` group (a missing or
-        // already-deleting topic is rejected without side effects); only on a
-        // successful removal do we stop the local drivers (Requirement 3.1,
-        // 3.2, 3.4, 16, 18).
-        let partitions = self
-            .node
+        // Commit the deletion through the dedicated `__meta/0` metadata Raft
+        // group (an absent topic is an idempotent no-op success, H2). The
+        // metadata group routes the proposal to its leader and reports success
+        // only once the removal commits (Req 3, 4.1). The commit-driven
+        // reconciler stops the deleted topic's drivers on every replica node,
+        // not in this handler (Req 6.2).
+        //
+        // `NotLeader { leader: Some }` carries the metadata leader hint for the
+        // client redirect (Req 4.1); `NotLeader { leader: None }` (no elected
+        // metadata leader) becomes a "no metadata leader available" error rather
+        // than a local commit (Req 4.2) — see [`admin_error_to_status`].
+        self.node
             .delete_topic(&req.name)
-            .map_err(|e| convert::core_error_to_status(&e))?;
-
-        for partition in partitions {
-            self.node.stop_partition(&req.name, partition);
-        }
+            .await
+            .map_err(|e| admin_error_to_status(&e))?;
 
         Ok(Response::new(v1::DeleteTopicResponse {}))
     }
@@ -288,18 +357,31 @@ impl VelaClient for VelaClientService {
     ) -> Result<Response<v1::FindLeaderResponse>, Status> {
         let req = request.into_inner();
         let partition = PartitionIndex(req.partition);
-        let metadata = self.node.metadata.lock().expect("metadata mutex poisoned");
-        let part = metadata
-            .topics
-            .get(&req.topic)
-            .and_then(|t| t.partitions.iter().find(|p| p.index == partition))
-            .ok_or_else(|| {
-                convert::core_error_to_status(&Self::not_found(&req.topic, req.partition))
-            })?;
-        // The wire response models an absent leader as `None`; clients retry
-        // until a leader is known (Requirement 10.4, 11.1).
+
+        // The partition must exist in the served catalogue; its replica
+        // locations come from there, but its authoritative leader does not
+        // (Requirement 8.1, 8.4).
+        {
+            let metadata = self.node.metadata.lock().expect("metadata mutex poisoned");
+            metadata
+                .topics
+                .get(&req.topic)
+                .and_then(|t| t.partitions.iter().find(|p| p.index == partition))
+                .ok_or_else(|| {
+                    convert::core_error_to_status(&Self::not_found(&req.topic, req.partition))
+                })?;
+        }
+
+        // Resolve to the live Raft-elected leader (Requirement 8.2): if this
+        // node hosts the partition's replica, answer with its known current
+        // leader; otherwise report no leader so the client retries against a
+        // replica. The wire response models an absent leader as `None`.
+        let leader = match self.node.handle(&req.topic, req.partition) {
+            Some(handle) => Self::known_leader(&handle).await,
+            None => None,
+        };
         Ok(Response::new(v1::FindLeaderResponse {
-            leader: part.leader.as_ref().map(|n| n.0.clone()),
+            leader: leader.map(|n| n.0),
         }))
     }
 }
@@ -394,25 +476,401 @@ impl VelaPeer for VelaPeerService {
 
     async fn sync_metadata(
         &self,
-        request: Request<v1::SyncMetadataRequest>,
+        _request: Request<v1::SyncMetadataRequest>,
     ) -> Result<Response<v1::SyncMetadataReply>, Status> {
-        let req = request.into_inner();
-        let incoming = req
+        // Reserved no-op (Requirement 1.3). Cluster metadata is now agreed
+        // solely through the dedicated `__meta/0` Raft group and reaches every
+        // node via `AppendEntries`, not a snapshot push. The bespoke
+        // adopt-fresher-snapshot / epoch-acknowledgement protocol is removed, so
+        // this RPC never mutates the served catalogue. It stays defined to keep
+        // the gRPC contract valid (and reserved for a future `InstallSnapshot`
+        // path, Raft §7); it answers with the node's current applied-change
+        // epoch read-only without adopting the incoming snapshot.
+        let epoch = self
+            .node
             .metadata
-            .ok_or_else(|| Status::invalid_argument("sync request is missing metadata"))?;
-        let incoming = convert::cluster_metadata_from_proto(&incoming);
-
-        // Adopt the incoming view if it is at least as fresh as ours, and
-        // acknowledge the applied epoch (Requirement 2.8, 3.5). Full ack
-        // tracking and the propagation deadline are task 14.3+.
-        let epoch = {
-            let mut metadata = self.node.metadata.lock().expect("metadata mutex poisoned");
-            if incoming.epoch >= metadata.epoch {
-                *metadata = incoming;
-            }
-            metadata.epoch
-        };
-
+            .lock()
+            .expect("metadata mutex poisoned")
+            .epoch;
         Ok(Response::new(v1::SyncMetadataReply { epoch }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use vela_core::NodeId;
+
+    /// A non-leader metadata replica that knows the leader surfaces the Raft §8
+    /// redirect: the `NotLeader` classification carrying the leader hint, so the
+    /// client retries against that node (Requirement 4.1).
+    #[test]
+    fn admin_not_leader_with_hint_redirects_carrying_the_leader() {
+        let status = admin_error_to_status(&CoreError::NotLeader {
+            leader: Some(NodeId::new("node-2")),
+        });
+        let vela_error =
+            convert::vela_error_from_status(&status).expect("status carries a typed VelaError");
+        assert_eq!(vela_error.code, v1::ErrorCode::NotLeader as i32);
+        assert_eq!(vela_error.leader.as_deref(), Some("node-2"));
+        // It maps through the shared converter unchanged (same status code).
+        assert_eq!(
+            status.code(),
+            convert::core_error_to_status(&CoreError::NotLeader {
+                leader: Some(NodeId::new("node-2")),
+            })
+            .code()
+        );
+    }
+
+    /// No elected metadata leader becomes a clear "no metadata leader available"
+    /// error with no hint, rather than committing locally (Requirement 4.2).
+    #[test]
+    fn admin_no_metadata_leader_reports_no_leader_available() {
+        let status = admin_error_to_status(&CoreError::NotLeader { leader: None });
+        let vela_error =
+            convert::vela_error_from_status(&status).expect("status carries a typed VelaError");
+        assert_eq!(vela_error.code, v1::ErrorCode::NotLeader as i32);
+        assert_eq!(vela_error.leader, None);
+        assert!(
+            vela_error.message.contains("no metadata leader"),
+            "message should indicate no metadata leader is available, got: {}",
+            vela_error.message
+        );
+    }
+
+    /// A non-leadership admin error (here the indeterminate commit timeout) is
+    /// passed through the shared converter unchanged.
+    #[test]
+    fn admin_other_errors_pass_through_unchanged() {
+        let status = admin_error_to_status(&CoreError::CommitTimeout);
+        let vela_error =
+            convert::vela_error_from_status(&status).expect("status carries a typed VelaError");
+        assert_eq!(vela_error.code, v1::ErrorCode::CommitTimeout as i32);
+        assert_eq!(
+            status.code(),
+            convert::core_error_to_status(&CoreError::CommitTimeout).code()
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Live-leader routing (task 7.3)
+    //
+    // `Produce` / `Consume` / `FindLeader` route by the partition driver's
+    // known **live** Raft-elected leader, never the (non-authoritative) `leader`
+    // field carried in `ClusterMetadata`. Each test seeds the served metadata
+    // with a deliberately bogus `leader` value and a controllable mock driver,
+    // then asserts the routing decision follows the driver's `KnownLeader`
+    // answer rather than that stale field (Requirement 8.2, 8.3, 8.4).
+    // -----------------------------------------------------------------------
+
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+    use std::sync::Mutex;
+
+    use tokio::sync::mpsc;
+
+    use vela_core::{
+        ClusterMetadata, CommittedRecord, LogBackend, Member, MetadataController, NodeAvailability,
+        Offset, Partition, Topic, TopicState,
+    };
+
+    use crate::registry::raft_node_id;
+    use crate::transport::PeerPool;
+
+    /// A bogus `leader` value seeded into `ClusterMetadata` to prove routing
+    /// never reads the stale metadata field once a partition has a live leader
+    /// (Requirement 8.4).
+    const STALE_METADATA_LEADER: &str = "stale-metadata-leader";
+
+    /// A mock partition driver that answers the routing-relevant
+    /// [`DriverCommand`]s with fixed, test-controlled values, standing in for a
+    /// real [`PartitionDriver`](crate::driver::PartitionDriver) so a test can
+    /// pin the partition's *live* known leader and its serve results.
+    struct MockDriver {
+        /// The live Raft-elected leader the driver reports for `KnownLeader`.
+        known_leader: Option<NodeId>,
+        /// The result a `Produce` command resolves to.
+        produce: Result<Offset, ProduceError>,
+        /// The records a `Consume` command resolves to.
+        consume: Vec<CommittedRecord>,
+    }
+
+    impl MockDriver {
+        /// A driver reporting `leader` as its live known leader; it rejects
+        /// produces as a non-leader and reads back nothing (the defaults the
+        /// redirect-path tests use).
+        fn reporting(leader: Option<&str>) -> Self {
+            Self {
+                known_leader: leader.map(NodeId::new),
+                produce: Err(ProduceError::NotLeader),
+                consume: Vec::new(),
+            }
+        }
+
+        /// Spawn the mock as a driver task, returning its command handle.
+        fn spawn(self) -> DriverHandle {
+            let (tx, mut rx) = mpsc::unbounded_channel::<DriverCommand>();
+            tokio::spawn(async move {
+                while let Some(command) = rx.recv().await {
+                    match command {
+                        DriverCommand::KnownLeader { reply } => {
+                            let _ = reply.send(self.known_leader.clone());
+                        }
+                        DriverCommand::Produce { reply, .. } => {
+                            let _ = reply.send(self.produce);
+                        }
+                        DriverCommand::Consume { reply, .. } => {
+                            let _ = reply.send(self.consume.clone());
+                        }
+                        DriverCommand::Shutdown => break,
+                        _ => {}
+                    }
+                }
+            });
+            tx
+        }
+    }
+
+    /// Build node state for `self_id` hosting `topic`/`partition`, whose served
+    /// metadata records `stale_leader` as the partition's (non-authoritative)
+    /// `leader` field, with `driver` registered as the partition's running
+    /// driver.
+    fn node_hosting(
+        self_id: &str,
+        topic: &str,
+        partition: u32,
+        stale_leader: Option<&str>,
+        driver: DriverHandle,
+    ) -> Arc<NodeShared> {
+        let mut metadata = ClusterMetadata::new();
+        metadata.members.push(Member {
+            id: NodeId::new(self_id),
+            addr: "127.0.0.1:7001".to_string(),
+            availability: NodeAvailability::Available,
+        });
+        metadata.topics.insert(
+            topic.to_string(),
+            Topic {
+                name: topic.to_string(),
+                partitions: vec![Partition {
+                    index: PartitionIndex(partition),
+                    replicas: vec![NodeId::new(self_id), NodeId::new("node-b")],
+                    leader: stale_leader.map(NodeId::new),
+                }],
+                state: TopicState::Active,
+                backend: LogBackend::InMemory,
+            },
+        );
+
+        let node = Arc::new(NodeShared {
+            self_id: self_id.to_string(),
+            replication_factor: 3,
+            metadata: Arc::new(Mutex::new(metadata)),
+            partitions: Mutex::new(HashMap::new()),
+            pool: Arc::new(PeerPool::new()),
+            data_dir: PathBuf::from("unused-in-routing-tests"),
+            controller: Arc::new(Mutex::new(MetadataController::new(
+                raft_node_id(self_id),
+                Vec::new(),
+            ))),
+        });
+        node.partitions
+            .lock()
+            .expect("partitions mutex poisoned")
+            .insert((topic.to_string(), partition), driver);
+        node
+    }
+
+    /// A produce request for `topic`/`partition` carrying a single value.
+    fn produce_request(topic: &str, partition: u32) -> Request<v1::ProduceRequest> {
+        Request::new(v1::ProduceRequest {
+            topic: topic.to_string(),
+            partition,
+            record: Some(v1::Record {
+                key: None,
+                value: b"v0".to_vec(),
+            }),
+        })
+    }
+
+    /// A consume request for `topic`/`partition` from offset 0.
+    fn consume_request(topic: &str, partition: u32) -> Request<v1::ConsumeRequest> {
+        Request::new(v1::ConsumeRequest {
+            topic: topic.to_string(),
+            partition,
+            offset: 0,
+            max_count: None,
+        })
+    }
+
+    /// Requirement 8.3, 8.4: a `Produce` reaching a replica that is not the
+    /// partition's live leader is redirected to that **live** leader, using the
+    /// driver's known-leader hint rather than the stale metadata `leader` field.
+    #[tokio::test]
+    async fn produce_to_non_leader_redirects_to_the_live_leader() {
+        let driver = MockDriver::reporting(Some("node-b")).spawn();
+        let node = node_hosting("node-a", "orders", 0, Some(STALE_METADATA_LEADER), driver);
+        let service = VelaClientService::new(node);
+
+        let status = service
+            .produce(produce_request("orders", 0))
+            .await
+            .expect_err("a non-leader produce is redirected");
+        let error =
+            convert::vela_error_from_status(&status).expect("status carries a typed VelaError");
+
+        assert_eq!(error.code, v1::ErrorCode::NotLeader as i32);
+        assert_eq!(
+            error.leader.as_deref(),
+            Some("node-b"),
+            "produce must redirect to the live Raft-elected leader (Req 8.3)"
+        );
+        assert_ne!(
+            error.leader.as_deref(),
+            Some(STALE_METADATA_LEADER),
+            "produce must NOT use the stale metadata leader field (Req 8.4)"
+        );
+    }
+
+    /// Requirement 8.3, 8.4: a `Consume` reaching a replica that is not the
+    /// partition's live leader is redirected to that **live** leader, again from
+    /// the driver's known-leader hint, not the stale metadata field.
+    #[tokio::test]
+    async fn consume_to_non_leader_redirects_to_the_live_leader() {
+        let driver = MockDriver::reporting(Some("node-b")).spawn();
+        let node = node_hosting("node-a", "orders", 0, Some(STALE_METADATA_LEADER), driver);
+        let service = VelaClientService::new(node);
+
+        let status = service
+            .consume(consume_request("orders", 0))
+            .await
+            .expect_err("a non-leader consume is redirected");
+        let error =
+            convert::vela_error_from_status(&status).expect("status carries a typed VelaError");
+
+        assert_eq!(error.code, v1::ErrorCode::NotLeader as i32);
+        assert_eq!(
+            error.leader.as_deref(),
+            Some("node-b"),
+            "consume must redirect to the live Raft-elected leader (Req 8.3)"
+        );
+        assert_ne!(
+            error.leader.as_deref(),
+            Some(STALE_METADATA_LEADER),
+            "consume must NOT use the stale metadata leader field (Req 8.4)"
+        );
+    }
+
+    /// Requirement 8.2 (and 7.3): with no live leader elected, `Consume` is
+    /// rejected as partition-unavailable rather than served from a stale local
+    /// read, even though the metadata `leader` field names a (bogus) leader.
+    #[tokio::test]
+    async fn consume_with_no_elected_leader_is_partition_unavailable() {
+        let driver = MockDriver::reporting(None).spawn();
+        let node = node_hosting("node-a", "orders", 0, Some(STALE_METADATA_LEADER), driver);
+        let service = VelaClientService::new(node);
+
+        let status = service
+            .consume(consume_request("orders", 0))
+            .await
+            .expect_err("consume with no live leader is unavailable");
+        let error =
+            convert::vela_error_from_status(&status).expect("status carries a typed VelaError");
+
+        assert_eq!(
+            error.code,
+            v1::ErrorCode::PartitionUnavailable as i32,
+            "with no live leader, consume is unavailable, not a stale local read (Req 8.2)"
+        );
+    }
+
+    /// Requirement 8.2: when this node *is* the partition's live leader, the
+    /// consume is served locally and returns the partition's committed records.
+    #[tokio::test]
+    async fn consume_on_the_live_leader_serves_committed_records() {
+        let mut mock = MockDriver::reporting(Some("node-a"));
+        mock.consume = vec![
+            CommittedRecord {
+                offset: 0,
+                value: b"v0".to_vec(),
+            },
+            CommittedRecord {
+                offset: 1,
+                value: b"v1".to_vec(),
+            },
+        ];
+        let node = node_hosting(
+            "node-a",
+            "orders",
+            0,
+            Some(STALE_METADATA_LEADER),
+            mock.spawn(),
+        );
+        let service = VelaClientService::new(node);
+
+        let response = service
+            .consume(consume_request("orders", 0))
+            .await
+            .expect("the live leader serves the consume")
+            .into_inner();
+
+        let offsets: Vec<u64> = response.records.iter().map(|r| r.offset).collect();
+        assert_eq!(offsets, vec![0, 1]);
+        assert_eq!(response.next_offset, 2);
+    }
+
+    /// Requirement 8.2, 8.4: `FindLeader` resolves to the partition's live
+    /// Raft-elected leader reported by the driver, not the stale metadata
+    /// `leader` field (here a bogus value the answer must not echo).
+    #[tokio::test]
+    async fn find_leader_returns_the_live_elected_leader() {
+        let driver = MockDriver::reporting(Some("node-b")).spawn();
+        let node = node_hosting("node-a", "orders", 0, Some(STALE_METADATA_LEADER), driver);
+        let service = VelaClientService::new(node);
+
+        let response = service
+            .find_leader(Request::new(v1::FindLeaderRequest {
+                topic: "orders".to_string(),
+                partition: 0,
+            }))
+            .await
+            .expect("find_leader succeeds")
+            .into_inner();
+
+        assert_eq!(
+            response.leader.as_deref(),
+            Some("node-b"),
+            "FindLeader returns the live Raft-elected leader (Req 8.2)"
+        );
+        assert_ne!(
+            response.leader.as_deref(),
+            Some(STALE_METADATA_LEADER),
+            "FindLeader must NOT echo the stale metadata leader field (Req 8.4)"
+        );
+    }
+
+    /// Requirement 8.2: `FindLeader` indicates no current leader (an absent
+    /// leader on the wire) when the partition's driver knows of none, regardless
+    /// of any stale metadata `leader` value.
+    #[tokio::test]
+    async fn find_leader_indicates_no_leader_when_none_is_elected() {
+        let driver = MockDriver::reporting(None).spawn();
+        let node = node_hosting("node-a", "orders", 0, Some(STALE_METADATA_LEADER), driver);
+        let service = VelaClientService::new(node);
+
+        let response = service
+            .find_leader(Request::new(v1::FindLeaderRequest {
+                topic: "orders".to_string(),
+                partition: 0,
+            }))
+            .await
+            .expect("find_leader succeeds")
+            .into_inner();
+
+        assert_eq!(
+            response.leader, None,
+            "FindLeader indicates no current leader when none is elected (Req 8.2)"
+        );
     }
 }

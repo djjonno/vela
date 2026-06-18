@@ -150,6 +150,42 @@ async fn await_leader(client: &mut VelaClientClient<Channel>, topic: &str, parti
     panic!("partition {topic}/{partition} did not elect a leader within the bounded window");
 }
 
+/// Issue `CreateTopic`, retrying while `__meta/0` has not yet elected a leader.
+///
+/// With the inline `BootstrapClock` bootstrap removed, even a single-node
+/// metadata group elects through the normal asynchronous election path, so a
+/// `CreateTopic` proposal is rejected with a "no metadata leader available"
+/// status until that election fires (Requirement 4.2). Retrying within a
+/// bounded window waits out the randomized election timeout.
+async fn create_topic_awaiting_metadata_leader(
+    client: &mut VelaClientClient<Channel>,
+    topic: &str,
+    partitions: u32,
+    log_backend: i32,
+) {
+    let mut last_status = None;
+    for _ in 0..100 {
+        match client
+            .create_topic(v1::CreateTopicRequest {
+                name: topic.to_string(),
+                partitions,
+                log_backend,
+            })
+            .await
+        {
+            Ok(_) => return,
+            Err(status) => {
+                last_status = Some(status);
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+    }
+    panic!(
+        "metadata group did not self-elect a leader to commit CreateTopic within the bounded \
+         window (last error: {last_status:?})"
+    );
+}
+
 /// Produce `value` to `(topic, partition)`, retrying briefly to absorb the
 /// instant between a leader being reported and the produce path observing it,
 /// and return the committed offset.
@@ -247,14 +283,13 @@ fn durable_partition_resumes_produce_and_consume_after_restart() {
             spawn_server(config("node-a", addr, data.path()));
             let mut client = connect_client(addr).await;
 
-            client
-                .create_topic(v1::CreateTopicRequest {
-                    name: "orders".to_string(),
-                    partitions: 1,
-                    log_backend: v1::LogBackend::Durable as i32,
-                })
-                .await
-                .expect("create durable topic succeeds");
+            create_topic_awaiting_metadata_leader(
+                &mut client,
+                "orders",
+                1,
+                v1::LogBackend::Durable as i32,
+            )
+            .await;
 
             await_leader(&mut client, "orders", 0).await;
             for (i, value) in before.iter().enumerate() {
@@ -275,7 +310,10 @@ fn durable_partition_resumes_produce_and_consume_after_restart() {
             let mut client = connect_client(addr).await;
 
             // (14.1) Every previously committed record is returned at its
-            // original offset after recovery.
+            // original offset after recovery. Consume routes by the live
+            // Raft-elected leader, so wait for the recovered partition to
+            // re-elect before reading (Requirement 8.1).
+            await_leader(&mut client, "orders", 0).await;
             let (recovered, next) = consume_all(&mut client, "orders", 0, 0).await;
             assert_eq!(recovered.len(), before.len());
             assert_eq!(next, before.len() as u64);
