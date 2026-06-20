@@ -32,7 +32,7 @@ use std::path::Path;
 use vela_log::{DurableWal, LogError, LogStorage, PayloadKind, SyncPolicy, WalConfig};
 use vela_raft::{Clock, NodeId as RaftNodeId, RaftInput, RaftOutput, Role};
 
-use crate::fleet::{FleetError, GroupKey, RaftGroupFleet};
+use crate::fleet::{FleetError, GroupKey, PartitionReplica, RaftGroupFleet};
 use crate::model::{
     ClusterCommand, ClusterMetadata, NodeAvailability, NodeId, Partition, PartitionIndex, Topic,
     TopicState,
@@ -275,6 +275,59 @@ impl MetadataController {
         Ok(Self::from_parts(metadata, fleet))
     }
 
+    /// Build (recover) the `__meta/0` metadata Raft group over an
+    /// **injected** [`PartitionLog`] rather than opening a real-filesystem WAL,
+    /// rebuilding the committed cluster catalogue from it.
+    ///
+    /// Gated behind the non-default `sim` feature. This mirrors
+    /// [`recover_durable`](Self::recover_durable) exactly — it creates the
+    /// recovered group through [`RaftGroupFleet::create_recovered_group`]
+    /// (restoring the Raft hard state and commit index from the recovered log)
+    /// and replays every committed [`PayloadKind::Cluster`] entry into a fresh
+    /// [`ClusterMetadata`] via [`apply_command`] in ascending index order — but
+    /// takes the already-opened `log` by value instead of calling
+    /// [`DurableWal::open`] itself.
+    ///
+    /// The `vela-sim` harness uses this to drive the **production**
+    /// `__meta/0` group over a Sim_Storage-backed [`PartitionLog::Sim`]: the
+    /// harness opens the WAL over its deterministic in-memory disk and passes
+    /// the resulting log here, so recovery runs the real WAL/Raft path while the
+    /// underlying disk stays injectable and reproducible (Requirement 3.2). As
+    /// with [`recover_durable`], the byte codec is the caller's concern, so the
+    /// committed-entry decoder is injected as `decode_cluster`.
+    ///
+    /// A fresh (empty) injected log recovers an empty catalogue, identical to a
+    /// freshly created group — the path a brand-new simulated cluster takes.
+    #[cfg(feature = "sim")]
+    pub fn recover_durable_with_log(
+        node_id: RaftNodeId,
+        peers: Vec<RaftNodeId>,
+        log: PartitionLog,
+        decode_cluster: impl Fn(&[u8]) -> ClusterCommand,
+    ) -> Result<Self, MetadataRecoverError> {
+        // Create the recovered group from the injected log: this restores the
+        // Raft hard state and commit index from the recovered log, exactly as
+        // `recover_durable` does after opening the real WAL.
+        let mut fleet = RaftGroupFleet::new();
+        fleet.create_recovered_group(metadata_group_key(), node_id, peers, log)?;
+
+        // Rebuild the catalogue by re-applying every committed `Cluster`
+        // command in ascending index order (Requirement 17.4, 18.1, 18.3).
+        let mut metadata = ClusterMetadata::new();
+        let replica = fleet
+            .get(&metadata_group_key())
+            .expect("the metadata group was just created");
+        if let Some(commit) = replica.raft().commit_index() {
+            for entry in replica.raft().log().read(0, commit) {
+                if entry.payload.kind == PayloadKind::Cluster {
+                    apply_command(&mut metadata, &decode_cluster(&entry.payload.bytes));
+                }
+            }
+        }
+
+        Ok(Self::from_parts(metadata, fleet))
+    }
+
     /// Shared, read-only access to the current cluster metadata view.
     pub fn metadata(&self) -> &ClusterMetadata {
         &self.metadata
@@ -283,6 +336,24 @@ impl MetadataController {
     /// Whether the controller is hosting the dedicated metadata Raft group.
     pub fn hosts_metadata_group(&self) -> bool {
         self.fleet.contains(&metadata_group_key())
+    }
+
+    /// Shared, read-only access to the `__meta/0` group's
+    /// [`PartitionReplica`](crate::PartitionReplica), or `None` if the metadata
+    /// group is somehow absent (which never happens for a controller built
+    /// through [`MetadataController::new`] or the recovery constructors).
+    ///
+    /// The metadata group is a Raft group like any partition's, so exposing its
+    /// replica lets an out-of-band, read-only observer (the DST
+    /// `Consistency_Checker`) inspect the metadata group's log, term, role, and
+    /// committed prefix through the same [`PartitionReplica`] surface it uses
+    /// for client partitions, rather than reaching for a bespoke accessor per
+    /// field. It grants no mutation and changes no behaviour — the consensus
+    /// path drives the group exclusively through
+    /// [`step`](MetadataController::step).
+    #[must_use]
+    pub fn meta_replica(&self) -> Option<&PartitionReplica> {
+        self.fleet.get(&metadata_group_key())
     }
 
     /// Drive the dedicated `__meta/p0` Raft group one step with `input`, using
@@ -596,5 +667,105 @@ mod tests {
             controller.find_leader("orders", PartitionIndex(0)),
             Err(CoreError::PartitionUnavailable)
         );
+    }
+}
+
+#[cfg(all(test, feature = "sim"))]
+mod sim_tests {
+    //! Tests for the `sim`-gated [`MetadataController::recover_durable_with_log`]
+    //! injection path: recovering the `__meta/0` group over an injected
+    //! [`PartitionLog::Sim`] backed by the deterministic fault filesystem.
+
+    use super::*;
+    use crate::partition_log::PartitionLog;
+    use crate::SimWalClock;
+    use vela_log::sim::FaultFileSystem;
+    use vela_log::{DurableWal, EntryPayload, LogStorage, SyncPolicy, WalConfig};
+
+    use crate::model::LogBackend;
+
+    /// A minimal, test-owned codec: encodes a `CreateTopic` (tag `0`) carrying
+    /// only a length-prefixed name; the harness owns the encoding, so this is
+    /// sufficient to exercise the recovery replay path.
+    fn encode_create(name: &str) -> Vec<u8> {
+        let mut buf = vec![0u8];
+        buf.extend_from_slice(&(name.len() as u32).to_le_bytes());
+        buf.extend_from_slice(name.as_bytes());
+        buf
+    }
+
+    /// The matching decoder injected into `recover_durable_with_log`.
+    fn decode(bytes: &[u8]) -> ClusterCommand {
+        assert_eq!(bytes[0], 0, "test codec only encodes CreateTopic");
+        let len = u32::from_le_bytes(bytes[1..5].try_into().unwrap()) as usize;
+        let name = String::from_utf8(bytes[5..5 + len].to_vec()).expect("valid utf8");
+        ClusterCommand::CreateTopic {
+            name,
+            partitions: Vec::new(),
+            backend: LogBackend::Durable,
+        }
+    }
+
+    /// Open a sim WAL over `fs` at `dir` with the consensus-safe `Always` policy.
+    fn open_wal(fs: FaultFileSystem, dir: &str) -> DurableWal<FaultFileSystem, SimWalClock> {
+        DurableWal::open_with_clock(
+            WalConfig::new(dir).with_sync_policy(SyncPolicy::Always),
+            fs,
+            SimWalClock::new(),
+        )
+        .expect("open sim WAL")
+    }
+
+    #[test]
+    fn recover_with_fresh_log_yields_empty_catalogue_hosting_meta_group() {
+        // The path a brand-new simulated cluster takes: a fresh injected log
+        // recovers an empty catalogue but a fully-formed `__meta/0` group.
+        let wal = open_wal(FaultFileSystem::default(), "/sim/meta-fresh");
+        let controller = MetadataController::recover_durable_with_log(
+            RaftNodeId(0),
+            Vec::new(),
+            PartitionLog::sim(wal),
+            decode,
+        )
+        .expect("recover over fresh sim log");
+
+        assert!(controller.hosts_metadata_group());
+        assert!(controller.metadata().topics.is_empty());
+    }
+
+    #[test]
+    fn recover_rebuilds_catalogue_from_committed_cluster_entries() {
+        // Write two committed `Cluster` entries through the real WAL, drop it,
+        // then reopen over the same disk and recover: the catalogue is rebuilt
+        // by replaying the committed prefix, exactly as production recovery does.
+        let fs = FaultFileSystem::default();
+        {
+            let mut wal = open_wal(fs.clone(), "/sim/meta-replay");
+            wal.append(
+                EntryPayload::new(PayloadKind::Cluster, encode_create("orders")),
+                1,
+            )
+            .unwrap();
+            wal.append(
+                EntryPayload::new(PayloadKind::Cluster, encode_create("events")),
+                1,
+            )
+            .unwrap();
+            wal.commit(1).unwrap();
+        }
+
+        let wal = open_wal(fs, "/sim/meta-replay");
+        let controller = MetadataController::recover_durable_with_log(
+            RaftNodeId(0),
+            Vec::new(),
+            PartitionLog::sim(wal),
+            decode,
+        )
+        .expect("recover over reopened sim log");
+
+        assert!(controller.metadata().topics.contains_key("orders"));
+        assert!(controller.metadata().topics.contains_key("events"));
+        // Two committed CreateTopic commands were applied.
+        assert_eq!(controller.metadata().topics.len(), 2);
     }
 }

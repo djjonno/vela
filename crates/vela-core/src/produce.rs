@@ -503,6 +503,7 @@ mod tests {
             RaftInput::Message(RaftMessage::RequestVoteReply(RequestVoteReply {
                 term: replica.raft().current_term(),
                 vote_granted: true,
+                voter: RaftNodeId(1),
             })),
             &mut clock,
         );

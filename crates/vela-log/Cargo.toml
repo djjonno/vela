@@ -18,5 +18,13 @@ tracing.workspace = true
 # feature is the blocking std::fs backend (no async runtime pulled in).
 fs4 = { version = "0.8", default-features = false, features = ["sync"] }
 
+[features]
+# Off by default. Exposes the deterministic-simulation surface (`vela_log::sim`):
+# the WAL `FileSystem`/`WalFile` seam traits and the in-memory fault filesystem
+# (`FaultFileSystem`), plus the `DurableWal::open_with`/`open_with_clock`
+# injection constructors. With the feature off no simulation-only item is
+# exposed and the seam stays crate-private, so production builds are unchanged.
+sim = []
+
 [dev-dependencies]
 proptest.workspace = true

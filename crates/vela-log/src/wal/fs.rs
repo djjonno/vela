@@ -49,6 +49,15 @@ use std::path::{Path, PathBuf};
 
 use fs4::FileExt;
 
+// The WAL filesystem seam (`FileSystem` and its `WalFile` handle) is
+// crate-private in production. The deterministic-simulation harness, however,
+// needs to name and inject it, so it is re-exported through `vela_log::sim`
+// behind the non-default `sim` feature. To expose it there without changing
+// production privacy, the seam traits are emitted at `pub` visibility only when
+// `sim` is enabled and stay `pub(crate)` otherwise. The bodies are written once
+// and emitted at the chosen visibility; exactly one invocation compiles.
+macro_rules! wal_fs_seam {
+    ($seam_vis:vis) => {
 /// The filesystem abstraction the WAL is built on.
 ///
 /// A `FileSystem` mints [`WalFile`] handles and performs whole-directory
@@ -61,7 +70,7 @@ use fs4::FileExt;
 /// [`crate::LogError::Io`] with the in-progress operation name at the call site
 /// (Requirement 10.2). Every method that can fail does so without leaving a
 /// partially mutated filesystem where avoidable.
-pub(crate) trait FileSystem {
+$seam_vis trait FileSystem {
     /// An open file handle yielding positional reads/writes and fsync.
     type File: WalFile;
 
@@ -121,7 +130,7 @@ pub(crate) trait FileSystem {
 /// All methods take `&self`: positional access carries its own offset, so no
 /// `&mut` cursor is needed, and the disk-backed read path can read through a
 /// shared `&self` handle (see the module docs).
-pub(crate) trait WalFile {
+$seam_vis trait WalFile {
     /// Read into `buf` starting at byte `offset`, returning the number of bytes
     /// read. A short read (including `0` at end-of-file) is not an error.
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> io::Result<usize>;
@@ -168,6 +177,13 @@ pub(crate) trait WalFile {
     /// (Requirement 9.6).
     fn set_len(&self, len: u64) -> io::Result<()>;
 }
+    };
+}
+
+#[cfg(feature = "sim")]
+wal_fs_seam!(pub);
+#[cfg(not(feature = "sim"))]
+wal_fs_seam!(pub(crate));
 
 // ---------------------------------------------------------------------------
 // Production implementation over `std::fs`.
@@ -185,6 +201,14 @@ impl RealFileSystem {
 }
 
 /// A real open file handle wrapping [`std::fs::File`].
+#[cfg(feature = "sim")]
+#[derive(Debug)]
+pub struct RealFile {
+    file: std::fs::File,
+}
+
+/// A real open file handle wrapping [`std::fs::File`].
+#[cfg(not(feature = "sim"))]
 #[derive(Debug)]
 pub(crate) struct RealFile {
     file: std::fs::File,
@@ -209,6 +233,16 @@ pub(crate) struct RealFile {
 /// and unlinking it would race a concurrent opener that has already created and
 /// locked a fresh file of the same name. Dropping this guard closes the handle,
 /// which releases the advisory lock.
+#[cfg(feature = "sim")]
+#[derive(Debug)]
+pub struct RealDirLock {
+    /// The locked file handle. Held solely so that dropping the guard closes
+    /// the descriptor and releases the OS advisory lock; never read or written.
+    _file: File,
+}
+
+/// Exclusive directory lock; see the `sim`-gated sibling above for details.
+#[cfg(not(feature = "sim"))]
 #[derive(Debug)]
 pub(crate) struct RealDirLock {
     /// The locked file handle. Held solely so that dropping the guard closes
@@ -373,7 +407,7 @@ impl FileSystem for RealFileSystem {
 // Test implementation: deterministic in-memory filesystem with fault injection.
 // ---------------------------------------------------------------------------
 
-#[cfg(test)]
+#[cfg(any(test, feature = "sim"))]
 pub(crate) mod fault {
     //! An in-memory [`FileSystem`] for deterministic crash/fault testing.
     //!
@@ -386,9 +420,15 @@ pub(crate) mod fault {
     //! and fire deterministically (by fsync call count or by path), with no
     //! reliance on timing or real process kills:
     //!
+    //! - **crash-durability boundary** — [`MemFileSystem::crash`] drops every
+    //!   file's un-fsynced tail (truncating it to the length forced to stable
+    //!   storage by its last successful fsync), modelling loss of unsynced
+    //!   writes at a Node_Crash while retaining exactly the durable bytes
+    //!   (Requirement 7.2).
     //! - **torn write** — [`MemFileSystem::tear_last_write`] /
     //!   [`MemFileSystem::truncate_file`] drop the tail of the most recent (or a
-    //!   named) file, modelling bytes that never reached disk (Requirement 6.1).
+    //!   named) file, modelling bytes that never reached disk (Requirements 6.1,
+    //!   7.3).
     //! - **fsync failure** — [`MemFileSystem::arm_fsync_failure_at`] /
     //!   [`MemFileSystem::arm_fsync_failure_for`] fail a chosen fsync
     //!   (Requirements 4.5, 10.3).
@@ -437,9 +477,27 @@ pub(crate) mod fault {
         write_fail_paths: HashSet<PathBuf>,
         /// When true, `create_dir_all` fails (uncreatable data directory).
         create_dir_fails: bool,
+        /// Per-file byte length forced to stable storage by that file's last
+        /// successful fsync (`sync_all`/`sync_data`). This is the length a
+        /// [`MemFileSystem::crash`] truncates the file back to, modelling loss
+        /// of the un-fsynced tail; a file never fsynced has no entry and so is
+        /// truncated to zero (Requirement 7.2).
+        synced_len: HashMap<PathBuf, u64>,
     }
 
     /// An in-memory [`FileSystem`]; clones share one backing store.
+    ///
+    /// `pub` under the non-default `sim` feature so it can be re-exported as
+    /// [`crate::wal::sim::FaultFileSystem`] for the simulation harness;
+    /// `pub(crate)` otherwise (test-only), leaving production privacy unchanged.
+    #[cfg(feature = "sim")]
+    #[derive(Debug, Clone, Default)]
+    pub struct MemFileSystem {
+        state: Arc<Mutex<MemState>>,
+    }
+
+    /// An in-memory [`FileSystem`]; clones share one backing store.
+    #[cfg(not(feature = "sim"))]
     #[derive(Debug, Clone, Default)]
     pub(crate) struct MemFileSystem {
         state: Arc<Mutex<MemState>>,
@@ -469,55 +527,7 @@ pub(crate) mod fault {
             self.lock().files.get(path).cloned()
         }
 
-        // --- fault injection -----------------------------------------------
-
-        /// Truncate `path` to `new_len` bytes, dropping any tail beyond it.
-        ///
-        /// Models a torn write where trailing bytes never reached disk.
-        pub(crate) fn truncate_file(&self, path: &Path, new_len: u64) {
-            let mut state = self.lock();
-            if let Some(bytes) = state.files.get_mut(path) {
-                bytes.truncate(new_len as usize);
-            }
-        }
-
-        /// Drop the final `bytes_dropped` bytes of the most recent write,
-        /// modelling a torn last write (Requirement 6.1).
-        pub(crate) fn tear_last_write(&self, bytes_dropped: u64) {
-            let last = self.lock().last_write.clone();
-            if let Some(last) = last {
-                let new_len = last.end_after.saturating_sub(bytes_dropped);
-                self.truncate_file(&last.path, new_len);
-            }
-        }
-
-        /// Fail the fsync whose 1-based call number equals `nth` (counting
-        /// `sync_all`, `sync_data`, and `sync_dir`).
-        pub(crate) fn arm_fsync_failure_at(&self, nth: u64) {
-            self.lock().fsync_fail_at = Some(nth);
-        }
-
-        /// Fail the next fsync call, whatever its number.
-        pub(crate) fn arm_next_fsync_failure(&self) {
-            let mut state = self.lock();
-            let next = state.fsync_count + 1;
-            state.fsync_fail_at = Some(next);
-        }
-
-        /// Fail every fsync that targets `path`.
-        pub(crate) fn arm_fsync_failure_for(&self, path: &Path) {
-            self.lock().fsync_fail_paths.insert(path.to_path_buf());
-        }
-
-        /// Fail every read of `path` (read-path fault for the fail-stop test).
-        pub(crate) fn arm_read_failure_for(&self, path: &Path) {
-            self.lock().read_fail_paths.insert(path.to_path_buf());
-        }
-
-        /// Fail every write to `path`.
-        pub(crate) fn arm_write_failure_for(&self, path: &Path) {
-            self.lock().write_fail_paths.insert(path.to_path_buf());
-        }
+        // --- open-time fault injection (crate-internal) --------------------
 
         /// Make [`create_dir_all`](FileSystem::create_dir_all) fail, modelling
         /// an uncreatable data directory.
@@ -533,7 +543,108 @@ pub(crate) mod fault {
         }
     }
 
+    // The crash-durability boundary (`crash`) and the storage-fault arming
+    // methods (torn-tail and I/O errors) are part of the simulation harness's
+    // public surface: emitted at `pub` visibility when the non-default `sim`
+    // feature is on (so `vela_log::sim::FaultFileSystem` can drive them) and
+    // `pub(crate)` otherwise, leaving production privacy unchanged. The bodies
+    // are written once; exactly one invocation compiles.
+    macro_rules! mem_fault_methods {
+        ($vis:vis) => {
+            impl MemFileSystem {
+                /// Truncate `path` to `new_len` bytes, dropping any tail beyond
+                /// it.
+                ///
+                /// Models a torn write where trailing bytes never reached disk.
+                $vis fn truncate_file(&self, path: &Path, new_len: u64) {
+                    let mut state = self.lock();
+                    if let Some(bytes) = state.files.get_mut(path) {
+                        bytes.truncate(new_len as usize);
+                    }
+                }
+
+                /// Drop the final `bytes_dropped` bytes of the most recent
+                /// write, modelling a torn last write (Requirement 6.1, 7.3).
+                $vis fn tear_last_write(&self, bytes_dropped: u64) {
+                    let last = self.lock().last_write.clone();
+                    if let Some(last) = last {
+                        let new_len = last.end_after.saturating_sub(bytes_dropped);
+                        self.truncate_file(&last.path, new_len);
+                    }
+                }
+
+                /// Model a Node_Crash: for every file, drop the un-fsynced tail
+                /// by truncating it to the length forced to stable storage by
+                /// that file's last successful fsync, retaining exactly the
+                /// bytes that were made durable (Requirement 7.2). A file that
+                /// was never fsynced is truncated to zero. Bytes only shrink —
+                /// the durable extent can never exceed the file's current
+                /// length — so this can lose unsynced writes but never fabricate
+                /// data. The volatile last-write marker is cleared so a torn-tail
+                /// fault cannot reference a write that did not survive the crash.
+                $vis fn crash(&self) {
+                    let mut state = self.lock();
+                    let paths: Vec<PathBuf> = state.files.keys().cloned().collect();
+                    for path in paths {
+                        let durable = state.synced_len.get(&path).copied().unwrap_or(0);
+                        if let Some(bytes) = state.files.get_mut(&path) {
+                            if bytes.len() as u64 > durable {
+                                bytes.truncate(durable as usize);
+                            }
+                        }
+                    }
+                    state.last_write = None;
+                }
+
+                /// Fail the fsync whose 1-based call number equals `nth`
+                /// (counting `sync_all`, `sync_data`, and `sync_dir`).
+                $vis fn arm_fsync_failure_at(&self, nth: u64) {
+                    self.lock().fsync_fail_at = Some(nth);
+                }
+
+                /// Fail the next fsync call, whatever its number.
+                $vis fn arm_next_fsync_failure(&self) {
+                    let mut state = self.lock();
+                    let next = state.fsync_count + 1;
+                    state.fsync_fail_at = Some(next);
+                }
+
+                /// Fail every fsync that targets `path`.
+                $vis fn arm_fsync_failure_for(&self, path: &Path) {
+                    self.lock().fsync_fail_paths.insert(path.to_path_buf());
+                }
+
+                /// Fail every read of `path` (read-path I/O error for the
+                /// fail-stop path; Requirement 7.4).
+                $vis fn arm_read_failure_for(&self, path: &Path) {
+                    self.lock().read_fail_paths.insert(path.to_path_buf());
+                }
+
+                /// Fail every write to `path` (Requirement 7.4).
+                $vis fn arm_write_failure_for(&self, path: &Path) {
+                    self.lock().write_fail_paths.insert(path.to_path_buf());
+                }
+            }
+        };
+    }
+
+    #[cfg(feature = "sim")]
+    mem_fault_methods!(pub);
+    #[cfg(not(feature = "sim"))]
+    mem_fault_methods!(pub(crate));
+
     /// An in-memory file handle sharing its filesystem's backing store.
+    #[cfg(feature = "sim")]
+    #[derive(Debug, Clone)]
+    pub struct MemFile {
+        /// Shared backing store.
+        state: Arc<Mutex<MemState>>,
+        /// Path this handle refers to.
+        path: PathBuf,
+    }
+
+    /// An in-memory file handle sharing its filesystem's backing store.
+    #[cfg(not(feature = "sim"))]
     #[derive(Debug, Clone)]
     pub(crate) struct MemFile {
         /// Shared backing store.
@@ -631,6 +742,14 @@ pub(crate) mod fault {
                 // One-shot: disarm so a retry could succeed.
                 self.fsync_fail_at = None;
                 return Err(io::Error::other("injected fsync failure (nth)"));
+            }
+            // The fsync succeeded: record the file's current length as the
+            // durable extent so a later `crash()` truncates it back to exactly
+            // the bytes forced to stable storage (Requirement 7.2). A `sync_dir`
+            // targets a directory, which has no `files` entry, so this is a
+            // no-op for directory fsyncs.
+            if let Some(len) = self.files.get(path).map(|b| b.len() as u64) {
+                self.synced_len.insert(path.to_path_buf(), len);
             }
             Ok(())
         }
@@ -752,6 +871,15 @@ pub(crate) mod fault {
     }
 
     /// RAII guard releasing a [`MemFileSystem`] directory lock on drop.
+    #[cfg(feature = "sim")]
+    #[derive(Debug)]
+    pub struct MemDirLock {
+        state: Arc<Mutex<MemState>>,
+        path: PathBuf,
+    }
+
+    /// RAII guard releasing a [`MemFileSystem`] directory lock on drop.
+    #[cfg(not(feature = "sim"))]
     #[derive(Debug)]
     pub(crate) struct MemDirLock {
         state: Arc<Mutex<MemState>>,
@@ -1114,5 +1242,169 @@ mod tests {
             file.read_at(0, &mut buf).is_err(),
             "armed read failure should surface as an I/O error",
         );
+    }
+
+    #[test]
+    fn mem_arm_write_failure_for_path_fails_writes() {
+        let fs = MemFileSystem::new();
+        let dir = PathBuf::from("/wal");
+        fs.create_dir_all(&dir).expect("mkdir");
+        let path = dir.join("seg.wal");
+        let file = fs.open_read_write(&path).expect("open");
+
+        fs.arm_write_failure_for(&path);
+        // An armed write failure surfaces through the result type rather than
+        // panicking or silently succeeding (Requirement 7.4).
+        assert!(
+            file.write_at(0, b"payload").is_err(),
+            "armed write failure should surface as an I/O error",
+        );
+        // The failed write left no bytes behind (no silent partial success).
+        assert_eq!(fs.file_size(&path), Some(0));
+    }
+
+    // --- MemFileSystem: crash durability boundary --------------------------
+
+    #[test]
+    fn mem_crash_retains_fsynced_bytes_and_drops_unsynced_tail() {
+        // The crash-durability boundary (Requirement 7.2): a crash keeps exactly
+        // the bytes forced to stable storage and discards the un-fsynced tail.
+        let fs = MemFileSystem::new();
+        let dir = PathBuf::from("/wal");
+        fs.create_dir_all(&dir).expect("mkdir");
+        let path = dir.join("seg.wal");
+
+        let file = fs.open_read_write(&path).expect("open");
+        file.write_at(0, &[1, 2, 3, 4]).expect("durable write");
+        file.sync_all()
+            .expect("fsync forces 4 bytes to stable storage");
+        // Append a tail that is never fsynced.
+        file.write_at(4, &[5, 6, 7, 8])
+            .expect("unsynced tail write");
+        assert_eq!(
+            fs.file_size(&path),
+            Some(8),
+            "all 8 bytes present pre-crash"
+        );
+
+        fs.crash();
+
+        // Only the fsynced prefix survives; the un-fsynced tail is gone.
+        assert_eq!(fs.file_size(&path), Some(4));
+        assert_eq!(fs.file_bytes(&path), Some(vec![1, 2, 3, 4]));
+    }
+
+    #[test]
+    fn mem_crash_truncates_never_fsynced_file_to_zero() {
+        // A file that was never fsynced has no durable extent, so a crash drops
+        // all of its bytes while leaving the (now empty) file in place.
+        let fs = MemFileSystem::new();
+        let dir = PathBuf::from("/wal");
+        fs.create_dir_all(&dir).expect("mkdir");
+        let path = dir.join("seg.wal");
+
+        let file = fs.open_read_write(&path).expect("open");
+        file.write_at(0, &[9, 9, 9, 9, 9]).expect("write, no fsync");
+        assert_eq!(fs.file_size(&path), Some(5));
+
+        fs.crash();
+
+        assert_eq!(fs.file_bytes(&path), Some(Vec::new()));
+    }
+
+    #[test]
+    fn mem_crash_retains_all_bytes_when_everything_was_fsynced() {
+        // When the last fsync forced the file's full length to stable storage,
+        // a crash retains every byte unchanged.
+        let fs = MemFileSystem::new();
+        let dir = PathBuf::from("/wal");
+        fs.create_dir_all(&dir).expect("mkdir");
+        let path = dir.join("seg.wal");
+
+        let file = fs.open_read_write(&path).expect("open");
+        file.write_at(0, &[1, 2, 3, 4, 5, 6]).expect("write");
+        file.sync_data().expect("fsync forces all 6 bytes");
+
+        fs.crash();
+
+        assert_eq!(fs.file_size(&path), Some(6));
+        assert_eq!(fs.file_bytes(&path), Some(vec![1, 2, 3, 4, 5, 6]));
+    }
+
+    #[test]
+    fn mem_crash_durable_extent_advances_with_each_fsync() {
+        // Each successful fsync advances the durable extent to the file's
+        // current length, so a later crash keeps the most recently synced
+        // prefix — not the first one.
+        let fs = MemFileSystem::new();
+        let dir = PathBuf::from("/wal");
+        fs.create_dir_all(&dir).expect("mkdir");
+        let path = dir.join("seg.wal");
+
+        let file = fs.open_read_write(&path).expect("open");
+        file.write_at(0, &[1, 2, 3, 4]).expect("first write");
+        file.sync_all().expect("fsync at 4 bytes");
+        file.write_at(4, &[5, 6, 7, 8]).expect("second write");
+        file.sync_all().expect("fsync at 8 bytes");
+        // A third, never-fsynced append.
+        file.write_at(8, &[9, 10]).expect("unsynced tail");
+
+        fs.crash();
+
+        // The durable extent moved to 8 with the second fsync; only the final
+        // un-fsynced 2 bytes are lost.
+        assert_eq!(fs.file_size(&path), Some(8));
+        assert_eq!(fs.file_bytes(&path), Some(vec![1, 2, 3, 4, 5, 6, 7, 8]));
+    }
+
+    #[test]
+    fn mem_crash_applies_per_file_durable_extents() {
+        // The boundary is tracked per file: each file is truncated to its own
+        // last-fsynced length independently.
+        let fs = MemFileSystem::new();
+        let dir = PathBuf::from("/wal");
+        fs.create_dir_all(&dir).expect("mkdir");
+        let synced = dir.join("synced.wal");
+        let dirty = dir.join("dirty.wal");
+
+        let synced_file = fs.open_read_write(&synced).expect("open synced");
+        synced_file.write_at(0, &[1, 2, 3, 4, 5, 6]).expect("write");
+        synced_file.sync_all().expect("fsync 6 bytes");
+        synced_file.write_at(6, &[7, 8]).expect("unsynced tail");
+
+        let dirty_file = fs.open_read_write(&dirty).expect("open dirty");
+        dirty_file
+            .write_at(0, &[42, 42, 42])
+            .expect("write, never fsync");
+
+        fs.crash();
+
+        // The fsynced file keeps its durable 6-byte prefix.
+        assert_eq!(fs.file_bytes(&synced), Some(vec![1, 2, 3, 4, 5, 6]));
+        // The never-fsynced file is emptied.
+        assert_eq!(fs.file_bytes(&dirty), Some(Vec::new()));
+    }
+
+    #[test]
+    fn mem_crash_clears_last_write_marker() {
+        // A crash clears the volatile last-write marker, so a torn-tail fault
+        // armed afterwards cannot reference a write that did not survive.
+        let fs = MemFileSystem::new();
+        let dir = PathBuf::from("/wal");
+        fs.create_dir_all(&dir).expect("mkdir");
+        let path = dir.join("seg.wal");
+
+        let file = fs.open_read_write(&path).expect("open");
+        file.write_at(0, &[1, 2, 3, 4]).expect("durable write");
+        file.sync_all().expect("fsync");
+        file.write_at(4, &[5, 6, 7, 8]).expect("unsynced tail");
+
+        fs.crash();
+        assert_eq!(fs.file_bytes(&path), Some(vec![1, 2, 3, 4]));
+
+        // With the marker cleared, tearing the last write is a no-op rather than
+        // truncating the surviving durable prefix.
+        fs.tear_last_write(2);
+        assert_eq!(fs.file_bytes(&path), Some(vec![1, 2, 3, 4]));
     }
 }

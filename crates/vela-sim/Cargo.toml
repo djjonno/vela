@@ -1,0 +1,36 @@
+[package]
+name = "vela-sim"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# Deterministic Simulation Testing harness. Dependency edges point inward only:
+# vela-sim -> vela-core -> vela-raft -> vela-log. It MUST NOT depend on
+# vela-server (tokio / tonic / wall-clock machinery is exactly what DST replaces).
+[dependencies]
+vela-core.workspace = true
+vela-raft.workspace = true
+# The harness drives the real WAL through vela-log's `sim` surface (the WAL
+# FileSystem seam + fault filesystem), enabled via this crate's `sim` feature
+# below. The feature is gated rather than always-on so the workspace keeps
+# building while vela-log's `sim` feature is still being introduced, and so the
+# DST suite is run explicitly with `cargo test -p vela-sim --features sim`.
+vela-log.workspace = true
+thiserror.workspace = true
+# `proptest` is an *optional* dependency enabled only by the `sim` feature, so
+# the reusable generators in `src/strategy.rs` (the `Strategy` helpers the DST
+# property tests share) can live in the library rather than being copy-pasted
+# into every integration test. With the feature off `proptest` is not built and
+# `vela-sim` stays an empty crate, so `cargo build --workspace` (no features)
+# pulls in nothing. The DST suite is run with `cargo test -p vela-sim
+# --features sim`, which enables it for the test targets too.
+proptest = { workspace = true, optional = true }
+
+[features]
+# Enables the vela-log simulation surface used by the harness, and vela-core's
+# matching `sim` surface (the `PartitionLog::Sim` backend + `MetadataController`
+# injection path the cluster drives the production `__meta/0` group over). It
+# also pulls in `proptest` so the shared `strategy` module compiles.
+sim = ["vela-log/sim", "vela-core/sim", "dep:proptest"]

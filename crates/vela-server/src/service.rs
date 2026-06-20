@@ -455,9 +455,9 @@ impl VelaPeer for VelaPeerService {
             .dispatch_rpc(&req.topic, req.partition, message)
             .await?
         {
-            RaftMessage::RequestVoteReply(reply) => {
-                Ok(Response::new(convert::request_vote_reply_to_proto(&reply)))
-            }
+            RaftMessage::RequestVoteReply(reply) => Ok(Response::new(
+                convert::request_vote_reply_to_proto(&reply, &self.node.self_id),
+            )),
             _ => Err(Status::internal("unexpected reply to RequestVote")),
         }
     }

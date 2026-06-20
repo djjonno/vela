@@ -810,6 +810,7 @@ mod tests {
             RaftMessage::RequestVoteReply(crate::RequestVoteReply {
                 term: 1,
                 vote_granted: true,
+                voter: NodeId(0),
             }),
         );
         assert_eq!(sim.in_flight(), 0);
@@ -824,6 +825,7 @@ mod tests {
         let vote = RaftMessage::RequestVoteReply(crate::RequestVoteReply {
             term: 1,
             vote_granted: false,
+            voter: NodeId(0),
         });
         sim.send(NodeId(0), NodeId(1), vote.clone());
         sim.send(NodeId(1), NodeId(0), vote.clone());

@@ -10,6 +10,7 @@ pub mod metadata;
 pub mod model;
 pub mod partition_log;
 pub mod produce;
+pub mod reconcile;
 pub mod router;
 pub mod topic;
 
@@ -25,8 +26,11 @@ pub use model::{
     ClusterCommand, ClusterMetadata, LogBackend, Member, NodeAvailability, NodeId, Offset,
     Partition, PartitionIndex, Record, Topic, TopicState,
 };
+#[cfg(feature = "sim")]
+pub use partition_log::SimWalClock;
 pub use partition_log::{PartitionLog, PartitionLogKind};
 pub use produce::{produce, ProduceOutcome, COMMIT_TIMEOUT_MS, MAX_RECORD_BYTES};
+pub use reconcile::{plan_reconcile, ReconcilePlan};
 pub use router::PartitionRouter;
 pub use topic::CoreError;
 

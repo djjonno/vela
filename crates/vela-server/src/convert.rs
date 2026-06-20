@@ -158,19 +158,28 @@ pub fn request_vote_from_proto(req: &v1::RequestVoteRequest) -> RequestVote {
     }
 }
 
-/// Convert a consensus [`RequestVoteReply`] into its wire form.
-pub fn request_vote_reply_to_proto(reply: &RequestVoteReply) -> v1::RequestVoteReply {
+/// Convert a consensus [`RequestVoteReply`] into its wire form. `self_id` is the
+/// responder's string identity, encoded as the wire `voter` so the candidate
+/// can tally votes by distinct voter (the numeric [`RaftNodeId`] is a one-way
+/// hash, so the string id is carried explicitly, mirroring `candidate_id`).
+pub fn request_vote_reply_to_proto(
+    reply: &RequestVoteReply,
+    self_id: &str,
+) -> v1::RequestVoteReply {
     v1::RequestVoteReply {
         term: reply.term,
         vote_granted: reply.vote_granted,
+        voter: self_id.to_string(),
     }
 }
 
-/// Convert a wire [`v1::RequestVoteReply`] into a consensus [`RequestVoteReply`].
+/// Convert a wire [`v1::RequestVoteReply`] into a consensus [`RequestVoteReply`],
+/// mapping the string `voter` to its numeric [`RaftNodeId`].
 pub fn request_vote_reply_from_proto(reply: &v1::RequestVoteReply) -> RequestVoteReply {
     RequestVoteReply {
         term: reply.term,
         vote_granted: reply.vote_granted,
+        voter: raft_node_id(&reply.voter),
     }
 }
 
@@ -770,8 +779,9 @@ mod tests {
         let reply = RequestVoteReply {
             term: 6,
             vote_granted: true,
+            voter: raft_node_id("node-a"),
         };
-        let back = request_vote_reply_from_proto(&request_vote_reply_to_proto(&reply));
+        let back = request_vote_reply_from_proto(&request_vote_reply_to_proto(&reply, "node-a"));
         assert_eq!(back, reply);
     }
 

@@ -60,7 +60,8 @@ crates/
 ├── vela-core/     # topics, partitions, routing, per-partition raft groups
 ├── vela-server/   # node daemon (`velad`): wires raft groups to gRPC services
 ├── vela-client/   # client library: producer, consumer, admin
-└── vela-ctl/      # CLI control tool
+├── vela-ctl/      # CLI control tool
+└── vela-sim/      # deterministic simulation testing harness (in-process multi-node cluster)
 ```
 
 > Status: early-stage. Source is being built out; the layout above is the target.
@@ -108,6 +109,46 @@ cargo fmt                    # format
 cargo clippy -- -D warnings  # lint
 cargo mutants                # mutation testing
 ```
+
+### Deterministic Simulation Testing
+
+`vela-sim` is a Deterministic Simulation Testing (DST) harness. It composes the
+real `vela-core` / `vela-raft` / `vela-log` types into a single-threaded,
+discrete-event `SimRuntime` — the production code runs against simulated clock,
+network, and storage seams, so an entire multi-node cluster (elections,
+replication, crashes, network faults) executes in one deterministic process with
+no wall clock, real sockets, or OS scheduler involved. From one 64-bit seed the
+harness derives every random decision and then asserts the correctness properties
+(Raft safety, Kafka-style produce/consume parity, recovery, liveness).
+
+The harness is gated behind `vela-sim`'s non-default `sim` feature, so a normal
+`cargo build` / `cargo test` is unaffected — with the feature off, `vela-sim`
+compiles as an empty crate.
+
+```bash
+# Run the full DST property suite (requires the `sim` feature)
+cargo test -p vela-sim --features sim
+
+# Run a single property by test-file name, e.g. the recovery round-trip
+cargo test -p vela-sim --features sim --test prop_recovery
+
+# Lint the harness (including its sim-only modules and tests)
+cargo clippy -p vela-sim --features sim --all-targets -- -D warnings
+```
+
+Runs are **deterministic and reproducible**: the same seed and scenario
+parameters always replay the identical schedule. When a property test fails,
+proptest prints the failing seed/input and persists it under
+`crates/vela-sim/proptest-regressions/` so the exact case is re-run on the next
+invocation.
+
+```bash
+# Increase the number of generated cases per property (proptest knob)
+PROPTEST_CASES=1000 cargo test -p vela-sim --features sim
+```
+
+Each run is bounded by an event budget (`DEFAULT_MAX_EVENTS`, 200,000) and a
+virtual-time budget so a simulation always terminates.
 
 ## Roadmap
 

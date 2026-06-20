@@ -17,6 +17,14 @@ mod wal;
 
 pub use wal::{DurableWal, RealClock, RealFileSystem, SyncPolicy, WalConfig};
 
+/// Deterministic-simulation surface, gated behind the non-default `sim` feature
+/// (off by default). Exposes the WAL `FileSystem`/`WalFile` seam, the in-memory
+/// `FaultFileSystem`, and the `Clock` seam so the simulation harness can inject
+/// them via [`DurableWal::open_with`]/[`DurableWal::open_with_clock`]. Absent
+/// from production builds.
+#[cfg(feature = "sim")]
+pub use wal::sim;
+
 /// The kind of payload carried by a [`LogEntry`].
 ///
 /// `vela-log` stays free of domain types: a payload is opaque bytes plus this

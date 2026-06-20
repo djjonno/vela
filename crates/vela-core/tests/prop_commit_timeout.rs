@@ -116,11 +116,14 @@ fn fleet_with_stuck_leader(topic: &str, total_nodes: u64, clock: &mut TestClock)
     // so deliver `majority - 1` granted replies to cross the threshold.
     let majority = total_nodes / 2 + 1;
     let term = replica.raft().current_term();
-    for _ in 0..(majority - 1) {
+    for i in 0..(majority - 1) {
         replica.step(
             RaftInput::Message(RaftMessage::RequestVoteReply(RequestVoteReply {
                 term,
                 vote_granted: true,
+                // Each granted reply must come from a *distinct* peer, since the
+                // candidate now tallies votes by voter identity.
+                voter: RaftNodeId(i + 1),
             })),
             clock,
         );

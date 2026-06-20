@@ -62,6 +62,21 @@ pub use clock::RealClock;
 pub use config::{SyncPolicy, WalConfig};
 pub use fs::RealFileSystem;
 
+/// Simulation-only surface, gated behind the non-default `sim` feature.
+///
+/// Re-exports the WAL filesystem seam ([`FileSystem`]/[`WalFile`]), the
+/// in-memory fault filesystem (as `FaultFileSystem`), and the [`Clock`] seam so
+/// the deterministic simulation harness (`vela-sim`) can inject a fault
+/// filesystem and a logical-time clock through
+/// [`DurableWal::open_with`]/[`DurableWal::open_with_clock`]. The module is
+/// absent from production builds, where the seams stay crate-private.
+#[cfg(feature = "sim")]
+pub mod sim {
+    pub use super::clock::Clock;
+    pub use super::fs::fault::MemFileSystem as FaultFileSystem;
+    pub use super::fs::{FileSystem, WalFile};
+}
+
 use std::cell::Cell;
 use std::io;
 
@@ -186,6 +201,25 @@ impl<F: FileSystem> DurableWal<F, RealClock> {
 }
 
 impl<F: FileSystem, C: Clock> DurableWal<F, C> {
+    /// Open a durable log against an injected [`FileSystem`] and [`Clock`].
+    ///
+    /// Public under the non-default `sim` feature so the deterministic
+    /// simulation harness can construct a [`DurableWal`] over an injected fault
+    /// filesystem; crate-private otherwise so production keeps the injection
+    /// constructor internal. Both arms delegate to
+    /// [`open_with_clock_inner`](Self::open_with_clock_inner).
+    #[cfg(feature = "sim")]
+    pub fn open_with_clock(cfg: WalConfig, fs: F, clock: C) -> Result<Self, LogError> {
+        Self::open_with_clock_inner(cfg, fs, clock)
+    }
+
+    /// Crate-private injection constructor for production builds; see the
+    /// `sim`-gated sibling above.
+    #[cfg(not(feature = "sim"))]
+    pub(crate) fn open_with_clock(cfg: WalConfig, fs: F, clock: C) -> Result<Self, LogError> {
+        Self::open_with_clock_inner(cfg, fs, clock)
+    }
+
     /// Open a durable log against an explicit [`FileSystem`] **and** [`Clock`].
     ///
     /// This is the full constructor the other entry points delegate to; it lets
@@ -195,7 +229,7 @@ impl<F: FileSystem, C: Clock> DurableWal<F, C> {
     /// [`open_with`](DurableWal::open_with): it validates the configuration,
     /// creates and locks the data directory, and reconstructs in-memory state
     /// from the manifest and any existing segments.
-    pub(crate) fn open_with_clock(cfg: WalConfig, fs: F, clock: C) -> Result<Self, LogError> {
+    fn open_with_clock_inner(cfg: WalConfig, fs: F, clock: C) -> Result<Self, LogError> {
         // Validate, create the data directory, and take the exclusive lock.
         let dir_lock = cfg.prepare(&fs)?;
 

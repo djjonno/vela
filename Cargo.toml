@@ -8,6 +8,7 @@ members = [
     "crates/vela-server",
     "crates/vela-client",
     "crates/vela-ctl",
+    "crates/vela-sim",
 ]
 
 [workspace.package]

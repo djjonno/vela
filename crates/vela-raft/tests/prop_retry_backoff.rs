@@ -77,6 +77,7 @@ fn make_leader(log_len: u64) -> RaftNode<InMemoryLog> {
         RaftInput::Message(RaftMessage::RequestVoteReply(RequestVoteReply {
             term,
             vote_granted: true,
+            voter: VOTER,
         })),
         &mut clock,
     );

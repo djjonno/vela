@@ -32,17 +32,33 @@
 
 use std::time::Instant;
 
+// The WAL clock seam is crate-private in production, but the
+// deterministic-simulation harness needs to name and implement it (so it can
+// inject a logical-time clock through `DurableWal::open_with_clock`). To expose
+// it there without changing production privacy, the trait is emitted at `pub`
+// visibility only when the non-default `sim` feature is on and stays
+// `pub(crate)` otherwise. This mirrors the `wal_fs_seam!` macro in `fs.rs`; the
+// body is written once and exactly one invocation compiles.
+macro_rules! wal_clock_seam {
+    ($seam_vis:vis) => {
 /// A monotonic millisecond clock the WAL reads to pace `Periodic` forces.
 ///
 /// Implementations need only provide a non-decreasing reading whose
 /// *differences* measure elapsed wall-clock time; the absolute value and epoch
 /// are unspecified. The trait is object-safe-irrelevant here — `DurableWal`
 /// carries the concrete clock as a type parameter, with no dynamic dispatch.
-pub(crate) trait Clock {
+$seam_vis trait Clock {
     /// The current monotonic time, in milliseconds. Only differences between
     /// two readings are meaningful.
     fn now_millis(&self) -> u64;
 }
+    };
+}
+
+#[cfg(feature = "sim")]
+wal_clock_seam!(pub);
+#[cfg(not(feature = "sim"))]
+wal_clock_seam!(pub(crate));
 
 /// The production [`Clock`], backed by a monotonic [`std::time::Instant`].
 ///

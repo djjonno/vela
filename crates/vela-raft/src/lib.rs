@@ -11,7 +11,7 @@
 //! election and replication behaviour is implemented in later tasks; here
 //! [`RaftNode::step`] is a no-op that returns an empty [`RaftOutput`].
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 pub mod sim;
@@ -124,6 +124,11 @@ pub struct RequestVoteReply {
     pub term: u64,
     /// Whether the vote was granted in `term`.
     pub vote_granted: bool,
+    /// The identity of the responding voter. The candidate tallies votes by
+    /// *distinct* voter so a duplicated reply (a legitimate network fault) is
+    /// counted at most once, preserving "at most one leader per term"
+    /// (Raft §5.2).
+    pub voter: NodeId,
 }
 
 /// An `AppendEntries` RPC: a leader replicates entries (or, when `entries` is
@@ -263,10 +268,14 @@ pub struct RaftNode<S: LogStorage> {
     /// Highest log index applied to the state machine.
     last_applied: CommitIndex,
 
-    /// Number of votes gathered in the current term while a candidate,
-    /// counting this node's own self-vote. Reset at the start of each election
-    /// and consulted to decide when a majority is reached (Requirement 7.4).
-    votes_granted: u64,
+    /// The set of distinct voters that have granted this node a vote in the
+    /// current term while it is a candidate, including this node's own self-vote.
+    /// Reset at the start of each election and consulted to decide when a
+    /// majority is reached (Requirement 7.4). Tracking *distinct* granters (not
+    /// a bare counter) makes duplicated `RequestVoteReply` messages idempotent,
+    /// so a duplicated grant cannot push a candidate past `majority()` without
+    /// genuine distinct-voter support (Raft §5.2).
+    votes_granted: HashSet<NodeId>,
     /// The leader this replica currently believes is in charge: its own id once
     /// it wins an election, the `leader_id` it last accepted from a valid
     /// `AppendEntries`, or `None` while it is a candidate or has just stepped
@@ -324,7 +333,7 @@ impl<S: LogStorage> RaftNode<S> {
             // caller; `last_applied` tracks the recovered commit index so the
             // replica does not re-surface entries it already applied (R11.1).
             last_applied: commit_index,
-            votes_granted: 0,
+            votes_granted: HashSet::new(),
             leader_id: None,
             next_index: HashMap::new(),
             match_index: HashMap::new(),
@@ -531,7 +540,7 @@ impl<S: LogStorage> RaftNode<S> {
         // (itself on winning, or another via `AppendEntries`) (Requirement 8.1).
         self.leader_id = None;
         self.voted_for = Some(self.id);
-        self.votes_granted = 1; // self-vote
+        self.votes_granted = HashSet::from([self.id]); // self-vote
         self.arm_election_timer(clock);
 
         let request = RequestVote {
@@ -552,7 +561,7 @@ impl<S: LogStorage> RaftNode<S> {
     /// Promote this candidate to leader once it has gathered a majority of
     /// votes for the current term (Requirements 7.4, 7.10).
     fn maybe_become_leader(&mut self, clock: &mut impl Clock, out: &mut RaftOutput) {
-        if self.role != Role::Candidate || self.votes_granted < self.majority() {
+        if self.role != Role::Candidate || (self.votes_granted.len() as u64) < self.majority() {
             return;
         }
 
@@ -733,7 +742,7 @@ impl<S: LogStorage> RaftNode<S> {
         self.current_term = term;
         self.role = Role::Follower;
         self.voted_for = None;
-        self.votes_granted = 0;
+        self.votes_granted = HashSet::new();
         // The leader of the new, higher term is not yet known; it is relearned
         // from the first valid `AppendEntries` of that term (Requirement 8.1).
         self.leader_id = None;
@@ -828,6 +837,7 @@ impl<S: LogStorage> RaftNode<S> {
             RaftMessage::RequestVoteReply(RequestVoteReply {
                 term: self.current_term,
                 vote_granted: grant,
+                voter: self.id,
             }),
         ));
     }
@@ -848,6 +858,13 @@ impl<S: LogStorage> RaftNode<S> {
 
     /// Count a granted vote and promote to leader on reaching a majority
     /// (Requirements 7.4, 7.10).
+    ///
+    /// Votes are tallied by *distinct* voter ([`RequestVoteReply::voter`]), so a
+    /// duplicated reply — a legitimate network fault the simulator injects — is
+    /// idempotent and cannot advance the tally twice. Without this, a single
+    /// voter's duplicated grant could push a candidate past [`Self::majority`]
+    /// without genuine majority support and elect a second leader for the term
+    /// (Raft §5.2).
     fn handle_request_vote_reply(
         &mut self,
         reply: RequestVoteReply,
@@ -855,7 +872,7 @@ impl<S: LogStorage> RaftNode<S> {
         out: &mut RaftOutput,
     ) {
         if self.role == Role::Candidate && reply.term == self.current_term && reply.vote_granted {
-            self.votes_granted += 1;
+            self.votes_granted.insert(reply.voter);
             self.maybe_become_leader(clock, out);
         }
     }
@@ -1327,6 +1344,61 @@ mod tests {
         node.step(RaftInput::Tick(TimerKind::Election), &mut clock);
         assert_eq!(node.role(), Role::Candidate);
         assert_eq!(node.leader_id(), None);
+    }
+
+    #[test]
+    fn duplicated_vote_grant_from_one_voter_does_not_advance_the_tally_twice() {
+        // A 5-node group has a majority of 3. The candidate's self-vote is one;
+        // a granted reply from NodeId(1) makes two. Re-delivering that *same*
+        // voter's grant (a legitimate network duplication) must be idempotent —
+        // the tally stays at two and the node remains a candidate. Only a grant
+        // from a *distinct* voter (NodeId(2)) reaches the majority of three and
+        // promotes the node to leader. Counting the duplicate would elect a
+        // leader without genuine majority support, allowing two leaders in one
+        // term (Raft §5.2 Election Safety).
+        let mut node = RaftNode::new(
+            NodeId(0),
+            vec![NodeId(1), NodeId(2), NodeId(3), NodeId(4)],
+            InMemoryLog::new(),
+        );
+        let mut clock = TestClock::default();
+
+        // Become a term-1 candidate with its own self-vote.
+        node.step(RaftInput::Tick(TimerKind::Election), &mut clock);
+        assert_eq!(node.role(), Role::Candidate);
+        let term = node.current_term();
+
+        let grant_from = |voter: NodeId| {
+            RaftInput::Message(RaftMessage::RequestVoteReply(RequestVoteReply {
+                term,
+                vote_granted: true,
+                voter,
+            }))
+        };
+
+        // First grant from NodeId(1): tally is now {self, node-1} = 2 < 3.
+        node.step(grant_from(NodeId(1)), &mut clock);
+        assert_eq!(
+            node.role(),
+            Role::Candidate,
+            "two distinct votes are short of the 3-of-5 majority"
+        );
+
+        // Duplicate grant from the *same* voter: must not advance the tally.
+        node.step(grant_from(NodeId(1)), &mut clock);
+        assert_eq!(
+            node.role(),
+            Role::Candidate,
+            "a duplicated grant from one voter must not push the tally to a majority"
+        );
+
+        // A grant from a distinct voter reaches the majority of three → leader.
+        node.step(grant_from(NodeId(2)), &mut clock);
+        assert_eq!(
+            node.role(),
+            Role::Leader,
+            "a third distinct vote is a genuine majority and elects the leader"
+        );
     }
 
     /// A trivial [`Clock`] for direct, single-node `step` tests: time never

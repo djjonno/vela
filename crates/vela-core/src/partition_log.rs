@@ -21,7 +21,103 @@ use vela_log::{
     Snapshot,
 };
 
+#[cfg(feature = "sim")]
+use vela_log::sim::FaultFileSystem;
+
 use crate::model::LogBackend;
+
+#[cfg(feature = "sim")]
+pub use sim_support::SimWalClock;
+
+/// Deterministic-simulation support for [`PartitionLog`], gated behind the
+/// non-default `sim` feature so production builds never see it.
+///
+/// Defines the one logical WAL [`Clock`](vela_log::sim::Clock) the harness uses
+/// for *every* simulated replica — including the `PartitionLog::Sim` backend and
+/// `vela-sim`'s own `SimBackend`, which re-exports this type so a single clock
+/// type flows through both. Reading logical time only (never the wall clock)
+/// keeps a run a pure function of its seed.
+#[cfg(feature = "sim")]
+mod sim_support {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
+
+    use vela_log::sim::Clock as WalClock;
+
+    /// The logical WAL [`Clock`](vela_log::sim::Clock) for the simulation
+    /// harness, reading logical milliseconds only — never the wall clock.
+    ///
+    /// A [`DurableWal`](vela_log::DurableWal) consults its clock solely to pace
+    /// the `Periodic` sync policy; the harness always uses
+    /// [`SyncPolicy::Always`](vela_log::SyncPolicy), under which the clock value
+    /// can never affect an Outcome. `SimWalClock` nonetheless honours the
+    /// determinism constraint structurally: it returns a reading from a shared
+    /// [`Arc<AtomicU64>`] that only the harness advances and never touches
+    /// `std::time`. A fresh clock reads `0`.
+    ///
+    /// `SimWalClock` is `Send + Sync` because the reading lives behind an
+    /// `Arc<AtomicU64>` (rather than an `Rc<Cell<_>>`). This matters beyond the
+    /// harness: `SimWalClock` is a field of `PartitionLog::Sim`, and `Send` is
+    /// an auto-trait computed over *every* enum variant, so a `!Send` clock
+    /// would make the whole [`PartitionLog`](super::PartitionLog) `!Send` under
+    /// `--all-features` and break the production `vela-server`, which stores
+    /// partition logs behind a `Sync` shared state. The harness is
+    /// single-threaded, so reading and writing with [`Ordering::Relaxed`] is
+    /// behaviourally identical to the old non-atomic cell and stays
+    /// deterministic — the atomics exist purely to make the type thread-safe.
+    ///
+    /// The reading lives behind a shared `Arc<AtomicU64>` so a clone handed to a
+    /// `DurableWal` observes the same logical time another clone is set to: a
+    /// clone shares the same `Arc`, exactly as the old `Rc<Cell>` clone shared
+    /// its cell.
+    #[derive(Debug)]
+    pub struct SimWalClock {
+        /// Shared logical time in milliseconds; only the harness advances it.
+        now: Arc<AtomicU64>,
+    }
+
+    impl Clone for SimWalClock {
+        /// Clone the handle, sharing the same underlying `Arc<AtomicU64>` so the
+        /// clone observes — and can set — the same logical time as the original.
+        fn clone(&self) -> Self {
+            Self {
+                now: Arc::clone(&self.now),
+            }
+        }
+    }
+
+    impl Default for SimWalClock {
+        /// A fresh clock reading logical `0` milliseconds.
+        fn default() -> Self {
+            Self {
+                now: Arc::new(AtomicU64::new(0)),
+            }
+        }
+    }
+
+    impl SimWalClock {
+        /// Construct a clock reading logical `0` milliseconds.
+        #[must_use]
+        pub fn new() -> Self {
+            Self::default()
+        }
+
+        /// Set the logical millisecond reading the WAL would observe.
+        ///
+        /// Only the harness calls this, when wiring the WAL clock to the
+        /// Virtual_Clock; under `SyncPolicy::Always` the value is never read for
+        /// timing, so this exists purely to keep the seam logical-time-only.
+        pub fn set_logical_millis(&self, millis: u64) {
+            self.now.store(millis, Ordering::Relaxed);
+        }
+    }
+
+    impl WalClock for SimWalClock {
+        fn now_millis(&self) -> u64 {
+            self.now.load(Ordering::Relaxed)
+        }
+    }
+}
 
 /// Which [`PartitionLog`] variant the server should construct for a partition
 /// replica, named independently of a live backend instance.
@@ -57,6 +153,19 @@ pub enum PartitionLog {
     Durable(DurableWal),
     /// The volatile in-memory backend.
     InMemory(InMemoryLog),
+    /// The deterministic-simulation backend: the real [`DurableWal`] running
+    /// over `vela-log`'s in-memory fault filesystem and the logical
+    /// [`SimWalClock`], gated behind the non-default `sim` feature.
+    ///
+    /// This is how the `vela-sim` harness drives the **production**
+    /// [`PartitionReplica`](crate::PartitionReplica) /
+    /// [`MetadataController`](crate::MetadataController) over a deterministic
+    /// disk: the WAL's framing, manifest, recovery, torn-tail classification,
+    /// and `Always` sync run unchanged, so a `RaftNode<PartitionLog>` behaves
+    /// observably like one over the real durable backend while every byte of
+    /// I/O is injectable and reproducible. Absent from production builds.
+    #[cfg(feature = "sim")]
+    Sim(DurableWal<FaultFileSystem, SimWalClock>),
 }
 
 /// Dispatch a [`LogStorage`] method to whichever backend the [`PartitionLog`]
@@ -66,6 +175,8 @@ macro_rules! dispatch {
         match $self {
             PartitionLog::Durable(backend) => backend.$method($($arg),*),
             PartitionLog::InMemory(backend) => backend.$method($($arg),*),
+            #[cfg(feature = "sim")]
+            PartitionLog::Sim(backend) => backend.$method($($arg),*),
         }
     };
 }
@@ -86,6 +197,20 @@ impl PartitionLog {
             LogBackend::Durable => PartitionLogKind::Durable,
             LogBackend::InMemory => PartitionLogKind::InMemory,
         }
+    }
+
+    /// Wrap an already-opened simulation [`DurableWal`] (over the fault
+    /// filesystem and the logical [`SimWalClock`]) as a [`PartitionLog::Sim`].
+    ///
+    /// Gated behind the non-default `sim` feature. This is the seam the
+    /// `vela-sim` harness injects through: it opens the WAL over its
+    /// deterministic in-memory disk and hands the result here, so the
+    /// production replica is built over the exact same WAL machinery as a real
+    /// durable replica while every byte of I/O stays injectable.
+    #[cfg(feature = "sim")]
+    #[must_use]
+    pub fn sim(wal: DurableWal<FaultFileSystem, SimWalClock>) -> Self {
+        PartitionLog::Sim(wal)
     }
 }
 

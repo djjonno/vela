@@ -64,3 +64,35 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Build on MSRV
         run: cargo build --workspace --locked
+
+  dst:
+    name: dst
+    runs-on: ubuntu-latest
+    env:
+      # Run more proptest cases in CI than the local default to widen seed
+      # coverage of the deterministic simulation suite.
+      PROPTEST_CASES: 256
+      # Bound each run's processed-event count; matches DEFAULT_MAX_EVENTS so a
+      # CI run is budgeted the same as a run built from defaults.
+      VELA_DST_MAX_EVENTS: 200000
+      # Tell the harness to persist run summaries / failure artifacts here so the
+      # upload-artifact step below can collect them when a run fails.
+      VELA_DST_ARTIFACT_DIR: target/dst-artifacts
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Run DST suite
+        run: cargo test -p vela-sim --features sim --locked
+      - name: Upload DST failure artifacts
+        # Runs only when a previous step (the DST suite) failed. The failed
+        # `cargo test` step still fails the job; this upload does not mask it.
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dst-artifacts
+          path: |
+            crates/vela-sim/proptest-regressions/
+            target/dst-artifacts/
+          if-no-files-found: ignore

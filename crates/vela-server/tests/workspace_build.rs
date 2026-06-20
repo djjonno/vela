@@ -4,7 +4,7 @@
 //! workspace root:
 //!
 //! * **Requirement 1.5** — `cargo build` at the workspace root compiles *all
-//!   seven* member crates to completion.
+//!   eight* member crates to completion.
 //! * **Requirement 1.6** — if any member crate fails to compile, the build
 //!   terminates with a non-zero exit status that names the failing crate.
 //!
@@ -15,7 +15,7 @@
 //! *structural contract* that makes Requirement 1.5 hold:
 //!
 //! * The set of crates `cargo build` compiles is exactly the workspace
-//!   `members` array, so we assert that array declares exactly the seven
+//!   `members` array, so we assert that array declares exactly the eight
 //!   expected crates and that each one is a real, buildable crate on disk
 //!   (a manifest with a package name + a crate root source file).
 //!
@@ -23,7 +23,7 @@
 //! guaranteed behaviour for a workspace build: when a member fails to compile,
 //! Cargo stops with a non-zero exit code and the diagnostic names the crate
 //! that failed. There is no Vela-side configuration that overrides this, so the
-//! structural guarantee here (a well-formed seven-member workspace) is what
+//! structural guarantee here (a well-formed eight-member workspace) is what
 //! Vela is responsible for; the failing-crate reporting is inherited from
 //! Cargo. This is documented and exercised structurally rather than by forcing
 //! a real compilation failure.
@@ -34,7 +34,7 @@
 use std::path::{Path, PathBuf};
 
 /// The exact set of member crates `cargo build` must compile (Requirement 1.5).
-const EXPECTED_MEMBERS: [&str; 7] = [
+const EXPECTED_MEMBERS: [&str; 8] = [
     "crates/vela-log",
     "crates/vela-raft",
     "crates/vela-proto",
@@ -42,6 +42,7 @@ const EXPECTED_MEMBERS: [&str; 7] = [
     "crates/vela-server",
     "crates/vela-client",
     "crates/vela-ctl",
+    "crates/vela-sim",
 ];
 
 /// Resolve the workspace root from this crate's manifest directory.
@@ -120,18 +121,18 @@ fn declares_package_name(manifest: &str) -> bool {
 }
 
 /// `cargo build` compiles exactly the crates in the workspace `members` array,
-/// so the array must declare exactly the seven expected crates (Requirement 1.5).
+/// so the array must declare exactly the eight expected crates (Requirement 1.5).
 #[test]
-fn workspace_build_compiles_exactly_seven_member_crates() {
+fn workspace_build_compiles_exactly_eight_member_crates() {
     let root = workspace_root();
     let manifest = read_manifest(&root.join("Cargo.toml"));
     let members = parse_workspace_members(&manifest);
 
     assert_eq!(
         members.len(),
-        7,
+        8,
         "`cargo build` at the workspace root compiles the `members` array, which \
-         must list exactly seven crates, found {}: {:?}",
+         must list exactly eight crates, found {}: {:?}",
         members.len(),
         members
     );
@@ -139,16 +140,16 @@ fn workspace_build_compiles_exactly_seven_member_crates() {
     for expected in EXPECTED_MEMBERS {
         assert!(
             members.iter().any(|m| m == expected),
-            "the seven crates `cargo build` compiles must include `{expected}`; \
+            "the eight crates `cargo build` compiles must include `{expected}`; \
              found {members:?}"
         );
     }
 }
 
-/// Each of the seven members must be a real, buildable crate on disk: a
+/// Each of the eight members must be a real, buildable crate on disk: a
 /// `Cargo.toml` declaring a package name plus a crate-root source file
 /// (`src/lib.rs` or `src/main.rs`). If any were absent or malformed, the
-/// workspace `cargo build` could not "compile all seven crates to completion"
+/// workspace `cargo build` could not "compile all eight crates to completion"
 /// (Requirement 1.5).
 #[test]
 fn every_member_crate_is_buildable_on_disk() {

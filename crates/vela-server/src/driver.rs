@@ -2066,6 +2066,7 @@ mod metadata_propose_tests {
                 RaftInput::Message(RaftMessage::RequestVoteReply(RequestVoteReply {
                     term: 1,
                     vote_granted: true,
+                    voter: raft_node_id("node-b"),
                 })),
                 &mut clock,
             );

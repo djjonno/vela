@@ -98,6 +98,7 @@ fn build_node(role: StartRole, term: u64) -> RaftNode<InMemoryLog> {
                 RaftInput::Message(RaftMessage::RequestVoteReply(RequestVoteReply {
                     term,
                     vote_granted: true,
+                    voter: NodeId(1),
                 })),
                 &mut clock,
             );
@@ -121,6 +122,7 @@ fn message_with_term(variant: u8, term: u64, flag: bool) -> RaftMessage {
         1 => RaftMessage::RequestVoteReply(RequestVoteReply {
             term,
             vote_granted: flag,
+            voter: NodeId(1),
         }),
         2 => RaftMessage::AppendEntries(AppendEntries {
             term,

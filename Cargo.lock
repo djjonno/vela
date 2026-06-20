@@ -1461,6 +1461,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "vela-sim"
+version = "0.1.0"
+dependencies = [
+ "proptest",
+ "thiserror",
+ "vela-core",
+ "vela-log",
+ "vela-raft",
+]
+
+[[package]]
 name = "wait-timeout"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

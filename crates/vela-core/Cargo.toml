@@ -15,3 +15,12 @@ tracing.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
+
+[features]
+# Deterministic-simulation surface, gated behind this non-default feature (off
+# by default). Enables `vela-log`'s `sim` seam and, in turn, exposes the
+# `PartitionLog::Sim` backend (the real `DurableWal` over the deterministic
+# fault filesystem) and the `MetadataController` injection path the `vela-sim`
+# harness drives. Production builds (feature off) are byte-for-byte unchanged:
+# every sim-only item is `#[cfg(feature = "sim")]`.
+sim = ["vela-log/sim"]
