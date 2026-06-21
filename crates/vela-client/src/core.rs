@@ -32,6 +32,7 @@ use prost::Message as _;
 use tonic::transport::Channel;
 use vela_proto::v1::vela_client_client::VelaClientClient;
 use vela_proto::v1::{self, FindLeaderRequest};
+use vela_proto::MAX_MESSAGE_BYTES;
 
 use crate::connection::{normalize_addr, ConnectionManager, NodeRegistry};
 use crate::error::{ClientError, Result};
@@ -475,8 +476,14 @@ impl ClientCore {
     }
 
     /// Build a `VelaClient` gRPC stub for an explicit node address.
+    ///
+    /// The stub's decode/encode limits are raised to [`MAX_MESSAGE_BYTES`] so a
+    /// large `Consume` response (up to the default 500-record batch, each record
+    /// up to 1 MiB) is not rejected by tonic's 4 MiB default receive limit.
     pub fn client_for(&self, addr: &str) -> Result<VelaClientClient<Channel>> {
-        Ok(VelaClientClient::new(self.connections.channel(addr)?))
+        Ok(VelaClientClient::new(self.connections.channel(addr)?)
+            .max_decoding_message_size(MAX_MESSAGE_BYTES)
+            .max_encoding_message_size(MAX_MESSAGE_BYTES))
     }
 
     /// Build a `VelaClient` stub against a bootstrap node (round-robin-free:
