@@ -26,6 +26,7 @@ use std::net::SocketAddr;
 
 use vela_proto::v1::vela_client_server::VelaClientServer;
 use vela_proto::v1::vela_peer_server::VelaPeerServer;
+use vela_proto::MAX_MESSAGE_BYTES;
 
 use crate::node::NodeShared;
 use crate::service::{VelaClientService, VelaPeerService};
@@ -97,8 +98,17 @@ pub async fn serve(config: Config) -> Result<(), ServeError> {
     let addr: SocketAddr = config.listen_addr;
     let node = NodeShared::new(&config)?;
 
-    let client = VelaClientServer::new(VelaClientService::new(node.clone()));
-    let peer = VelaPeerServer::new(VelaPeerService::new(node.clone()));
+    // Raise the gRPC decode/encode limits above tonic's 4 MiB default
+    // ([`MAX_MESSAGE_BYTES`]). The client service sends large `Consume`
+    // responses (up to the default 500-record batch), and the peer service
+    // exchanges `AppendEntries` batches that carry a slice of the partition log;
+    // either can exceed 4 MiB on a loaded cluster.
+    let client = VelaClientServer::new(VelaClientService::new(node.clone()))
+        .max_decoding_message_size(MAX_MESSAGE_BYTES)
+        .max_encoding_message_size(MAX_MESSAGE_BYTES);
+    let peer = VelaPeerServer::new(VelaPeerService::new(node.clone()))
+        .max_decoding_message_size(MAX_MESSAGE_BYTES)
+        .max_encoding_message_size(MAX_MESSAGE_BYTES);
 
     // Start the membership subsystem: connect to each configured peer, send
     // 1 s heartbeats, and track availability transitions (Requirement 9.1, 9.2,

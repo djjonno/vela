@@ -31,6 +31,7 @@ use tonic::transport::{Channel, Endpoint};
 use vela_raft::{NodeId as RaftNodeId, RaftInput, RaftMessage};
 
 use vela_proto::v1::vela_peer_client::VelaPeerClient;
+use vela_proto::MAX_MESSAGE_BYTES;
 
 use crate::convert;
 use crate::driver::{DriverCommand, DriverHandle};
@@ -77,7 +78,7 @@ impl PeerPool {
             .get(&peer)
             .cloned()
         {
-            return Some(VelaPeerClient::new(channel));
+            return Some(peer_stub(channel));
         }
 
         let addr = self
@@ -95,8 +96,18 @@ impl PeerPool {
             .lock()
             .expect("peer pool channel mutex poisoned")
             .insert(peer, channel.clone());
-        Some(VelaPeerClient::new(channel))
+        Some(peer_stub(channel))
     }
+}
+
+/// Build a [`VelaPeerClient`] with the decode/encode limits raised to
+/// [`MAX_MESSAGE_BYTES`]. `AppendEntries` replication batches a slice of the
+/// partition log and can exceed tonic's 4 MiB default, so every peer stub is
+/// constructed with the higher bound.
+fn peer_stub(channel: Channel) -> VelaPeerClient<Channel> {
+    VelaPeerClient::new(channel)
+        .max_decoding_message_size(MAX_MESSAGE_BYTES)
+        .max_encoding_message_size(MAX_MESSAGE_BYTES)
 }
 
 #[cfg(test)]
