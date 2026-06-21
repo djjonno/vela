@@ -183,6 +183,7 @@ fn register_peers(node: &Arc<NodeShared>, peers: &[Peer]) {
             metadata.members.push(Member {
                 id: id.clone(),
                 addr: peer.addr.clone(),
+                advertised_addr: peer.advertised_addr.clone(),
                 availability: NodeAvailability::Available,
             });
         }
@@ -251,6 +252,63 @@ async fn send_heartbeat(node: &NodeShared, peer: RaftNodeId) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use std::path::{Path, PathBuf};
+    use std::process;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use crate::config::Config;
+
+    /// Process-unique counter for temp data-dir names.
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    /// A uniquely-named, auto-removed data directory for a node fixture. The
+    /// guard drops after the `NodeShared` (and its metadata WAL), releasing the
+    /// directory lock before cleanup.
+    struct TempDir {
+        path: PathBuf,
+    }
+
+    impl TempDir {
+        fn new(tag: &str) -> Self {
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock should be after the unix epoch")
+                .as_nanos();
+            let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let name = format!(
+                "vela-server-membership-{tag}-{}-{unique}-{nanos}",
+                process::id()
+            );
+            Self {
+                path: std::env::temp_dir().join(name),
+            }
+        }
+
+        fn path(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
+    /// A minimal single-node [`Config`] for a membership fixture: no peers, the
+    /// advertised address defaulted to the listen address.
+    fn test_config(node_id: &str, addr: &str, data_dir: &Path) -> Config {
+        Config {
+            node_id: NodeId::new(node_id),
+            listen_addr: addr.parse().expect("valid addr"),
+            advertised_addr: addr.to_string(),
+            peers: Vec::new(),
+            replication_factor: 1,
+            data_dir: data_dir.to_path_buf(),
+        }
+    }
 
     #[test]
     fn three_consecutive_misses_mark_unavailable() {
@@ -324,5 +382,43 @@ mod tests {
             assert_eq!(state.record_success(), None);
             assert_eq!(state.availability(), NodeAvailability::Available);
         }
+    }
+
+    #[tokio::test]
+    async fn peer_member_carries_both_addrs_and_dials_bind_addr() {
+        // A peer parsed as `id@listen@advertised` is registered into the served
+        // membership with both its bind/listen address and its client-reachable
+        // advertised address, unconflated (advertised-listeners 3.2). Crucially,
+        // the server-to-server dial target is the peer's *bind* address, never
+        // its advertised address, which is client-facing metadata only (Req 4.1).
+        let tmp = TempDir::new("register-peers");
+        let node = NodeShared::new(&test_config("node-a", "127.0.0.1:7001", tmp.path()))
+            .expect("node startup succeeds");
+
+        let peer = Peer {
+            id: "node-b".to_string(),
+            addr: "10.0.0.2:7001".to_string(),
+            advertised_addr: "203.0.113.9:8001".to_string(),
+        };
+        register_peers(&node, std::slice::from_ref(&peer));
+
+        // The peer member carries both addresses, kept distinct.
+        let member = {
+            let metadata = node.metadata.lock().expect("metadata mutex poisoned");
+            metadata
+                .members
+                .iter()
+                .find(|m| m.id == NodeId::new("node-b"))
+                .cloned()
+                .expect("the peer is registered as a member")
+        };
+        assert_eq!(member.addr, "10.0.0.2:7001");
+        assert_eq!(member.advertised_addr, "203.0.113.9:8001");
+        assert_ne!(member.addr, member.advertised_addr);
+
+        // The peer pool — the server-to-server dial registry — holds the peer's
+        // bind address, never the advertised one.
+        let dialed = node.pool.peer_addr(raft_node_id(&peer.id));
+        assert_eq!(dialed.as_deref(), Some("10.0.0.2:7001"));
     }
 }

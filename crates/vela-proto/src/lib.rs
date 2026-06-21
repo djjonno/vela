@@ -17,3 +17,9 @@
 pub mod v1 {
     tonic::include_proto!("vela.v1");
 }
+
+/// The `Canonical_Partitioner`: the single shared key→partition mapping used by
+/// `vela-ctl`, the `vela-client` `Producer`, `vela-core`, and any internal
+/// repartition / `key_by` stage (Requirement 5.5). Lives here because
+/// `vela-proto` is the one crate both `vela-client` and `vela-core` depend on.
+pub mod partition;

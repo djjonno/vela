@@ -110,6 +110,7 @@ fn replay(members: &[String], commands: &[ClusterCommand]) -> ClusterMetadata {
         .map(|id| Member {
             id: NodeId::new(id.clone()),
             addr: format!("{id}:7001"),
+            advertised_addr: format!("{id}:7001"),
             availability: NodeAvailability::Unavailable,
         })
         .collect();

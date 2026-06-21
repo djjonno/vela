@@ -27,6 +27,7 @@ fn cluster(available: usize, unavailable: usize) -> ClusterMetadata {
         members.push(Member {
             id: NodeId::new(format!("avail-{i}")),
             addr: format!("avail-{i}:7001"),
+            advertised_addr: format!("avail-{i}:7001"),
             availability: NodeAvailability::Available,
         });
     }
@@ -34,6 +35,7 @@ fn cluster(available: usize, unavailable: usize) -> ClusterMetadata {
         members.push(Member {
             id: NodeId::new(format!("down-{i}")),
             addr: format!("down-{i}:7001"),
+            advertised_addr: format!("down-{i}:7001"),
             availability: NodeAvailability::Unavailable,
         });
     }

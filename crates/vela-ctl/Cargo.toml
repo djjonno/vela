@@ -6,6 +6,13 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+# The command logic lives in a library target so it is reachable from
+# integration tests in `tests/` (a binary crate's modules are not). The binary
+# below is a thin entry point over this library.
+[lib]
+name = "vela_ctl"
+path = "src/lib.rs"
+
 # Produces the `vela-ctl` binary.
 [[bin]]
 name = "vela-ctl"
@@ -20,8 +27,19 @@ tracing.workspace = true
 # CLI argument parsing (derive API) with env-var support for the endpoint flag.
 clap = { version = "4.5.23", features = ["derive", "env"] }
 # Async runtime: admin calls are async, and the 5 s connection-failure bound is a
-# `tokio::time::timeout` around each operation.
-tokio = { version = "1.43.0", features = ["rt-multi-thread", "macros", "time"] }
+# `tokio::time::timeout` around each operation. `io-std`/`io-util` back the
+# stdin `LineSource` seam and `signal` backs the Ctrl+C `Signal` seam (seams.rs).
+# `sync` backs the continuous consumer's `mpsc` record channel and `watch`
+# cancellation token across its per-partition poll tasks (consume.rs).
+tokio = { version = "1.43.0", features = [
+    "rt-multi-thread",
+    "macros",
+    "time",
+    "io-std",
+    "io-util",
+    "signal",
+    "sync",
+] }
 # Used only to classify a transport-level `Unavailable` status as a connection
 # error (Requirement 13.6); pinned to match the version vela-client/vela-proto use.
 tonic = "0.12.3"
@@ -37,6 +55,7 @@ tokio = { version = "1.43.0", features = [
     "macros",
     "time",
     "net",
+    "sync",
     "test-util",
 ] }
 # The fake server implements the `VelaClient` gRPC service from `vela-proto` and
@@ -45,3 +64,6 @@ tokio = { version = "1.43.0", features = [
 # the OS and known before the CLI connects (no readiness race).
 vela-proto.workspace = true
 tokio-stream = { version = "0.1.17", features = ["net"] }
+# Property-based tests for the Producer REPL (Properties 14–16, task 8.3) drive
+# `produce::run_repl` over scripted seams against an in-process fake gRPC server.
+proptest.workspace = true

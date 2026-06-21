@@ -87,6 +87,7 @@ fn config(node_id: &str, addr: SocketAddr) -> Config {
     Config::from_cli(CliArgs {
         node_id: Some(node_id.to_string()),
         listen_addr: Some(addr.to_string()),
+        advertised_addr: None,
         peers: Vec::new(),
         replication_factor: Some("1".to_string()),
         data_dir: Some(unique_data_dir()),

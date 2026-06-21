@@ -101,6 +101,7 @@ fn config(node_id: &str, addr: SocketAddr, peers: &[&str], rf: u32) -> Config {
     Config::from_cli(CliArgs {
         node_id: Some(node_id.to_string()),
         listen_addr: Some(addr.to_string()),
+        advertised_addr: None,
         peers: peers.iter().map(|p| p.to_string()).collect(),
         replication_factor: Some(rf.to_string()),
         data_dir: Some(unique_data_dir()),

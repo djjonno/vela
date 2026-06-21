@@ -23,26 +23,9 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
+use vela_proto::partition::partition_for_key;
+
 use crate::model::PartitionIndex;
-
-/// FNV-1a 64-bit offset basis.
-const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
-/// FNV-1a 64-bit prime.
-const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
-
-/// Deterministic, dependency-free 64-bit hash of a byte slice (FNV-1a).
-///
-/// FNV-1a is used instead of [`std::collections::hash_map::DefaultHasher`] so
-/// the keyed mapping is fully deterministic and reproducible — it depends only
-/// on the key bytes, not on any per-process random seed.
-fn fnv1a_64(bytes: &[u8]) -> u64 {
-    let mut hash = FNV_OFFSET_BASIS;
-    for &byte in bytes {
-        hash ^= u64::from(byte);
-        hash = hash.wrapping_mul(FNV_PRIME);
-    }
-    hash
-}
 
 /// Resolves a `(topic, partition_key)` pair to a partition of the topic.
 ///
@@ -78,18 +61,21 @@ impl PartitionRouter {
         if partition_count == 0 {
             return PartitionIndex(0);
         }
-        let count = u64::from(partition_count);
 
         match key {
-            // A present, non-empty key uses the deterministic hash mapping.
+            // A present, non-empty key uses the deterministic hash mapping
+            // shared with `vela-client` via the canonical partitioner. With a
+            // non-zero `partition_count` (guarded above) the canonical function
+            // always yields `Some`.
             Some(bytes) if !bytes.is_empty() => {
-                let slot = fnv1a_64(bytes) % count;
-                PartitionIndex(slot as u32)
+                let slot =
+                    partition_for_key(bytes, partition_count).expect("partition_count is non-zero");
+                PartitionIndex(slot)
             }
             // A missing or empty key uses keyless round-robin.
             _ => {
                 let n = self.next_round_robin(topic);
-                PartitionIndex((n % count) as u32)
+                PartitionIndex((n % u64::from(partition_count)) as u32)
             }
         }
     }

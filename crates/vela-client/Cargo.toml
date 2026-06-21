@@ -22,5 +22,29 @@ tonic = "0.12.3"
 prost = "0.13.4"
 
 [dev-dependencies]
-tokio = { version = "1.43.0", features = ["rt", "macros", "test-util"] }
+# `net` backs the in-process fake `VelaClient` gRPC server used by the dispatch
+# re-resolution property test (Property 8): a `TcpListener` bound on an
+# OS-chosen port answers `FindLeader` so the transport re-resolution path can be
+# exercised deterministically (task 4.4). `tonic`'s transport feature (a default
+# of the `[dependencies]` entry) serves that fake over the bound listener.
+tokio = { version = "1.43.0", features = [
+    "rt",
+    "rt-multi-thread",
+    "macros",
+    "time",
+    "net",
+    "sync",
+    "test-util",
+] }
 proptest.workspace = true
+# Test-only edge: the cross-implementation partitioner-agreement property test
+# (Property 2, Requirement 5.5) asserts that the client `PartitionRouter`, the
+# core `PartitionRouter`, and the canonical `vela_proto::partition::partition_for_key`
+# all resolve the same key to the same partition. This is a `[dev-dependencies]`
+# entry only — the runtime inward direction (vela-client -> vela-proto, never
+# vela-core) stays intact (Open Decision 3).
+vela-core.workspace = true
+# Adapts the bound `TcpListener` into the incoming stream `tonic` serves, so the
+# fake server's port is chosen by the OS and known before the client connects
+# (no readiness race) — mirroring the harness in vela-ctl's example tests.
+tokio-stream = { version = "0.1.17", features = ["net"] }

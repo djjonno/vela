@@ -226,6 +226,7 @@ mod tests {
         Config {
             node_id: NodeId::new(node_id),
             listen_addr: addr.parse().expect("valid addr"),
+            advertised_addr: addr.to_string(),
             peers: Vec::new(),
             replication_factor: 1,
             data_dir: data_dir.to_path_buf(),

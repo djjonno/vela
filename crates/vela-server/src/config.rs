@@ -44,6 +44,12 @@ pub struct CliArgs {
     #[arg(long, env = "VELA_LISTEN_ADDR")]
     pub listen_addr: Option<String>,
 
+    /// Client-reachable address advertised to clients (e.g. `127.0.0.1:7001`).
+    /// Defaults to `listen_addr` when unset or blank after trimming
+    /// (Requirement 1.1, 1.2, 1.3).
+    #[arg(long, env = "VELA_ADVERTISED_ADDR")]
+    pub advertised_addr: Option<String>,
+
     /// Peer nodes as `id@host:port` (e.g. `node2@node2:7001`), comma-separated
     /// or repeated. A bare `host:port` is accepted and uses the address as the
     /// peer id (single-node/local fallback).
@@ -72,8 +78,13 @@ pub struct CliArgs {
 pub struct Peer {
     /// The peer's stable cluster node id (matches its own `VELA_NODE_ID`).
     pub id: String,
-    /// The peer's transport address (`host:port`).
+    /// The peer's transport address (`host:port`) — its Listen_Address, used
+    /// for server-to-server dialing.
     pub addr: String,
+    /// The peer's client-reachable advertised address (`host:port`). Equals
+    /// [`addr`](Self::addr) when no advertised half is supplied in the peer
+    /// entry. Client-facing metadata only; never used for inter-node dialing.
+    pub advertised_addr: String,
 }
 
 /// A validated `velad` configuration, ready for the daemon to act on.
@@ -83,6 +94,10 @@ pub struct Config {
     pub node_id: NodeId,
     /// The socket address the gRPC listener binds on.
     pub listen_addr: SocketAddr,
+    /// The resolved client-reachable advertised address (`host:port`). Equals
+    /// `listen_addr.to_string()` when `--advertised-addr` / `VELA_ADVERTISED_ADDR`
+    /// is unset or blank after trimming (Requirement 1.2, 1.5).
+    pub advertised_addr: String,
     /// The configured peer nodes (id + `host:port`). May be empty for a
     /// single-node cluster.
     pub peers: Vec<Peer>,
@@ -154,6 +169,16 @@ impl Config {
                     reason: err.to_string(),
                 })?;
 
+        // Resolve the advertised address: a non-empty trimmed flag/env value is
+        // recorded verbatim with no format validation (any non-empty value,
+        // including a `0.0.0.0` wildcard host or a bare hostname, is accepted —
+        // Req 1.1, 1.3, 1.4); otherwise it defaults to the listen address so
+        // zero-config deployments are unchanged (Req 1.2).
+        let advertised_addr = match args.advertised_addr.as_deref().map(str::trim) {
+            Some(v) if !v.is_empty() => v.to_string(),
+            _ => listen_addr.to_string(),
+        };
+
         let rf_raw = require(args.replication_factor.as_deref(), "replication_factor")?;
         let replication_factor = parse_replication_factor(rf_raw)?;
 
@@ -169,6 +194,7 @@ impl Config {
         Ok(Config {
             node_id: NodeId::new(node_id),
             listen_addr,
+            advertised_addr,
             peers,
             replication_factor,
             data_dir,
@@ -209,10 +235,16 @@ fn parse_replication_factor(raw: &str) -> Result<u32, ConfigError> {
 /// Parse each peer entry into a [`Peer`] and reject any that is empty after
 /// trimming.
 ///
-/// An entry may be `id@host:port` (explicit id) or a bare `host:port` (the
-/// address doubles as the id, for the single-node/local fallback). The `id` and
-/// `addr` halves are trimmed; an entry that is empty, or whose `id` or `addr`
-/// half is empty (e.g. `@addr`, `id@`, or a lone `@`), is rejected.
+/// An entry follows the grammar `id@listen[@advertised]` (or a bare
+/// `host:port`, where the address doubles as both the id and the listen
+/// address, for the single-node/local fallback). After splitting `(id, rest)`
+/// on the first `@`, `rest` is split once more on `@` into
+/// `(listen, advertised)`; when no second `@` is present the advertised address
+/// defaults to the listen address (D2). Each half is trimmed; an entry that is
+/// empty, or whose `id`, `listen`, or explicitly-supplied `advertised` half is
+/// empty (e.g. `@addr`, `id@`, `id@listen@`, or a lone `@`), is rejected with
+/// [`ConfigError::EmptyPeer`]. Every legacy `id@listen` and bare `host:port`
+/// entry parses unchanged with `advertised = listen`.
 fn normalize_peers(peers: Vec<String>) -> Result<Vec<Peer>, ConfigError> {
     let mut out = Vec::with_capacity(peers.len());
     for peer in peers {
@@ -220,16 +252,23 @@ fn normalize_peers(peers: Vec<String>) -> Result<Vec<Peer>, ConfigError> {
         if trimmed.is_empty() {
             return Err(ConfigError::EmptyPeer);
         }
-        let (id, addr) = match trimmed.split_once('@') {
-            Some((id, addr)) => (id.trim(), addr.trim()),
+        let (id, rest) = match trimmed.split_once('@') {
+            Some((id, rest)) => (id.trim(), rest.trim()),
             None => (trimmed, trimmed),
         };
-        if id.is_empty() || addr.is_empty() {
+        // Split the listen/advertised halves; absent second `@` defaults the
+        // advertised address to the listen address (D2).
+        let (listen, advertised) = match rest.split_once('@') {
+            Some((listen, advertised)) => (listen.trim(), advertised.trim()),
+            None => (rest, rest),
+        };
+        if id.is_empty() || listen.is_empty() || advertised.is_empty() {
             return Err(ConfigError::EmptyPeer);
         }
         out.push(Peer {
             id: id.to_string(),
-            addr: addr.to_string(),
+            addr: listen.to_string(),
+            advertised_addr: advertised.to_string(),
         });
     }
     Ok(out)
@@ -250,6 +289,7 @@ mod tests {
         CliArgs {
             node_id: node_id.map(str::to_string),
             listen_addr: listen_addr.map(str::to_string),
+            advertised_addr: None,
             peers: peers.iter().map(|p| p.to_string()).collect(),
             replication_factor: replication_factor.map(str::to_string),
             data_dir: data_dir.map(str::to_string),
@@ -274,11 +314,13 @@ mod tests {
             vec![
                 Peer {
                     id: "node-b:7001".to_string(),
-                    addr: "node-b:7001".to_string()
+                    addr: "node-b:7001".to_string(),
+                    advertised_addr: "node-b:7001".to_string()
                 },
                 Peer {
                     id: "node-c:7001".to_string(),
-                    addr: "node-c:7001".to_string()
+                    addr: "node-c:7001".to_string(),
+                    advertised_addr: "node-c:7001".to_string()
                 },
             ]
         );
@@ -412,11 +454,13 @@ mod tests {
             vec![
                 Peer {
                     id: "node-b:7001".to_string(),
-                    addr: "node-b:7001".to_string()
+                    addr: "node-b:7001".to_string(),
+                    advertised_addr: "node-b:7001".to_string()
                 },
                 Peer {
                     id: "node-c:7001".to_string(),
-                    addr: "node-c:7001".to_string()
+                    addr: "node-c:7001".to_string(),
+                    advertised_addr: "node-c:7001".to_string()
                 },
             ]
         );
@@ -452,11 +496,13 @@ mod tests {
             vec![
                 Peer {
                     id: "node2".to_string(),
-                    addr: "node2:7001".to_string()
+                    addr: "node2:7001".to_string(),
+                    advertised_addr: "node2:7001".to_string()
                 },
                 Peer {
                     id: "node3".to_string(),
-                    addr: "node3:7001".to_string()
+                    addr: "node3:7001".to_string(),
+                    advertised_addr: "node3:7001".to_string()
                 },
             ]
         );
@@ -476,7 +522,8 @@ mod tests {
             config.peers,
             vec![Peer {
                 id: "node2".to_string(),
-                addr: "node2:7001".to_string()
+                addr: "node2:7001".to_string(),
+                advertised_addr: "node2:7001".to_string()
             }]
         );
     }
@@ -544,15 +591,174 @@ mod tests {
             vec![
                 Peer {
                     id: "node-b:7001".to_string(),
-                    addr: "node-b:7001".to_string()
+                    addr: "node-b:7001".to_string(),
+                    advertised_addr: "node-b:7001".to_string()
                 },
                 Peer {
                     id: "node-c:7001".to_string(),
-                    addr: "node-c:7001".to_string()
+                    addr: "node-c:7001".to_string(),
+                    advertised_addr: "node-c:7001".to_string()
                 },
             ]
         );
         assert_eq!(config.node_id, NodeId::new("node-a"));
         assert_eq!(config.replication_factor, 3);
+    }
+
+    // ---- advertised address resolution (advertised-listeners 1.x) ---------
+
+    #[test]
+    fn advertised_addr_value_is_recorded() {
+        // A non-empty `--advertised-addr` / `VELA_ADVERTISED_ADDR` value is
+        // recorded verbatim as the node's Advertised_Address (Req 1.1). clap
+        // binds both the flag and the env var onto `CliArgs::advertised_addr`, so
+        // exercising that field covers both sources (mirroring
+        // `data_dir_is_read_from_env_value`).
+        let mut args = cli(
+            Some("n"),
+            Some("127.0.0.1:7001"),
+            &[],
+            Some("1"),
+            Some("/var/lib/vela"),
+        );
+        args.advertised_addr = Some("203.0.113.5:9001".to_string());
+        let config = Config::from_cli(args).expect("config with an advertised addr must parse");
+        assert_eq!(config.advertised_addr, "203.0.113.5:9001");
+    }
+
+    #[test]
+    fn absent_advertised_addr_defaults_to_listen() {
+        // Req 1.2: an absent advertised value defaults to the Listen_Address.
+        let config = Config::from_cli(cli(
+            Some("n"),
+            Some("127.0.0.1:7001"),
+            &[],
+            Some("1"),
+            Some("/var/lib/vela"),
+        ))
+        .expect("config without an advertised addr must parse");
+        assert_eq!(config.advertised_addr, "127.0.0.1:7001");
+        assert_eq!(config.advertised_addr, config.listen_addr.to_string());
+    }
+
+    #[test]
+    fn blank_advertised_addr_defaults_to_listen() {
+        // Req 1.2: a value that is empty after trimming falls back to the listen
+        // address rather than being recorded or rejected.
+        for blank in ["", "   ", "\t \n"] {
+            let mut args = cli(
+                Some("n"),
+                Some("127.0.0.1:7001"),
+                &[],
+                Some("1"),
+                Some("/var/lib/vela"),
+            );
+            args.advertised_addr = Some(blank.to_string());
+            let config =
+                Config::from_cli(args).expect("a blank advertised addr must default, not error");
+            assert_eq!(config.advertised_addr, "127.0.0.1:7001", "input {blank:?}");
+        }
+    }
+
+    #[test]
+    fn advertised_addr_surrounding_whitespace_is_trimmed() {
+        // Req 1.3: surrounding whitespace is trimmed before the value is recorded.
+        let mut args = cli(
+            Some("n"),
+            Some("127.0.0.1:7001"),
+            &[],
+            Some("1"),
+            Some("/var/lib/vela"),
+        );
+        args.advertised_addr = Some("  198.51.100.7:7002  ".to_string());
+        let config = Config::from_cli(args).expect("a padded advertised addr must parse");
+        assert_eq!(config.advertised_addr, "198.51.100.7:7002");
+    }
+
+    #[test]
+    fn any_non_empty_advertised_addr_is_accepted() {
+        // Req 1.4: any non-empty value is accepted without format validation,
+        // including a `0.0.0.0` wildcard host, a bare hostname, and a host:port.
+        for value in [
+            "0.0.0.0:7001",
+            "0.0.0.0",
+            "node2",
+            "node2:7001",
+            "example.com",
+        ] {
+            let mut args = cli(
+                Some("n"),
+                Some("127.0.0.1:7001"),
+                &[],
+                Some("1"),
+                Some("/var/lib/vela"),
+            );
+            args.advertised_addr = Some(value.to_string());
+            let config = Config::from_cli(args)
+                .unwrap_or_else(|err| panic!("advertised {value:?} must be accepted, got {err:?}"));
+            assert_eq!(config.advertised_addr, value);
+        }
+    }
+
+    // ---- peer grammar `id@listen[@advertised]` (advertised-listeners D2) ---
+
+    #[test]
+    fn peer_with_advertised_half_parses_all_three_fields() {
+        // `id@listen@advertised` records the peer's id, its bind/listen address,
+        // and its client-reachable advertised address as three distinct fields.
+        let config = Config::from_cli(cli(
+            Some("node1"),
+            Some("0.0.0.0:7001"),
+            &["node2@node2:7001@127.0.0.1:7002"],
+            Some("1"),
+            Some("/var/lib/vela"),
+        ))
+        .expect("an id@listen@advertised peer must parse");
+        assert_eq!(
+            config.peers,
+            vec![Peer {
+                id: "node2".to_string(),
+                addr: "node2:7001".to_string(),
+                advertised_addr: "127.0.0.1:7002".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn peer_advertised_half_is_trimmed() {
+        let config = Config::from_cli(cli(
+            Some("node1"),
+            Some("0.0.0.0:7001"),
+            &["  node2  @  node2:7001  @  127.0.0.1:7002  "],
+            Some("1"),
+            Some("/var/lib/vela"),
+        ))
+        .expect("a padded id@listen@advertised peer must parse");
+        assert_eq!(
+            config.peers,
+            vec![Peer {
+                id: "node2".to_string(),
+                addr: "node2:7001".to_string(),
+                advertised_addr: "127.0.0.1:7002".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn peer_with_empty_advertised_half_is_rejected() {
+        // An explicitly-empty advertised half (`id@listen@`, or whitespace-only)
+        // is rejected with the existing `EmptyPeer`, symmetric with the empty
+        // listen half (design D2).
+        for bad in ["node2@node2:7001@", "node2@node2:7001@   "] {
+            let err = Config::from_cli(cli(
+                Some("node1"),
+                Some("0.0.0.0:7001"),
+                &[bad],
+                Some("1"),
+                Some("/var/lib/vela"),
+            ))
+            .expect_err("an empty advertised half must error");
+            assert_eq!(err, ConfigError::EmptyPeer, "input {bad:?}");
+        }
     }
 }

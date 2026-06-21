@@ -370,6 +370,7 @@ pub fn member_to_proto(member: &Member) -> v1::Member {
     v1::Member {
         id: member.id.0.clone(),
         addr: member.addr.clone(),
+        advertised_addr: member.advertised_addr.clone(),
         availability: availability_to_proto(member.availability) as i32,
     }
 }
@@ -379,6 +380,7 @@ pub fn member_from_proto(member: &v1::Member) -> Member {
     Member {
         id: NodeId::new(&member.id),
         addr: member.addr.clone(),
+        advertised_addr: member.advertised_addr.clone(),
         availability: availability_from_proto(member.availability),
     }
 }
@@ -908,11 +910,31 @@ mod tests {
             let member = Member {
                 id: NodeId::new("node-a"),
                 addr: "node-a:7001".to_string(),
+                advertised_addr: "node-a:7001".to_string(),
                 availability,
             };
             let back = member_from_proto(&member_to_proto(&member));
             assert_eq!(back, member);
         }
+    }
+
+    #[test]
+    fn old_server_member_without_advertised_decodes_to_empty() {
+        // A `Member` from an older server omits wire field 4, so proto3 defaults
+        // `advertised_addr` to the empty string. Decoding preserves the bind
+        // `addr` (field 2) and yields an empty advertised address, which the
+        // client treats as a fall-back signal (advertised-listeners 7.1).
+        let old = v1::Member {
+            id: "node-a".to_string(),
+            addr: "node-a:7001".to_string(),
+            advertised_addr: String::new(),
+            availability: v1::NodeAvailability::Available as i32,
+        };
+        let member = member_from_proto(&old);
+        assert_eq!(member.advertised_addr, "");
+        assert_eq!(member.addr, "node-a:7001");
+        assert_eq!(member.id, NodeId::new("node-a"));
+        assert_eq!(member.availability, NodeAvailability::Available);
     }
 
     #[test]
@@ -929,6 +951,7 @@ mod tests {
         metadata.members = vec![Member {
             id: NodeId::new("node-a"),
             addr: "node-a:7001".to_string(),
+            advertised_addr: "node-a:7001".to_string(),
             availability: NodeAvailability::Available,
         }];
         metadata.epoch = 4;
@@ -1246,6 +1269,7 @@ mod tests {
             metadata.members = vec![Member {
                 id: NodeId::new("node-0"),
                 addr: "node-0:7001".to_string(),
+                advertised_addr: "node-0:7001".to_string(),
                 availability: NodeAvailability::Available,
             }];
             let before = metadata.clone();
@@ -1334,13 +1358,18 @@ mod tests {
     }
 
     fn arb_member() -> impl Strategy<Value = Member> {
-        (arb_node_id(), "[a-z0-9.:-]{1,20}", arb_availability()).prop_map(
-            |(id, addr, availability)| Member {
+        (
+            arb_node_id(),
+            "[a-z0-9.:-]{1,20}",
+            "[a-z0-9.:-]{1,20}",
+            arb_availability(),
+        )
+            .prop_map(|(id, addr, advertised_addr, availability)| Member {
                 id,
                 addr,
+                advertised_addr,
                 availability,
-            },
-        )
+            })
     }
 
     fn arb_cluster_metadata() -> impl Strategy<Value = ClusterMetadata> {

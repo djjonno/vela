@@ -222,6 +222,7 @@ impl NodeShared {
         metadata.members.push(Member {
             id: NodeId::new(&self_id),
             addr: config.listen_addr.to_string(),
+            advertised_addr: config.advertised_addr.clone(),
             availability: NodeAvailability::Available,
         });
         for topic in controller.metadata().topics.values() {
@@ -717,6 +718,7 @@ mod tests {
         Config {
             node_id: NodeId::new(node_id),
             listen_addr: addr.parse().expect("valid addr"),
+            advertised_addr: addr.to_string(),
             peers: Vec::new(),
             replication_factor: rf,
             data_dir: data_dir.to_path_buf(),

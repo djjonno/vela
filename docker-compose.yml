@@ -6,9 +6,21 @@
 #
 #   VELA_NODE_ID            stable identity of the node
 #   VELA_LISTEN_ADDR        address the gRPC listener binds on (in-container)
-#   VELA_PEERS              comma-separated `id@host:port` list of the OTHER
-#                           nodes (the id matches each peer's VELA_NODE_ID, so
-#                           node identity is consistent cluster-wide)
+#   VELA_ADVERTISED_ADDR    client-reachable address published in cluster
+#                           metadata (the host-published 127.0.0.1:700N here),
+#                           distinct from the in-container bind address so a
+#                           host client discovering members via DescribeCluster
+#                           dials a reachable address (advertised-listeners
+#                           Req 8.1, 8.2)
+#   VELA_PEERS              comma-separated `id@listen@advertised` list of the
+#                           OTHER nodes (the id matches each peer's
+#                           VELA_NODE_ID, so node identity is consistent
+#                           cluster-wide). The `listen` half is the Docker DNS
+#                           bind address `nodeN:7001` used for inter-node
+#                           dialing; the `advertised` half is the peer's
+#                           host-published `127.0.0.1:700N` carried into served
+#                           metadata so any node reports every member's
+#                           host-reachable address (advertised-listeners Req 8.3)
 #   VELA_REPLICATION_FACTOR replicas per partition (Raft group size)
 #   VELA_DATA_DIR           in-container root for durable partition logs
 #
@@ -19,7 +31,10 @@
 # created against the running cluster (Req 14.5).
 #
 # Container port 7001 is mapped to a distinct host port per node (7001..7004)
-# so a local client or `vela-ctl` can reach any individual node.
+# so a local client or `vela-ctl` can reach any individual node. Each node
+# advertises its own host-published 127.0.0.1:700N mapping (and carries each
+# peer's host-published mapping in VELA_PEERS), so a host client querying any
+# single published node discovers all four host-reachable addresses.
 #
 # Durability (Requirement 15): each node sets `VELA_DATA_DIR` to the in-container
 # path `/var/lib/vela` and mounts its OWN distinct named volume there
@@ -44,7 +59,8 @@ services:
     environment:
       VELA_NODE_ID: node1
       VELA_LISTEN_ADDR: 0.0.0.0:7001
-      VELA_PEERS: node2@node2:7001,node3@node3:7001,node4@node4:7001
+      VELA_ADVERTISED_ADDR: 127.0.0.1:7001
+      VELA_PEERS: node2@node2:7001@127.0.0.1:7002,node3@node3:7001@127.0.0.1:7003,node4@node4:7001@127.0.0.1:7004
       VELA_REPLICATION_FACTOR: "3"
       VELA_DATA_DIR: /var/lib/vela
     ports:
@@ -65,7 +81,8 @@ services:
     environment:
       VELA_NODE_ID: node2
       VELA_LISTEN_ADDR: 0.0.0.0:7001
-      VELA_PEERS: node1@node1:7001,node3@node3:7001,node4@node4:7001
+      VELA_ADVERTISED_ADDR: 127.0.0.1:7002
+      VELA_PEERS: node1@node1:7001@127.0.0.1:7001,node3@node3:7001@127.0.0.1:7003,node4@node4:7001@127.0.0.1:7004
       VELA_REPLICATION_FACTOR: "3"
       VELA_DATA_DIR: /var/lib/vela
     ports:
@@ -86,7 +103,8 @@ services:
     environment:
       VELA_NODE_ID: node3
       VELA_LISTEN_ADDR: 0.0.0.0:7001
-      VELA_PEERS: node1@node1:7001,node2@node2:7001,node4@node4:7001
+      VELA_ADVERTISED_ADDR: 127.0.0.1:7003
+      VELA_PEERS: node1@node1:7001@127.0.0.1:7001,node2@node2:7001@127.0.0.1:7002,node4@node4:7001@127.0.0.1:7004
       VELA_REPLICATION_FACTOR: "3"
       VELA_DATA_DIR: /var/lib/vela
     ports:
@@ -107,7 +125,8 @@ services:
     environment:
       VELA_NODE_ID: node4
       VELA_LISTEN_ADDR: 0.0.0.0:7001
-      VELA_PEERS: node1@node1:7001,node2@node2:7001,node3@node3:7001
+      VELA_ADVERTISED_ADDR: 127.0.0.1:7004
+      VELA_PEERS: node1@node1:7001@127.0.0.1:7001,node2@node2:7001@127.0.0.1:7002,node3@node3:7001@127.0.0.1:7003
       VELA_REPLICATION_FACTOR: "3"
       VELA_DATA_DIR: /var/lib/vela
     ports:

@@ -7,9 +7,12 @@ license.workspace = true
 repository.workspace = true
 
 # Dependency edges point inward only: vela-core -> vela-raft, vela-log.
+# vela-proto sits at the bottom of both dependency chains and provides the
+# canonical partitioner shared with vela-client (Requirement 5.5).
 [dependencies]
 vela-raft.workspace = true
 vela-log.workspace = true
+vela-proto.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 

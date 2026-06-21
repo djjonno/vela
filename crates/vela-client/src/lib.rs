@@ -19,19 +19,21 @@
 //! - The [`Producer`] wraps the [`PartitionRouter`] so a record's partition is
 //!   resolved *before* dispatch (Requirement 4.1, 4.2).
 //!
-//! # Leader-redirection retry (task 16.2)
+//! # Leader-redirection and transport-failure retry (task 4.1)
 //!
-//! On a `NotLeader` response, the client re-resolves the leader and retries —
-//! waiting at least [`RETRY_DELAY_MS`] ms before each retry and following at
-//! most [`MAX_RETRIES`] redirects before returning
-//! [`ClientError::NoLeaderAfterRetries`] (Requirement 11.2–11.4).
-//! [`ClientCore::dispatch`] owns this loop: it invalidates/updates the
-//! [`LeaderCache`] from the redirect's leader hint (resolved via the
-//! [`NodeRegistry`], or re-fetched with `FindLeader` when the hint is absent or
-//! unknown) and re-runs the per-attempt operation. [`Producer`] and [`Consumer`]
-//! both dispatch through it, so a produce or consume that lands on a non-leader
-//! is transparently redirected to the real leader. Non-redirect errors propagate
-//! immediately.
+//! [`ClientCore::dispatch`] runs each attempt against the believed leader and
+//! [`classify`](crate::ClientCore)s the outcome: it re-resolves the leader on a
+//! `NotLeader` redirect or a transport failure, refreshes stale topic metadata
+//! on a stale-routing error, and surfaces non-retryable application errors
+//! immediately (Requirement 3.2, 3.3, 3.6, 1.6). Retries are bounded by a
+//! time-based [`RetryBudget`] with exponential backoff (Requirement 3.4); once
+//! the budget is exhausted dispatch returns
+//! [`ClientError::NoLeaderAfterRetries`] (Requirement 3.5). [`Producer`] and
+//! [`Consumer`] both dispatch through it, so a produce or consume that lands on
+//! a non-leader — or a stale/unreachable leader — is transparently retried
+//! against the re-resolved leader. All backoff waits and metadata-TTL
+//! comparisons are measured against an injected [`Clock`], so the timing is
+//! deterministic under a paused tokio runtime in tests.
 //!
 //! # Example
 //!
@@ -59,7 +61,9 @@ mod consumer;
 mod core;
 mod error;
 mod leader_cache;
+mod metadata_cache;
 mod producer;
+mod retry;
 mod router;
 
 use std::sync::Arc;
@@ -67,11 +71,15 @@ use std::sync::Arc;
 pub use admin::{AdminClient, LogBackend};
 pub use connection::{ConnectionManager, NodeRegistry};
 pub use consumer::{ConsumeOutcome, Consumer};
-pub use core::{ClientCore, MAX_RETRIES, RETRY_DELAY_MS};
+pub use core::{
+    resolve_leader, ClientConfig, ClientCore, Clock, LeaderProbe, LeaderResolution, TokioClock,
+};
 pub use error::{ClientError, Result};
 pub use leader_cache::LeaderCache;
+pub use metadata_cache::{MetadataCache, TopicMeta};
 pub use producer::Producer;
-pub use router::PartitionRouter;
+pub use retry::RetryBudget;
+pub use router::{KeylessStrategy, PartitionRouter, RouteError};
 
 /// Entry point to the Vela client library.
 ///
@@ -94,6 +102,23 @@ impl VelaClient {
     pub fn new(nodes: impl IntoIterator<Item = (String, String)>) -> Self {
         Self {
             core: Arc::new(ClientCore::new(nodes)),
+        }
+    }
+
+    /// Build a client from `(node_id, address)` bootstrap pairs with an explicit
+    /// [`ClientConfig`].
+    ///
+    /// Identical to [`VelaClient::new`] except the shared [`ClientCore`] is built
+    /// with `config`, so the metadata-cache TTL (Requirement 1.7) and the
+    /// router's keyless strategy (Requirement 5.2, 5.6) honor the supplied
+    /// settings. Passing [`ClientConfig::default`] is equivalent to
+    /// [`VelaClient::new`].
+    pub fn with_config(
+        nodes: impl IntoIterator<Item = (String, String)>,
+        config: ClientConfig,
+    ) -> Self {
+        Self {
+            core: Arc::new(ClientCore::with_config(nodes, config)),
         }
     }
 
@@ -137,5 +162,26 @@ mod tests {
             Some("http://node-a:50051")
         );
         let _ = (client.producer(), client.consumer(), client.admin());
+    }
+
+    #[test]
+    fn with_config_builds_a_configured_core() {
+        // `VelaClient::with_config` must propagate the metadata TTL and keyless
+        // strategy through to the shared core (Requirement 1.7, 5.2, 5.6).
+        use std::time::Duration;
+
+        let config = ClientConfig {
+            metadata_ttl: Duration::from_secs(7),
+            keyless: KeylessStrategy::Sticky { run_length: 16 },
+        };
+        let client = VelaClient::with_config(
+            [("node-a".to_string(), "http://node-a:50051".to_string())],
+            config,
+        );
+        assert_eq!(client.core().metadata().ttl(), Duration::from_secs(7));
+        assert_eq!(
+            client.core().router().keyless_strategy(),
+            KeylessStrategy::Sticky { run_length: 16 }
+        );
     }
 }

@@ -77,6 +77,7 @@ fn valid_args() -> CliArgs {
     CliArgs {
         node_id: Some("node-a".to_string()),
         listen_addr: Some("127.0.0.1:7001".to_string()),
+        advertised_addr: None,
         peers: vec!["node-b:7001".to_string()],
         replication_factor: Some("3".to_string()),
         data_dir: Some("/var/lib/vela".to_string()),

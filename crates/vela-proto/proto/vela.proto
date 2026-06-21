@@ -140,12 +140,16 @@ enum NodeAvailability {
   NODE_AVAILABILITY_UNAVAILABLE = 2;
 }
 
-// A cluster member node: its identity, transport address, and availability
-// (Requirement 9.3).
+// A cluster member node: its identity, internal/bind transport address, its
+// client-reachable advertised address, and availability (Requirement 9.3,
+// advertised-listeners Requirement 5.1).
 message Member {
   string id = 1;
-  string addr = 2;
+  string addr = 2;              // internal / bind / Listen_Address (unchanged)
   NodeAvailability availability = 3;
+  // client-reachable address advertised to clients; empty => use addr
+  // (advertised-listeners Requirement 5.1).
+  string advertised_addr = 4;
 }
 
 // The replica assignment and current leader for one partition (Requirement 2.3,
@@ -219,6 +223,19 @@ message FindLeaderRequest {
 
 message FindLeaderResponse {
   optional string leader = 1; // absent if no leader is currently elected
+}
+
+// Describe the current cluster membership so a client can seed its node
+// registry (id -> transport address) for leader-directed routing
+// (Requirements 12.6, 12.7, 13.1).
+message DescribeClusterRequest {}
+
+// The current cluster members plus the metadata epoch they were observed at
+// (Requirement 12.7, 12.8). Each `Member` carries its id, transport address,
+// and availability.
+message DescribeClusterResponse {
+  repeated Member members = 1;
+  uint64 epoch = 2;
 }
 
 // ---------------------------------------------------------------------------
@@ -349,6 +366,12 @@ service VelaClient {
   // Resolve the current leader of a (topic, partition) (Requirement 10.4,
   // 11.1).
   rpc FindLeader(FindLeaderRequest) returns (FindLeaderResponse);
+
+  // Describe the current cluster membership (id + transport address +
+  // availability) plus the metadata epoch, so a client can seed its node
+  // registry for leader-directed routing (Requirements 12.6, 12.7, 12.8,
+  // 13.1).
+  rpc DescribeCluster(DescribeClusterRequest) returns (DescribeClusterResponse);
 }
 
 // Server-to-server API: per-partition Raft RPCs plus membership and metadata

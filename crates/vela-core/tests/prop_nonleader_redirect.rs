@@ -89,6 +89,7 @@ fn metadata_with_leader(topic: &str, believed_leader: Option<NodeId>) -> Cluster
     meta.members = vec![Member {
         id: NodeId::new("node-0"),
         addr: "node-0:7001".to_string(),
+        advertised_addr: "node-0:7001".to_string(),
         availability: NodeAvailability::Available,
     }];
     meta.topics.insert(

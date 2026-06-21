@@ -21,6 +21,7 @@ fn cluster(n: usize) -> ClusterMetadata {
         .map(|i| Member {
             id: NodeId::new(format!("node-{i}")),
             addr: format!("node-{i}:7001"),
+            advertised_addr: format!("node-{i}:7001"),
             availability: NodeAvailability::Available,
         })
         .collect();

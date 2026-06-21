@@ -9,33 +9,60 @@
 //! - `list` → [`list_topics`] (Requirement 13.3)
 //! - `describe <name>` → [`describe_topic`] (Requirement 13.4)
 //!
+//! A fifth admin command exposes cluster membership:
+//!
+//! - `describe-cluster` (alias `cluster`) → [`describe_cluster`] — the
+//!   `Member_Address_Map` (each node's id, address, availability) plus the
+//!   metadata epoch (Requirement 12.6, 12.7, 12.8)
+//!
 //! Two data-plane commands drive the produce/consume client roles:
 //!
-//! - `produce <name> --value V [--key K]` → `Producer::produce` (Requirement 4)
-//! - `consume <name> --partition P [--offset O] [--max N]` →
-//!   `Consumer::consume` (Requirement 5)
+//! - `produce <name> [--key K] [--value V]` → the interactive Producer REPL
+//!   ([`crate::produce::run_repl`], Requirement 6.x). When `--value` is supplied
+//!   the command instead produces that single record and exits (a
+//!   backward-compatible one-shot); when it is omitted the REPL reads lines from
+//!   stdin and produces each until end-of-input or Ctrl+C.
+//! - `consume <name> [--partition P] [--offset-reset R] [--poll-interval MS]` →
+//!   the continuous Consumer loop ([`crate::consume::run_consume`], Requirements
+//!   8–11), which discovers a topic's partitions and polls each leader until
+//!   Ctrl+C.
 //!
-//! Every call is wrapped in a 5 s [`tokio::time::timeout`]: if the cluster cannot
-//! be reached in time the command reports a connection error and exits non-zero
-//! (Requirement 13.6); any error the cluster returns is likewise reported with a
-//! non-zero exit (Requirement 13.7). A command that completes returns
-//! `Ok(())`, which the caller turns into exit status zero (Requirement 13.5).
+//! The four topic-admin calls are each wrapped in a 5 s [`tokio::time::timeout`]:
+//! if the cluster cannot be reached in time the command reports a connection
+//! error and exits non-zero (Requirement 13.6); any error the cluster returns is
+//! likewise reported with a non-zero exit (Requirement 13.7). The long-running
+//! produce/consume loops are not time-bounded — they run until the operator
+//! ends the session — and classify their own failures internally. A command
+//! that completes returns `Ok(())`, which the caller turns into exit status zero
+//! (Requirement 13.5).
 //!
 //! [`AdminClient`]: vela_client::AdminClient
 //! [`create_topic`]: vela_client::AdminClient::create_topic
 //! [`delete_topic`]: vela_client::AdminClient::delete_topic
 //! [`list_topics`]: vela_client::AdminClient::list_topics
 //! [`describe_topic`]: vela_client::AdminClient::describe_topic
+//! [`describe_cluster`]: vela_client::AdminClient::describe_cluster
 
 use std::future::Future;
 use std::process::ExitCode;
+use std::sync::Arc;
 use std::time::Duration;
 
 use clap::{Parser, Subcommand};
-use vela_client::{ClientError, LogBackend, VelaClient};
+use vela_client::{ClientConfig, ClientError, KeylessStrategy, LogBackend, VelaClient};
+
+use crate::consume::{run_consume, OffsetReset};
+use crate::produce::run_repl;
+use crate::seams::{CtrlC, StdinLines, TokioClock};
 
 /// Default endpoint contacted when `--endpoints`/`VELA_ADDR` is not supplied.
 const DEFAULT_ENDPOINT: &str = "http://127.0.0.1:50051";
+
+/// Run length applied to the sticky keyless partitioner when `--keyless sticky`
+/// is selected without an explicit run length: a run of this many consecutive
+/// keyless records is assigned to one partition before rotating (Requirement
+/// 5.6).
+const DEFAULT_STICKY_RUN_LENGTH: u32 = 16;
 
 /// Upper bound on how long any single admin call may take before it is reported
 /// as a connection failure (Requirement 13.6).
@@ -69,6 +96,19 @@ pub struct Cli {
         value_name = "URL"
     )]
     pub endpoints: Vec<String>,
+
+    /// Maximum age, in seconds, a cached topic-metadata entry may reach before
+    /// the client refreshes it on the next produce/consume routing operation
+    /// (Requirement 1.7). Defaults to 30 seconds; rejected at parse time if not
+    /// a non-negative integer.
+    #[arg(
+        long = "metadata-ttl",
+        global = true,
+        default_value = "30",
+        value_name = "SECS",
+        value_parser = parse_metadata_ttl
+    )]
+    pub metadata_ttl: Duration,
 
     /// The operation to perform.
     #[command(subcommand)]
@@ -108,35 +148,92 @@ pub enum Command {
         /// Topic name.
         name: String,
     },
-    /// Produce a single record to a topic (Requirement 4).
+    /// Describe the cluster membership: each node's id, address, and
+    /// availability, plus the metadata epoch (Requirement 12.6, 12.7, 12.8).
+    #[command(name = "describe-cluster", visible_alias = "cluster")]
+    DescribeCluster,
+    /// Produce records to a topic (Requirement 6).
     ///
-    /// The partition is resolved client-side: a `--key` maps deterministically
-    /// to a partition, while an absent key round-robins (Requirement 4.1, 4.2).
+    /// With `--value` the command produces that single record and exits (a
+    /// backward-compatible one-shot). Without `--value` it opens an interactive
+    /// REPL that produces each line read from stdin until end-of-input or Ctrl+C
+    /// (Requirement 6.x, 7.x). The partition is resolved client-side: a `--key`
+    /// maps deterministically to a partition, while an absent key spreads
+    /// records across partitions (Requirement 5.1, 5.2).
     Produce {
         /// Topic name.
         name: String,
         /// Optional record key. A non-empty key routes deterministically to a
-        /// partition; omit it to round-robin across partitions.
+        /// partition; omit it to spread records across partitions. In a REPL
+        /// session the key (when supplied) is applied to every produced line
+        /// (Requirement 6.4).
         #[arg(long, short = 'k', value_name = "KEY")]
         key: Option<String>,
-        /// Record value (payload) to append.
+        /// Optional record value (payload). When supplied, a single record is
+        /// produced and the command exits (one-shot, backward compatible). When
+        /// omitted, `produce` opens the interactive REPL described above
+        /// (Requirement 6.x).
         #[arg(long, short = 'v', value_name = "VALUE")]
-        value: String,
+        value: Option<String>,
+        /// Keyless routing strategy for records produced without a `--key`:
+        /// `round-robin` (the default) spreads each keyless record across the
+        /// partitions in cyclic order, while `sticky` assigns a run of
+        /// consecutive keyless records to one partition before rotating
+        /// (Requirement 5.2, 5.6). Any other value is rejected at parse time.
+        #[arg(
+            long = "keyless",
+            value_name = "STRATEGY",
+            default_value = "round-robin",
+            value_parser = parse_keyless
+        )]
+        keyless: KeylessStrategy,
     },
-    /// Consume committed records from a topic partition (Requirement 5).
+    /// Consume committed records from a topic (Requirement 8).
+    ///
+    /// Runs the continuous, multi-partition consumer: it discovers the topic's
+    /// partitions and polls each partition's leader, printing every record until
+    /// Ctrl+C (Requirements 8–11). Supply `--partition` to read a single
+    /// partition instead of the whole topic (Requirement 8.4).
     Consume {
         /// Topic name.
         name: String,
-        /// Partition index to read from.
+        /// Partition index to read from. Omit to consume every partition of the
+        /// topic (Requirement 8.4).
         #[arg(long, short = 'p', value_name = "INDEX")]
-        partition: u32,
-        /// Offset to start reading from (0-based).
+        partition: Option<u32>,
+        /// Deprecated for the continuous consumer: the start offset is now
+        /// derived from `--offset-reset` and each partition is polled to the end
+        /// of its log, so this flag no longer applies and is ignored. Retained on
+        /// the command surface for backward-compatible parsing only.
         #[arg(long, short = 'o', value_name = "OFFSET", default_value_t = 0)]
         offset: u64,
-        /// Maximum number of records to return (server bounds this to 1..=10000;
-        /// omitted lets the server apply its default of 500).
+        /// Deprecated for the continuous consumer: the loop polls each partition
+        /// continuously rather than reading a bounded batch, so this flag no
+        /// longer applies and is ignored. Retained for backward-compatible
+        /// parsing only.
         #[arg(long, short = 'm', value_name = "N")]
         max: Option<u32>,
+        /// Where each partition begins reading: `latest` (the default) reads only
+        /// records produced after the session starts, while `earliest` reads from
+        /// the beginning of each partition's log (Requirement 8.6, 8.7). Any
+        /// other value is rejected at parse time.
+        #[arg(
+            long = "offset-reset",
+            value_name = "RESET",
+            default_value = "latest",
+            value_parser = parse_offset_reset
+        )]
+        offset_reset: OffsetReset,
+        /// Interval, in milliseconds, to wait before re-polling a partition that
+        /// returned no new records (Requirement 9.5). Defaults to 500ms; rejected
+        /// at parse time if not a non-negative integer.
+        #[arg(
+            long = "poll-interval",
+            value_name = "MS",
+            default_value = "500",
+            value_parser = parse_poll_interval
+        )]
+        poll_interval: Duration,
     },
 }
 
@@ -160,6 +257,63 @@ fn parse_backend(value: &str) -> Result<LogBackend, ClientError> {
     value.parse()
 }
 
+/// Parse a `--keyless` flag value into a [`KeylessStrategy`].
+///
+/// Accepts exactly `round-robin` (per-record rotation, the default) and
+/// `sticky` (a run of [`DEFAULT_STICKY_RUN_LENGTH`] consecutive keyless records
+/// per partition before rotating); any other value is rejected at parse time,
+/// before any request is sent, mirroring [`parse_backend`] (Requirement 5.2,
+/// 5.6).
+fn parse_keyless(value: &str) -> Result<KeylessStrategy, String> {
+    match value {
+        "round-robin" => Ok(KeylessStrategy::RoundRobin),
+        "sticky" => Ok(KeylessStrategy::Sticky {
+            run_length: DEFAULT_STICKY_RUN_LENGTH,
+        }),
+        other => Err(format!(
+            "invalid keyless strategy '{other}' (expected 'round-robin' or 'sticky')"
+        )),
+    }
+}
+
+/// Parse an `--offset-reset` flag value into an [`OffsetReset`].
+///
+/// Accepts exactly `latest` (the default) and `earliest`; any other value is
+/// rejected at parse time, before any request is sent (Requirement 8.6, 8.7).
+fn parse_offset_reset(value: &str) -> Result<OffsetReset, String> {
+    match value {
+        "latest" => Ok(OffsetReset::Latest),
+        "earliest" => Ok(OffsetReset::Earliest),
+        other => Err(format!(
+            "invalid offset reset '{other}' (expected 'latest' or 'earliest')"
+        )),
+    }
+}
+
+/// Parse a `--poll-interval` flag value (milliseconds) into a [`Duration`].
+///
+/// Rejects any value that is not a non-negative integer at parse time, before
+/// any request is sent (Requirement 9.5).
+fn parse_poll_interval(value: &str) -> Result<Duration, String> {
+    value
+        .parse::<u64>()
+        .map(Duration::from_millis)
+        .map_err(|_| {
+            format!("invalid poll interval '{value}' (expected milliseconds as an integer)")
+        })
+}
+
+/// Parse a `--metadata-ttl` flag value (seconds) into a [`Duration`].
+///
+/// Rejects any value that is not a non-negative integer at parse time, before
+/// any request is sent (Requirement 1.7).
+fn parse_metadata_ttl(value: &str) -> Result<Duration, String> {
+    value
+        .parse::<u64>()
+        .map(Duration::from_secs)
+        .map_err(|_| format!("invalid metadata TTL '{value}' (expected seconds as an integer)"))
+}
+
 /// A human-readable label for a topic's wire backend value.
 ///
 /// Decodes the `TopicInfo.log_backend` wire field into the client enum; an
@@ -168,6 +322,18 @@ fn backend_label(log_backend: i32) -> String {
     LogBackend::from_wire(log_backend)
         .map(|backend| backend.to_string())
         .unwrap_or_else(|| "unspecified".to_string())
+}
+
+/// A human-readable label for a member's wire availability value.
+///
+/// Decodes the `Member.availability` wire field; an unspecified or unrecognized
+/// value is reported as `unknown`.
+fn availability_label(availability: i32) -> &'static str {
+    match vela_proto::v1::NodeAvailability::try_from(availability) {
+        Ok(vela_proto::v1::NodeAvailability::Available) => "available",
+        Ok(vela_proto::v1::NodeAvailability::Unavailable) => "unavailable",
+        Ok(vela_proto::v1::NodeAvailability::Unspecified) | Err(_) => "unknown",
+    }
 }
 
 /// A failure that ends the process with a non-zero status.
@@ -204,9 +370,29 @@ pub fn report(result: Result<(), CtlError>) -> ExitCode {
 /// Execute a parsed [`Cli`] against a cluster.
 ///
 /// Builds a [`VelaClient`] from the endpoint list and dispatches the chosen
-/// command, printing a human-readable outcome on success.
+/// command. The four topic-admin commands print a human-readable outcome on
+/// success; `produce`/`consume` hand off to the long-running REPL/poll loops.
+///
+/// The client core is configured from the parsed flags via [`ClientConfig`]: the
+/// `--metadata-ttl` governs the shared metadata cache for every command
+/// (Requirement 1.7), and the `produce` `--keyless` strategy is applied to the
+/// router (Requirement 5.2, 5.6). For non-`produce` commands the keyless setting
+/// is irrelevant, so the default round-robin strategy is used.
 pub async fn run(cli: Cli) -> Result<(), CtlError> {
-    let client = VelaClient::new(derive_nodes(&cli.endpoints));
+    // The metadata TTL applies to the shared core for every command; the keyless
+    // strategy is only meaningful for `produce`, so other commands use the
+    // default. The core is built once per `run`, so the strategy is read from
+    // the command before dispatch (Requirement 1.7, 5.2, 5.6).
+    let keyless = match &cli.command {
+        Command::Produce { keyless, .. } => *keyless,
+        _ => KeylessStrategy::default(),
+    };
+    let config = ClientConfig {
+        metadata_ttl: cli.metadata_ttl,
+        keyless,
+    };
+
+    let client = VelaClient::with_config(derive_nodes(&cli.endpoints), config);
     let admin = client.admin();
 
     match cli.command {
@@ -250,44 +436,97 @@ pub async fn run(cli: Cli) -> Result<(), CtlError> {
                 println!("  partition {} leader {}", partition.index, leader);
             }
         }
-        Command::Produce { name, key, value } => {
-            let producer = client.producer();
-            let key_bytes = key.as_deref().map(str::as_bytes);
-            let offset =
-                with_timeout(producer.produce(&name, key_bytes, value.into_bytes())).await?;
-            println!("produced to topic '{name}' at offset {offset}");
+        Command::DescribeCluster => {
+            let cluster = with_timeout(admin.describe_cluster()).await?;
+            println!(
+                "cluster: {} member(s) (epoch {})",
+                cluster.members.len(),
+                cluster.epoch
+            );
+            for member in cluster.members {
+                // Surface both the internal/bind address and the
+                // client-reachable advertised address (advertised-listeners):
+                // the advertised address is the one a client dials, and may
+                // differ from the bind address under port mapping / NAT. An
+                // older server omits the advertised field, so fall back to the
+                // bind address, which it mirrors.
+                let advertised = if member.advertised_addr.is_empty() {
+                    member.addr.as_str()
+                } else {
+                    member.advertised_addr.as_str()
+                };
+                println!(
+                    "  {}\t{}\t(advertised {})\t{}",
+                    member.id,
+                    member.addr,
+                    advertised,
+                    availability_label(member.availability)
+                );
+            }
         }
+        // `keyless` was read above and applied to the configured router, so it
+        // is not needed again here.
+        Command::Produce {
+            name, key, value, ..
+        } => {
+            let producer = client.producer();
+            let key_bytes = key.map(String::into_bytes);
+            match value {
+                // Backward-compatible one-shot: `--value V` produces a single
+                // record and exits, time-bounded like the admin calls.
+                Some(value) => {
+                    let offset = with_timeout(producer.produce(
+                        &name,
+                        key_bytes.as_deref(),
+                        value.into_bytes(),
+                    ))
+                    .await?;
+                    println!("produced to topic '{name}' at offset {offset}");
+                }
+                // No `--value`: open the interactive Producer REPL over stdin and
+                // Ctrl+C, producing each entered line until end-of-input or an
+                // interrupt (Requirement 6.x, 7.x). The REPL runs unbounded and
+                // classifies its own I/O failures.
+                None => {
+                    let mut out = std::io::stdout();
+                    run_repl(
+                        producer,
+                        name,
+                        key_bytes,
+                        StdinLines::new(),
+                        CtrlC,
+                        &mut out,
+                    )
+                    .await?;
+                }
+            }
+        }
+        // `offset`/`max` are ignored here — the continuous loop derives each
+        // partition's start offset from `offset_reset` and polls to the end of
+        // the log (see their flag docs).
         Command::Consume {
             name,
             partition,
-            offset,
-            max,
+            offset_reset,
+            poll_interval,
+            ..
         } => {
-            let consumer = client.consumer();
-            let outcome = with_timeout(consumer.consume(&name, partition, offset, max)).await?;
-            if outcome.records.is_empty() {
-                println!("no records");
-            } else {
-                for record in outcome.records {
-                    let value = record
-                        .record
-                        .as_ref()
-                        .map(|r| String::from_utf8_lossy(&r.value).into_owned())
-                        .unwrap_or_default();
-                    match record
-                        .record
-                        .as_ref()
-                        .and_then(|r| r.key.as_ref())
-                        .map(|k| String::from_utf8_lossy(k).into_owned())
-                    {
-                        Some(key) => {
-                            println!("offset {} key {} value {}", record.offset, key, value)
-                        }
-                        None => println!("offset {} value {}", record.offset, value),
-                    }
-                }
-            }
-            println!("next offset {}", outcome.next_offset);
+            // Run the continuous, multi-partition consumer until Ctrl+C, using
+            // the production seams: the real wall clock, OS-signal interrupt, and
+            // process stdout (Requirements 8–11). `run_consume` owns its own
+            // error classification, so it is not wrapped in `with_timeout`.
+            let mut out = std::io::stdout();
+            run_consume(
+                client,
+                name,
+                partition,
+                offset_reset,
+                poll_interval,
+                Arc::new(TokioClock),
+                CtrlC,
+                &mut out,
+            )
+            .await?;
         }
     }
     Ok(())
@@ -339,17 +578,40 @@ where
 
 /// Sort a [`ClientError`] into a connection failure or a cluster rejection.
 ///
-/// A transport-level `Unavailable` status means the client never reached a node
-/// (e.g. connection refused), so it is reported as a connection error
-/// (Requirement 13.6). Every other error is a request the cluster — or the
-/// client's routing layer — rejected (Requirement 13.7).
+/// - [`ClientError::UnknownNode`]: a resolved leader node id that maps to no
+///   address — from neither the server's `Member_Address_Map` nor a configured
+///   `id=url` endpoint — is a fail-fast connection error reporting the
+///   unresolved node id and that an `id=url` endpoint is required for it
+///   (Requirement 13.4, 13.6).
+/// - A transport-level `Unavailable` status means the client never reached a
+///   node (e.g. connection refused), so it is reported as a connection error
+///   (Requirement 13.6).
+/// - Every other error — including [`ClientError::TopicNotFound`]
+///   (Requirement 1.4), [`ClientError::NoPartitions`] (Requirement 1.8, 8.5),
+///   and [`ClientError::NoLeaderAfterRetries`] (Requirement 4.4) — is a request
+///   the cluster, or the client's routing layer, rejected, and is reported as a
+///   cluster error (Requirement 13.7). All of these exit non-zero.
 fn classify(err: ClientError) -> CtlError {
-    if let ClientError::Rpc(status) = &err {
-        if status.code() == tonic::Code::Unavailable {
-            return CtlError::Connection(status.message().to_string());
+    match err {
+        // A resolved leader id with no known address: fail fast with a clear,
+        // actionable message (Requirement 13.4, 13.6).
+        ClientError::UnknownNode {
+            node,
+            topic,
+            partition,
+        } => CtlError::Connection(format!(
+            "leader node `{node}` for {topic}/{partition} has no known address; \
+             an `id=url` endpoint is required for node {node}"
+        )),
+        // A transport `Unavailable` means no node was reached (Requirement 13.6).
+        ClientError::Rpc(status) if status.code() == tonic::Code::Unavailable => {
+            CtlError::Connection(status.message().to_string())
         }
+        // Topic-not-found, no-partitions, no-leader-after-retries, and every
+        // other error are cluster-side rejections reported non-zero
+        // (Requirement 1.4, 1.8, 4.4, 8.5, 13.7).
+        other => CtlError::Cluster(other),
     }
-    CtlError::Cluster(err)
 }
 
 #[cfg(test)]
@@ -460,10 +722,12 @@ mod tests {
     fn produce_parses_name_key_and_value() {
         let cli = parse(&["produce", "orders", "--key", "user-1", "--value", "hi"]).expect("valid");
         match cli.command {
-            Command::Produce { name, key, value } => {
+            Command::Produce {
+                name, key, value, ..
+            } => {
                 assert_eq!(name, "orders");
                 assert_eq!(key.as_deref(), Some("user-1"));
-                assert_eq!(value, "hi");
+                assert_eq!(value.as_deref(), Some("hi"));
             }
             other => panic!("expected produce, got {other:?}"),
         }
@@ -476,9 +740,12 @@ mod tests {
     }
 
     #[test]
-    fn produce_requires_a_value() {
-        // Without `--value` there is nothing to append, so it is a parse error.
-        assert!(parse(&["produce", "orders"]).is_err());
+    fn produce_value_is_optional_and_opens_the_repl() {
+        // Omitting `--value` is no longer a parse error: it selects the
+        // interactive REPL (value resolves to `None`), reading lines from stdin
+        // (Requirement 6.x).
+        let cli = parse(&["produce", "orders"]).expect("valid");
+        assert!(matches!(cli.command, Command::Produce { value: None, .. }));
     }
 
     #[test]
@@ -493,9 +760,10 @@ mod tests {
                 partition,
                 offset,
                 max,
+                ..
             } => {
                 assert_eq!(name, "orders");
-                assert_eq!(partition, 2);
+                assert_eq!(partition, Some(2));
                 assert_eq!(offset, 10);
                 assert_eq!(max, Some(50));
             }
@@ -517,9 +785,150 @@ mod tests {
     }
 
     #[test]
-    fn consume_requires_a_partition() {
-        // Consume targets an explicit partition; omitting it is a parse error.
-        assert!(parse(&["consume", "orders"]).is_err());
+    fn consume_partition_is_optional() {
+        // Omitting `--partition` consumes every partition of the topic, so it is
+        // no longer a parse error and resolves to `None` (Requirement 8.4).
+        let cli = parse(&["consume", "orders"]).expect("valid");
+        assert!(matches!(
+            cli.command,
+            Command::Consume {
+                partition: None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn produce_defaults_keyless_to_round_robin() {
+        // Omitting `--keyless` selects the round-robin default (Requirement 5.2).
+        let cli = parse(&["produce", "orders", "--value", "hi"]).expect("valid");
+        assert!(matches!(
+            cli.command,
+            Command::Produce {
+                keyless: KeylessStrategy::RoundRobin,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn produce_accepts_both_keyless_strategies() {
+        let round_robin = parse(&[
+            "produce",
+            "orders",
+            "--value",
+            "hi",
+            "--keyless",
+            "round-robin",
+        ])
+        .expect("valid round-robin strategy");
+        assert!(matches!(
+            round_robin.command,
+            Command::Produce {
+                keyless: KeylessStrategy::RoundRobin,
+                ..
+            }
+        ));
+
+        let sticky = parse(&["produce", "orders", "--value", "hi", "--keyless", "sticky"])
+            .expect("valid sticky strategy");
+        assert!(matches!(
+            sticky.command,
+            Command::Produce {
+                keyless: KeylessStrategy::Sticky { .. },
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn produce_rejects_an_unknown_keyless_strategy() {
+        // An unrecognized strategy is rejected at parse time (Requirement 5.2).
+        assert!(parse(&["produce", "orders", "--value", "hi", "--keyless", "bogus"]).is_err());
+    }
+
+    #[test]
+    fn consume_defaults_offset_reset_to_latest() {
+        // Omitting `--offset-reset` selects the latest default (Requirement 8.6).
+        let cli = parse(&["consume", "orders"]).expect("valid");
+        assert!(matches!(
+            cli.command,
+            Command::Consume {
+                offset_reset: OffsetReset::Latest,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn consume_accepts_both_offset_resets() {
+        let latest =
+            parse(&["consume", "orders", "--offset-reset", "latest"]).expect("valid latest");
+        assert!(matches!(
+            latest.command,
+            Command::Consume {
+                offset_reset: OffsetReset::Latest,
+                ..
+            }
+        ));
+
+        let earliest =
+            parse(&["consume", "orders", "--offset-reset", "earliest"]).expect("valid earliest");
+        assert!(matches!(
+            earliest.command,
+            Command::Consume {
+                offset_reset: OffsetReset::Earliest,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn consume_rejects_an_unknown_offset_reset() {
+        assert!(parse(&["consume", "orders", "--offset-reset", "bogus"]).is_err());
+    }
+
+    #[test]
+    fn consume_defaults_poll_interval_to_500ms() {
+        // Omitting `--poll-interval` applies the 500ms default (Requirement 9.5).
+        let cli = parse(&["consume", "orders"]).expect("valid");
+        assert!(matches!(
+            cli.command,
+            Command::Consume { poll_interval, .. } if poll_interval == Duration::from_millis(500)
+        ));
+    }
+
+    #[test]
+    fn consume_parses_poll_interval_milliseconds() {
+        let cli = parse(&["consume", "orders", "--poll-interval", "250"]).expect("valid");
+        assert!(matches!(
+            cli.command,
+            Command::Consume { poll_interval, .. } if poll_interval == Duration::from_millis(250)
+        ));
+    }
+
+    #[test]
+    fn consume_rejects_a_non_numeric_poll_interval() {
+        assert!(parse(&["consume", "orders", "--poll-interval", "soon"]).is_err());
+    }
+
+    #[test]
+    fn metadata_ttl_defaults_to_thirty_seconds() {
+        // Omitting `--metadata-ttl` applies the 30s default (Requirement 1.7).
+        let cli = parse(&["list"]).expect("valid");
+        assert_eq!(cli.metadata_ttl, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn metadata_ttl_parses_seconds_and_is_global() {
+        // The flag is global, so it is accepted after the subcommand too.
+        let cli = parse(&["list", "--metadata-ttl", "5"]).expect("valid");
+        assert_eq!(cli.metadata_ttl, Duration::from_secs(5));
+    }
+
+    #[test]
+    fn metadata_ttl_rejects_a_non_numeric_value() {
+        assert!(parse(&["--metadata-ttl", "soon", "list"]).is_err());
     }
 
     #[test]
@@ -657,6 +1066,62 @@ mod tests {
     }
 
     #[test]
+    fn topic_not_found_is_a_cluster_error() {
+        // A topic the cluster reports absent is a request-level rejection, not a
+        // connection failure (Requirement 1.4).
+        let err = ClientError::TopicNotFound {
+            topic: "orders".to_string(),
+        };
+        assert!(matches!(classify(err), CtlError::Cluster(_)));
+    }
+
+    #[test]
+    fn no_partitions_is_a_cluster_error() {
+        // A topic that never reported a partition before the discovery timeout is
+        // a cluster-side rejection reported non-zero (Requirement 1.8, 8.5).
+        let err = ClientError::NoPartitions {
+            topic: "orders".to_string(),
+        };
+        assert!(matches!(classify(err), CtlError::Cluster(_)));
+    }
+
+    #[test]
+    fn no_leader_after_retries_is_a_cluster_error() {
+        // Exhausting the redirect retry budget without reaching a leader is a
+        // cluster-side rejection, not a connection failure (Requirement 4.4).
+        let err = ClientError::NoLeaderAfterRetries {
+            topic: "orders".to_string(),
+            partition: 3,
+        };
+        assert!(matches!(classify(err), CtlError::Cluster(_)));
+    }
+
+    #[test]
+    fn unknown_node_is_a_connection_error_naming_the_node_and_id_url() {
+        // A resolved leader id with no known address is a fail-fast connection
+        // error whose message names the unresolved node id and points at the
+        // `id=url` endpoint fallback (Requirement 13.4, 13.6).
+        let err = ClientError::UnknownNode {
+            node: "node7".to_string(),
+            topic: "orders".to_string(),
+            partition: 2,
+        };
+        match classify(err) {
+            CtlError::Connection(msg) => {
+                assert!(
+                    msg.contains("node7"),
+                    "message should name the unresolved node id: {msg}"
+                );
+                assert!(
+                    msg.contains("id=url"),
+                    "message should point at the `id=url` fallback: {msg}"
+                );
+            }
+            other => panic!("expected a connection error, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn report_maps_outcomes_to_exit_codes() {
         // Smoke-check the mapping is wired; ExitCode is opaque, so we only assert
         // the call is total and does not panic for each variant.
@@ -692,9 +1157,10 @@ mod example_tests {
     use vela_proto::v1::vela_client_server::{VelaClient as VelaClientService, VelaClientServer};
     use vela_proto::v1::{
         ConsumeRequest, ConsumeResponse, CreateTopicRequest, CreateTopicResponse,
-        DeleteTopicRequest, DeleteTopicResponse, DescribeTopicRequest, DescribeTopicResponse,
-        FindLeaderRequest, FindLeaderResponse, ListTopicsRequest, ListTopicsResponse, LogBackend,
-        PartitionInfo, ProduceRequest, ProduceResponse, TopicInfo,
+        DeleteTopicRequest, DeleteTopicResponse, DescribeClusterRequest, DescribeClusterResponse,
+        DescribeTopicRequest, DescribeTopicResponse, FindLeaderRequest, FindLeaderResponse,
+        ListTopicsRequest, ListTopicsResponse, LogBackend, PartitionInfo, ProduceRequest,
+        ProduceResponse, TopicInfo,
     };
 
     /// An in-process fake of the client-facing `VelaClient` service.
@@ -810,6 +1276,19 @@ mod example_tests {
             }))
         }
 
+        // The admin CLI does not seed its registry from `DescribeCluster`; return
+        // an empty membership so the generated service trait is satisfied (the
+        // RPC was added to `VelaClient` in task 7.1).
+        async fn describe_cluster(
+            &self,
+            _request: Request<DescribeClusterRequest>,
+        ) -> Result<Response<DescribeClusterResponse>, Status> {
+            Ok(Response::new(DescribeClusterResponse {
+                members: vec![],
+                epoch: 0,
+            }))
+        }
+
         // Produce/Consume are not exercised by the admin CLI; stub them out.
         async fn produce(
             &self,
@@ -872,6 +1351,7 @@ mod example_tests {
     fn cli(endpoint: String, command: Command) -> Cli {
         Cli {
             endpoints: vec![endpoint],
+            metadata_ttl: std::time::Duration::from_secs(30),
             command,
         }
     }

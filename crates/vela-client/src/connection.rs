@@ -39,18 +39,25 @@ impl ConnectionManager {
     /// that cannot be parsed into an endpoint URI yields
     /// [`ClientError::InvalidAddress`].
     pub fn channel(&self, addr: &str) -> Result<Channel> {
+        // Normalize to a dialable URL. A configured `id=url` Endpoint already
+        // carries a scheme (`http://host:port`), but an address learned from the
+        // server's `Member_Address_Map` (and a peer's `FindLeader` hint) is a
+        // bare transport address (`host:port`), which `Endpoint::from_shared`
+        // rejects for lack of a scheme. Prepend `http://` when no scheme is
+        // present so both forms dial the same node, and key the channel cache on
+        // the normalized URL so the two forms share one connection.
+        let url = normalize_addr(addr);
         let mut channels = self.lock();
-        if let Some(channel) = channels.get(addr) {
+        if let Some(channel) = channels.get(&url) {
             return Ok(channel.clone());
         }
-        let endpoint = Endpoint::from_shared(addr.to_string()).map_err(|source| {
-            ClientError::InvalidAddress {
+        let endpoint =
+            Endpoint::from_shared(url.clone()).map_err(|source| ClientError::InvalidAddress {
                 addr: addr.to_string(),
                 source,
-            }
-        })?;
+            })?;
         let channel = endpoint.connect_lazy();
-        channels.insert(addr.to_string(), channel.clone());
+        channels.insert(url, channel.clone());
         Ok(channel)
     }
 
@@ -58,6 +65,25 @@ impl ConnectionManager {
         self.channels
             .lock()
             .expect("connection manager mutex poisoned")
+    }
+}
+
+/// Ensure `addr` is a dialable URL by prepending `http://` when it carries no
+/// `http`/`https` scheme.
+///
+/// Configured `id=url` Endpoints already include a scheme and pass through
+/// unchanged; bare `host:port` transport addresses (from the server's
+/// `Member_Address_Map` or a `FindLeader` leader hint) gain the default
+/// `http://` scheme so they can be parsed into a tonic [`Endpoint`].
+///
+/// Exposed within the crate so leader resolution can de-duplicate its probe set
+/// by each node's dialable form, treating a configured `http://host:port` and a
+/// discovered bare `host:port` as the same node.
+pub(crate) fn normalize_addr(addr: &str) -> String {
+    if addr.starts_with("http://") || addr.starts_with("https://") {
+        addr.to_string()
+    } else {
+        format!("http://{addr}")
     }
 }
 
@@ -92,10 +118,45 @@ impl NodeRegistry {
         addrs.insert(node_id.into(), addr.into());
     }
 
+    /// Record the address for `node_id` only if it is not already known,
+    /// returning `true` when the entry was added.
+    ///
+    /// Used to seed addresses learned from the server's `Member_Address_Map`
+    /// without clobbering an operator-supplied `id=url` Endpoint. The configured
+    /// endpoints are authoritative: only the operator knows how their client
+    /// reaches each node (e.g. through published ports / NAT), whereas the
+    /// cluster's self-reported member addresses are its *internal* view (a bind
+    /// address like `0.0.0.0:7001`, or a peer hostname only resolvable inside the
+    /// cluster network). Discovery therefore *fills gaps* — ids the operator did
+    /// not supply — rather than overriding a working configured address.
+    pub fn insert_if_absent(&self, node_id: impl Into<String>, addr: impl Into<String>) -> bool {
+        use std::collections::hash_map::Entry;
+        let mut addrs = self.lock();
+        match addrs.entry(node_id.into()) {
+            Entry::Occupied(_) => false,
+            Entry::Vacant(slot) => {
+                slot.insert(addr.into());
+                true
+            }
+        }
+    }
+
     /// Resolve a node id to its address, if known.
     pub fn addr_of(&self, node_id: &str) -> Option<String> {
         let addrs = self.lock();
         addrs.get(node_id).cloned()
+    }
+
+    /// A snapshot of every known node address, in arbitrary order.
+    ///
+    /// Used by leader resolution to probe not just the configured bootstrap
+    /// endpoints but every member the client has learned of (via cluster
+    /// discovery), so a partition's leader can be found even when no bootstrap
+    /// node hosts that partition's replica. Order is unspecified (the backing
+    /// map is unordered); callers must not depend on it.
+    pub fn addrs(&self) -> Vec<String> {
+        let addrs = self.lock();
+        addrs.values().cloned().collect()
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, String>> {
@@ -126,6 +187,23 @@ mod tests {
         let _ = manager.channel("http://node-a:50051").expect("valid uri");
         let _ = manager.channel("http://node-b:50051").expect("valid uri");
         assert_eq!(manager.channels.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn schemeless_and_id_url_forms_share_one_channel() {
+        // A bare `host:port` (as learned from the server's Member_Address_Map)
+        // and the equivalent `http://host:port` (a configured id=url Endpoint)
+        // normalize to the same URL, so they dial the same node and share a
+        // single cached channel rather than failing to parse or duplicating.
+        let manager = ConnectionManager::new();
+        let bare = manager
+            .channel("node-a:50051")
+            .expect("bare host:port dials");
+        let with_scheme = manager
+            .channel("http://node-a:50051")
+            .expect("id=url form dials");
+        drop((bare, with_scheme));
+        assert_eq!(manager.channels.lock().unwrap().len(), 1);
     }
 
     #[test]

@@ -89,6 +89,7 @@ fn config(node_id: &str, addr: SocketAddr, peers: &[&str], rf: u32) -> Config {
     Config::from_cli(CliArgs {
         node_id: Some(node_id.to_string()),
         listen_addr: Some(addr.to_string()),
+        advertised_addr: None,
         peers: peers.iter().map(|p| p.to_string()).collect(),
         replication_factor: Some(rf.to_string()),
         data_dir: Some(unique_data_dir()),
@@ -380,6 +381,7 @@ async fn sync_metadata_is_a_reserved_no_op_and_does_not_adopt() {
         members: vec![v1::Member {
             id: "node-a".to_string(),
             addr: addr.to_string(),
+            advertised_addr: addr.to_string(),
             availability: v1::NodeAvailability::Available as i32,
         }],
         topics: vec![v1::TopicInfo {

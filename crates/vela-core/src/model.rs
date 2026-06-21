@@ -143,14 +143,23 @@ pub enum NodeAvailability {
     Unavailable,
 }
 
-/// A member node of the cluster: its identity, network address, and current
-/// availability (Requirement 9.3).
+/// A member node of the cluster: its identity, internal/bind transport
+/// address, client-reachable advertised address, and current availability
+/// (Requirement 9.3, advertised-listeners 3.1).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Member {
     /// The member's stable identity.
     pub id: NodeId,
-    /// The member's network address (host:port).
+    /// The member's internal / bind transport address (host:port) — the
+    /// Listen_Address its gRPC listener binds on. Carried on the wire `addr`
+    /// field.
     pub addr: String,
+    /// The member's client-reachable advertised address (host:port). Distinct
+    /// from [`addr`](Self::addr): `addr` is the internal/bind address, while
+    /// this is the address clients dial. Equals `addr` when an advertised
+    /// address is not separately configured. Carried on the wire
+    /// `advertised_addr` field.
+    pub advertised_addr: String,
     /// Whether the member is currently available or unavailable.
     pub availability: NodeAvailability,
 }
@@ -262,11 +271,29 @@ mod tests {
         let member = Member {
             id: NodeId::new("node-a"),
             addr: "127.0.0.1:7001".to_string(),
+            advertised_addr: "127.0.0.1:7001".to_string(),
             availability: NodeAvailability::Available,
         };
         assert_eq!(member.id, NodeId::new("node-a"));
         assert_eq!(member.addr, "127.0.0.1:7001");
+        assert_eq!(member.advertised_addr, "127.0.0.1:7001");
         assert_eq!(member.availability, NodeAvailability::Available);
+    }
+
+    #[test]
+    fn member_retains_distinct_addr_and_advertised_addr() {
+        // The bind/Listen_Address and the client-reachable advertised address
+        // are independent fields: a member built with differing values must
+        // read both back unconflated (advertised-listeners 3.1, 3.2).
+        let member = Member {
+            id: NodeId::new("node-a"),
+            addr: "0.0.0.0:7001".to_string(),
+            advertised_addr: "127.0.0.1:7002".to_string(),
+            availability: NodeAvailability::Available,
+        };
+        assert_eq!(member.addr, "0.0.0.0:7001");
+        assert_eq!(member.advertised_addr, "127.0.0.1:7002");
+        assert_ne!(member.addr, member.advertised_addr);
     }
 
     #[test]

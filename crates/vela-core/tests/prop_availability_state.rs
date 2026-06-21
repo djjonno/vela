@@ -40,6 +40,7 @@ fn cluster(initial: &[NodeAvailability]) -> ClusterMetadata {
         .map(|(i, &availability)| Member {
             id: NodeId::new(format!("node-{i}")),
             addr: format!("node-{i}:7001"),
+            advertised_addr: format!("node-{i}:7001"),
             availability,
         })
         .collect();

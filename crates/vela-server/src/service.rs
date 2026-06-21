@@ -384,6 +384,36 @@ impl VelaClient for VelaClientService {
             leader: leader.map(|n| n.0),
         }))
     }
+
+    async fn describe_cluster(
+        &self,
+        _request: Request<v1::DescribeClusterRequest>,
+    ) -> Result<Response<v1::DescribeClusterResponse>, Status> {
+        // Expose the current cluster membership so a programmatic client can
+        // seed its node registry (node id -> transport address) for
+        // leader-directed routing (Requirement 12.7, 12.8, 13.1).
+        //
+        // The reply is built from the served [`ClusterMetadata`] view — the same
+        // catalogue every other client RPC reads — because that view is the only
+        // place a node's membership actually lives: it is seeded with this node
+        // at startup and grown by the membership subsystem as peers are learned
+        // (`crate::membership`). The durable `MetadataController`'s metadata
+        // carries only the committed topic catalogue (no `ClusterCommand` adds a
+        // member), so it would report no addresses. Each member maps through the
+        // shared `member_to_proto` (id + addr + availability), and the `epoch` is
+        // the served view's applied-change epoch the membership was observed at
+        // (Requirement 12.8), matching the read-only epoch `SyncMetadata` returns.
+        let metadata = self.node.metadata.lock().expect("metadata mutex poisoned");
+        let members = metadata
+            .members
+            .iter()
+            .map(convert::member_to_proto)
+            .collect();
+        Ok(Response::new(v1::DescribeClusterResponse {
+            members,
+            epoch: metadata.epoch,
+        }))
+    }
 }
 
 /// The server-to-server gRPC service (Raft RPCs, membership, metadata).
@@ -647,6 +677,7 @@ mod tests {
         metadata.members.push(Member {
             id: NodeId::new(self_id),
             addr: "127.0.0.1:7001".to_string(),
+            advertised_addr: "127.0.0.1:7001".to_string(),
             availability: NodeAvailability::Available,
         });
         metadata.topics.insert(
@@ -871,6 +902,37 @@ mod tests {
         assert_eq!(
             response.leader, None,
             "FindLeader indicates no current leader when none is elected (Req 8.2)"
+        );
+    }
+
+    /// Requirement 12.7, 12.8: `DescribeCluster` returns each known member's id,
+    /// transport address, and availability from the served membership view, plus
+    /// the metadata epoch the view was observed at, so a client can seed its node
+    /// registry for leader-directed routing.
+    #[tokio::test]
+    async fn describe_cluster_returns_members_and_epoch() {
+        // `node_hosting` seeds the served metadata with this node as an available
+        // member at a known transport address.
+        let driver = MockDriver::reporting(Some("node-a")).spawn();
+        let node = node_hosting("node-a", "orders", 0, None, driver);
+        node.metadata.lock().expect("metadata mutex poisoned").epoch = 7;
+        let service = VelaClientService::new(node);
+
+        let response = service
+            .describe_cluster(Request::new(v1::DescribeClusterRequest {}))
+            .await
+            .expect("describe_cluster succeeds")
+            .into_inner();
+
+        assert_eq!(response.epoch, 7, "the reply carries the metadata epoch");
+        assert_eq!(response.members.len(), 1, "the seeded member is returned");
+        let member = &response.members[0];
+        assert_eq!(member.id, "node-a");
+        assert_eq!(member.addr, "127.0.0.1:7001");
+        assert_eq!(
+            member.availability,
+            v1::NodeAvailability::Available as i32,
+            "availability is carried through (Req 12.7)"
         );
     }
 }

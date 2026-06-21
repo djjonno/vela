@@ -99,6 +99,22 @@ impl PeerPool {
     }
 }
 
+#[cfg(test)]
+impl PeerPool {
+    /// Test-only: read back the transport address registered for `id`, if any.
+    ///
+    /// Used by the membership tests to assert a peer is dialed over its
+    /// **bind** address (`Peer::addr`) and never its client-facing advertised
+    /// address (advertised-listeners 4.1).
+    pub(crate) fn peer_addr(&self, id: RaftNodeId) -> Option<String> {
+        self.addrs
+            .lock()
+            .expect("peer pool addr mutex poisoned")
+            .get(&id)
+            .cloned()
+    }
+}
+
 /// The [`Transport`](vela_raft::Transport) adapter for one partition replica.
 pub struct GrpcTransport {
     /// The topic this transport stamps onto outbound RPCs.

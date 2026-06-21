@@ -62,6 +62,7 @@ fn metadata_with_topic(
     meta.members = vec![Member {
         id: NodeId::new("node-0"),
         addr: "node-0:7001".to_string(),
+        advertised_addr: "node-0:7001".to_string(),
         availability: NodeAvailability::Available,
     }];
     let partitions = (0..partition_count)

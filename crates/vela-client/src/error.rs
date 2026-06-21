@@ -80,6 +80,23 @@ pub enum ClientError {
         /// The unrecognized backend value supplied by the caller.
         value: String,
     },
+
+    /// The topic does not exist (`DescribeTopic` / routing reported it absent).
+    /// Surfaced to the CLI as a topic-not-found error with a non-zero exit
+    /// (Requirement 1.4).
+    #[error("topic `{topic}` not found")]
+    TopicNotFound {
+        /// The topic name that could not be found.
+        topic: String,
+    },
+
+    /// The topic exists but reports zero partitions and none appeared before the
+    /// discovery timeout elapsed (Requirement 1.8, 8.5).
+    #[error("topic `{topic}` has no partitions after discovery timeout")]
+    NoPartitions {
+        /// The topic name that reported no partitions.
+        topic: String,
+    },
 }
 
 impl From<tonic::Status> for ClientError {

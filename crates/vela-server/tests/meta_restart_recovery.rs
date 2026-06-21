@@ -133,6 +133,7 @@ fn config(
     Config::from_cli(CliArgs {
         node_id: Some(node_id.to_string()),
         listen_addr: Some(addr.to_string()),
+        advertised_addr: None,
         peers,
         replication_factor: Some("3".to_string()),
         data_dir: Some(data_dir.to_string_lossy().into_owned()),

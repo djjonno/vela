@@ -62,6 +62,7 @@ fn member(id: &str) -> Member {
     Member {
         id: NodeId::new(id),
         addr: format!("{id}:7001"),
+        advertised_addr: format!("{id}:7001"),
         availability: NodeAvailability::Available,
     }
 }
