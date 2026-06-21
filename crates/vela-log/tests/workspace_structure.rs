@@ -3,9 +3,9 @@
 //! This test parses the workspace and member manifests directly (no build-graph
 //! introspection) and asserts two structural invariants from the requirements:
 //!
-//! * The workspace root declares **exactly eight** member crates (Requirement
+//! * The workspace root declares **exactly nine** member crates (Requirement
 //!   1.1) — the original seven plus `vela-sim`, the deterministic-simulation
-//!   harness crate.
+//!   harness crate, and `vela-bench`, the throughput-benchmark crate.
 //! * The innermost crates `vela-log` and `vela-raft` declare **no forbidden
 //!   (outward) Vela dependencies** — `vela-log` depends on no other Vela crate,
 //!   and `vela-raft` depends only on `vela-log` (Requirements 1.2, 1.4).
@@ -18,10 +18,11 @@ use std::path::{Path, PathBuf};
 
 /// The exact set of member crates the workspace must declare (Requirement 1.1).
 ///
-/// `vela-sim` is the deterministic-simulation harness crate; it is a legitimate
-/// workspace member that depends inward only (`vela-core → vela-raft →
-/// vela-log`) and never on `vela-server`.
-const EXPECTED_MEMBERS: [&str; 8] = [
+/// `vela-sim` is the deterministic-simulation harness crate and `vela-bench` is
+/// the throughput-benchmark crate; both are legitimate workspace members that
+/// depend inward only (`vela-core → vela-raft → vela-log`) and never on
+/// `vela-server`.
+const EXPECTED_MEMBERS: [&str; 9] = [
     "crates/vela-log",
     "crates/vela-raft",
     "crates/vela-proto",
@@ -30,10 +31,11 @@ const EXPECTED_MEMBERS: [&str; 8] = [
     "crates/vela-client",
     "crates/vela-ctl",
     "crates/vela-sim",
+    "crates/vela-bench",
 ];
 
 /// Every Vela crate name, used to detect outward (forbidden) dependency edges.
-const VELA_CRATES: [&str; 8] = [
+const VELA_CRATES: [&str; 9] = [
     "vela-log",
     "vela-raft",
     "vela-proto",
@@ -42,6 +44,7 @@ const VELA_CRATES: [&str; 8] = [
     "vela-client",
     "vela-ctl",
     "vela-sim",
+    "vela-bench",
 ];
 
 /// Resolve the workspace root from this crate's manifest directory.
@@ -144,15 +147,15 @@ fn parse_dependency_names(manifest: &str) -> Vec<String> {
 }
 
 #[test]
-fn workspace_declares_exactly_eight_expected_members() {
+fn workspace_declares_exactly_nine_expected_members() {
     let root = workspace_root();
     let manifest = read_manifest(&root.join("Cargo.toml"));
     let members = parse_workspace_members(&manifest);
 
     assert_eq!(
         members.len(),
-        8,
-        "workspace must declare exactly eight member crates, found {}: {:?}",
+        9,
+        "workspace must declare exactly nine member crates, found {}: {:?}",
         members.len(),
         members
     );

@@ -1,0 +1,71 @@
+[package]
+name = "vela-bench"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# The benchmark logic lives in a library target so the pure-logic modules
+# (params, workload, metrics, verify, outcome, report, html) are reachable from
+# the property-based tests under `tests/` (a binary crate's modules are not).
+# The binary below is a thin entry point over this library, mirroring the
+# `vela-ctl` split.
+[lib]
+name = "vela_bench"
+path = "src/lib.rs"
+
+# Produces the `vela-bench` binary: a distinct, buildable CI artifact
+# (Requirement 8.4) separate from the server, client, and operator CLI.
+[[bin]]
+name = "vela-bench"
+path = "src/main.rs"
+
+# `vela-bench` is a leaf application crate: nothing depends on it, so its edges
+# onto both the client and the server do not invert the core graph's
+# inward-pointing rule — it sits above everything, like a test/operator harness
+# (Requirement 3.1). It drives the measured surface (`vela-client`), names the
+# record types (`vela-proto`), and starts the in-process Cluster_Under_Test
+# (`vela-server`).
+[dependencies]
+vela-client.workspace = true
+vela-proto.workspace = true
+vela-server.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+# CLI argument parsing (derive API) with env-var support, matching `vela-ctl`.
+clap = { version = "4.5.23", features = ["derive", "env"] }
+# Async runtime: the harness is async, the produce/consume phases drive async
+# client calls, `time` backs the per-run time-budget `timeout`, and `sync` backs
+# cross-task coordination during the phases.
+tokio = { version = "1.43.0", features = [
+    "rt-multi-thread",
+    "macros",
+    "time",
+    "sync",
+] }
+# `buffer_unordered` keeps up to `producer_concurrency` produce requests in
+# flight during the Producer_Phase (Requirement 4.4).
+futures = "0.3.31"
+# `async fn` in the `Cluster` trait (the topology seam) — keeps the trait usable
+# behind a swappable in-process / fake implementation. Pinned to the version
+# already resolved in the workspace lockfile (transitively via tonic).
+async-trait = "0.1.89"
+# Structured Benchmark_Report model + machine-readable JSON emission
+# (Requirement 6.1, 6.2).
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.133"
+
+[dev-dependencies]
+# Property-based tests for the pure-logic modules (>=100 iterations each).
+proptest.workspace = true
+# `test-util` enables the paused-clock helpers used to exercise time-budget /
+# startup-budget behavior deterministically in tests.
+tokio = { version = "1.43.0", features = [
+    "rt",
+    "rt-multi-thread",
+    "macros",
+    "time",
+    "sync",
+    "test-util",
+] }

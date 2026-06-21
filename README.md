@@ -61,7 +61,8 @@ crates/
 ├── vela-server/   # node daemon (`velad`): wires raft groups to gRPC services
 ├── vela-client/   # client library: producer, consumer, admin
 ├── vela-ctl/      # CLI control tool
-└── vela-sim/      # deterministic simulation testing harness (in-process multi-node cluster)
+├── vela-sim/      # deterministic simulation testing harness (in-process multi-node cluster)
+└── vela-bench/    # throughput benchmark (`vela-bench`): end-to-end produce/consume measurement
 ```
 
 > Status: early-stage. Source is being built out; the layout above is the target.
@@ -149,6 +150,62 @@ PROPTEST_CASES=1000 cargo test -p vela-sim --features sim
 
 Each run is bounded by an event budget (`DEFAULT_MAX_EVENTS`, 200,000) and a
 virtual-time budget so a simulation always terminates.
+
+### Throughput Benchmark
+
+`vela-bench` measures Vela's end-to-end produce and consume throughput. It is a
+self-contained binary: it stands up an **in-process single-node cluster**, drives
+a configurable workload through the public `vela-client` Producer/Consumer APIs,
+verifies that every produced record is read back, and emits three coordinated
+outputs from one run — a machine-readable JSON report, a human-readable stdout
+summary, and a self-contained HTML report. The process exits `0` on a passing
+run and non-zero on a failing one (an operation error, a data-integrity
+violation, an exceeded time budget, or a breached throughput floor).
+
+You do **not** need to start a server first — the benchmark owns its cluster for
+the duration of the run.
+
+```bash
+# Run with the documented defaults (prints a summary to stdout)
+cargo run -p vela-bench --release
+
+# Write the JSON and HTML reports to disk
+cargo run -p vela-bench --release -- \
+  --report-json target/bench/report.json \
+  --report-html target/bench/report.html
+
+# A small, quick run
+cargo run -p vela-bench --release -- \
+  --record-count 1000 --value-size 128 --partition-count 2 --time-budget-secs 30
+```
+
+The workload is configurable via flags (each also reads from a `VELA_BENCH_*`
+environment variable; run `cargo run -p vela-bench -- --help` for the full list):
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--record-count <u64>` | 100000 | records to produce and consume |
+| `--value-size <bytes>` | 256 | payload size per record |
+| `--key-mode <keyed\|keyless>` | keyless | keyed partition routing or keyless |
+| `--partition-count <u32>` | 4 | target topic partitions |
+| `--producer-concurrency <u32>` | 16 | produce requests kept in flight |
+| `--topic <string>` | vela-bench | target topic name |
+| `--warmup <u64>` | 0 | leading ops excluded from the measurement window |
+| `--time-budget-secs <u64>` | 60 | overall run budget (1–86,400) |
+| `--startup-budget-secs <u64>` | 60 | cluster-readiness budget (1–600) |
+| `--floor-produce-rps <f64>` | — | fail if measured produce records/s is below this |
+| `--floor-consume-rps <f64>` | — | fail if measured consume records/s is below this |
+| `--report-json <path>` | — | write the JSON report to this path |
+| `--report-html <path>` | — | write the HTML report to this path |
+
+Throughput on shared/CI hardware varies run to run, so the benchmark is treated
+as a continuously exercised, regression-detecting measurement rather than a
+precise performance gate: a run fails on **errors**, **data-integrity**
+violations, or the **time budget** — and only on throughput when an explicit
+floor is configured. The benchmark runs in CI as a distinct `benchmark` job
+(see [`.github/workflows/ci.yml`](.github/workflows/ci.yml)) on every push and
+pull request to `main`, which publishes the JSON and HTML reports as build
+artifacts.
 
 ## Roadmap
 

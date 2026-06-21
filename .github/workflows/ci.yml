@@ -96,3 +96,51 @@ jobs:
             crates/vela-sim/proptest-regressions/
             target/dst-artifacts/
           if-no-files-found: ignore
+
+  benchmark:
+    name: benchmark
+    runs-on: ubuntu-latest
+    # Hard wall-clock cap for the Benchmark_Job. The run itself is bounded by
+    # `--time-budget-secs 120` (well under the 300s CI budget); this 30-minute
+    # ceiling is the outer safety net required so a stuck run fails the job.
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build vela-bench (release)
+        run: cargo build -p vela-bench --release --locked
+      - name: Prepare report directory
+        run: mkdir -p target/bench
+      - name: Run throughput benchmark
+        # CI-designated, bounded Workload_Parameters sized to finish well under
+        # the 120s time budget on a shared runner. A failing Outcome (operation
+        # error, integrity failure, or time-budget breach) exits non-zero and
+        # fails the job. No throughput floors are configured: on a noisy shared
+        # runner the job is gated only on errors / integrity / time budget.
+        run: |
+          ./target/release/vela-bench \
+            --record-count 50000 \
+            --value-size 256 \
+            --partition-count 4 \
+            --producer-concurrency 16 \
+            --warmup 1000 \
+            --time-budget-secs 120 \
+            --startup-budget-secs 60 \
+            --topic vela-bench-ci \
+            --report-json target/bench/report.json \
+            --report-html target/bench/report.html
+      - name: Upload benchmark reports
+        # Publish both reports regardless of Outcome (Requirement 7.4). This
+        # upload does not mask a failing run: the benchmark step above still
+        # fails the job on a non-zero exit.
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: throughput-benchmark-report
+          path: |
+            target/bench/report.json
+            target/bench/report.html
+          retention-days: 7
+          if-no-files-found: error
