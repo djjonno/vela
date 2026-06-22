@@ -76,9 +76,6 @@ pub struct InProcessCluster {
     node_id: String,
     /// The address the in-process server's gRPC listener is bound on.
     addr: SocketAddr,
-    /// The unique data directory backing this node's durable partition logs;
-    /// removed on shutdown (best effort).
-    data_dir: PathBuf,
     /// Handle to the background `serve` task, aborted on shutdown.
     handle: JoinHandle<()>,
 }
@@ -130,7 +127,6 @@ impl InProcessCluster {
         Ok(Self {
             node_id,
             addr,
-            data_dir,
             handle,
         })
     }
@@ -172,17 +168,18 @@ impl Cluster for InProcessCluster {
         }
     }
 
-    /// Abort the background `serve` task and remove the node's data directory.
+    /// Abort the background `serve` task and tear the cluster down.
     ///
-    /// Aborting the task drops the bound listener and tears the server down;
-    /// directory removal is best effort (a failure to clean up a temp directory
-    /// is not a benchmark failure).
+    /// Aborting only cancels the top-level `serve` task; the per-partition Raft
+    /// driver tasks it spawned keep running briefly and may still read their
+    /// durable logs by path as they wind down. Removing the data directory here
+    /// would therefore race those still-live readers and trip the WAL's
+    /// fail-stop on a vanished segment file. So the per-run data directory —
+    /// a unique path under the system temp dir — is intentionally left in place
+    /// for the OS temp reaper to reclaim, exactly as the `vela-server`
+    /// integration tests do for the same reason.
     async fn shutdown(self) -> Result<(), BenchError> {
         self.handle.abort();
-        // Best-effort, non-blocking-enough cleanup of a small temp directory;
-        // a synchronous `std::fs` call avoids pulling in tokio's `fs` feature
-        // for what is a fire-and-forget teardown step.
-        let _ = std::fs::remove_dir_all(&self.data_dir);
         Ok(())
     }
 }
