@@ -215,7 +215,7 @@ environment variable; run `cargo run -p vela-bench -- --help` for the full list)
 | `--floor-consume-rps <f64>` | — | fail if measured consume records/s is below this |
 | `--report-json <path>` | — | write the JSON report to this path |
 | `--report-html <path>` | — | write the HTML report to this path |
-| `--endpoints <list>` | — | comma-separated live cluster endpoints (`host:port`, `http://host:port`, or `id@addr`); when omitted, an in-process cluster is used |
+| `--endpoints <list>` | — | comma-separated live cluster endpoints (`host:port`, `http://host:port`, or `id=url`); when omitted, an in-process cluster is used |
 
 Throughput on shared/CI hardware varies run to run, so the benchmark is treated
 as a continuously exercised, regression-detecting measurement rather than a

@@ -153,8 +153,10 @@ pub struct Cli {
     #[arg(long, value_name = "PATH", env = "VELA_BENCH_REPORT_HTML")]
     pub report_html: Option<PathBuf>,
 
-    /// Live cluster endpoint(s) to benchmark against, comma-separated — each
-    /// `host:port`, `http://host:port`, or `id@addr`. When omitted, the
+    /// Live cluster endpoint(s) to benchmark against, comma-separated — each a
+    /// bare address (`host:port` or `http://host:port`) or an `id=url` pair
+    /// (e.g. `node1=http://127.0.0.1:7001`), matching the `vela-ctl`
+    /// convention. When omitted, the
     /// benchmark starts its own in-process single-node cluster instead. Not
     /// part of the validated workload; it selects the Cluster_Under_Test, so it
     /// is surfaced separately for the entry point.
@@ -309,7 +311,7 @@ mod tests {
         let parsed = Cli::try_parse_from([
             "vela-bench",
             "--endpoints",
-            "127.0.0.1:7001,http://127.0.0.1:7002,node3@127.0.0.1:7003",
+            "127.0.0.1:7001,http://127.0.0.1:7002,node3=127.0.0.1:7003",
         ])
         .expect("a comma-separated --endpoints list parses");
         assert_eq!(
@@ -317,7 +319,7 @@ mod tests {
             vec![
                 "127.0.0.1:7001".to_string(),
                 "http://127.0.0.1:7002".to_string(),
-                "node3@127.0.0.1:7003".to_string(),
+                "node3=127.0.0.1:7003".to_string(),
             ]
         );
         // The endpoints selector is not part of the validated workload.

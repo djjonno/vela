@@ -206,12 +206,14 @@ pub struct ExternalCluster {
 impl ExternalCluster {
     /// Build a cluster handle from caller-supplied `endpoints`.
     ///
-    /// Each endpoint is `host:port`, `http://host:port`, or `id@addr` (the `id`
-    /// half is an optional bootstrap node-id label; without it the normalized
-    /// URL doubles as the label). A bare `host:port` is normalized to an
-    /// `http://` URL so it can be handed straight to `VelaClient::new`. Returns
-    /// [`BenchError::ClusterStartup`] when `endpoints` is empty or an entry is
-    /// blank.
+    /// Each endpoint is a bare address (`host:port` or `http://host:port`) or an
+    /// `id=url` pair (e.g. `node1=http://127.0.0.1:7001`), matching the
+    /// `vela-ctl` convention. A bare `host:port` is normalized to an `http://`
+    /// URL so it can be handed straight to `VelaClient::new`; with no explicit
+    /// `id=` prefix the normalized URL doubles as the bootstrap label (cluster
+    /// discovery then seeds the real node ids, so the label only needs to be
+    /// unique). Returns [`BenchError::ClusterStartup`] when `endpoints` is empty
+    /// or an entry is blank.
     pub fn new(endpoints: &[String]) -> Result<Self, BenchError> {
         if endpoints.is_empty() {
             return Err(BenchError::ClusterStartup {
@@ -226,9 +228,9 @@ impl ExternalCluster {
                     detail: "an --endpoints entry was empty".to_string(),
                 });
             }
-            // Optional `id@addr` form: an explicit label before `@`, otherwise
-            // the normalized URL doubles as the bootstrap label.
-            let (label, addr) = match raw.split_once('@') {
+            // Optional `id=url` form (the vela-ctl convention): an explicit label
+            // before `=`, otherwise the normalized URL doubles as the label.
+            let (label, addr) = match raw.split_once('=') {
                 Some((id, addr)) if !id.is_empty() && !addr.is_empty() => {
                     (Some(id.to_string()), addr)
                 }
@@ -385,11 +387,23 @@ mod tests {
 
     #[test]
     fn external_cluster_honors_explicit_id_label() {
-        let cluster = ExternalCluster::new(&["node1@127.0.0.1:7001".to_string()])
-            .expect("an id@addr endpoint builds a cluster");
+        let cluster = ExternalCluster::new(&["node1=http://127.0.0.1:7001".to_string()])
+            .expect("an id=url endpoint builds a cluster");
         assert_eq!(
             cluster.bootstrap(),
             vec![("node1".to_string(), "http://127.0.0.1:7001".to_string())]
+        );
+    }
+
+    #[test]
+    fn external_cluster_normalizes_bare_address_in_an_id_pair() {
+        // The url half of an `id=url` pair is normalized too: a bare host:port
+        // gains the http:// scheme.
+        let cluster = ExternalCluster::new(&["node2=127.0.0.1:7002".to_string()])
+            .expect("an id=host:port endpoint builds a cluster");
+        assert_eq!(
+            cluster.bootstrap(),
+            vec![("node2".to_string(), "http://127.0.0.1:7002".to_string())]
         );
     }
 
