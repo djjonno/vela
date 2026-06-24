@@ -184,6 +184,112 @@ impl Cluster for InProcessCluster {
     }
 }
 
+/// A live, externally-managed Cluster_Under_Test the benchmark connects to via
+/// caller-supplied endpoints (the `--endpoints` flag).
+///
+/// Unlike [`InProcessCluster`], the benchmark neither starts nor stops this
+/// cluster — it only seeds a [`VelaClient`](vela_client::VelaClient) with the
+/// given bootstrap endpoints and drives produce/consume traffic against the
+/// already-running deployment (e.g. the docker-compose cluster). The client
+/// then discovers the full membership and per-partition leaders itself via the
+/// cluster's `DescribeCluster`/`FindLeader` RPCs, so the bootstrap node-id
+/// labels are placeholders that real ids learned from discovery supersede.
+/// [`shutdown`](Cluster::shutdown) is therefore a no-op: the benchmark must not
+/// tear down a cluster it did not start.
+#[derive(Debug, Clone)]
+pub struct ExternalCluster {
+    /// Bootstrap `(node_id, url)` pairs seeded into the client, one per supplied
+    /// endpoint. Each `url` is a client-dialable `http://host:port`.
+    bootstrap: Vec<(String, String)>,
+}
+
+impl ExternalCluster {
+    /// Build a cluster handle from caller-supplied `endpoints`.
+    ///
+    /// Each endpoint is `host:port`, `http://host:port`, or `id@addr` (the `id`
+    /// half is an optional bootstrap node-id label; without it the normalized
+    /// URL doubles as the label). A bare `host:port` is normalized to an
+    /// `http://` URL so it can be handed straight to `VelaClient::new`. Returns
+    /// [`BenchError::ClusterStartup`] when `endpoints` is empty or an entry is
+    /// blank.
+    pub fn new(endpoints: &[String]) -> Result<Self, BenchError> {
+        if endpoints.is_empty() {
+            return Err(BenchError::ClusterStartup {
+                detail: "no --endpoints supplied for an external cluster".to_string(),
+            });
+        }
+        let mut bootstrap = Vec::with_capacity(endpoints.len());
+        for raw in endpoints {
+            let raw = raw.trim();
+            if raw.is_empty() {
+                return Err(BenchError::ClusterStartup {
+                    detail: "an --endpoints entry was empty".to_string(),
+                });
+            }
+            // Optional `id@addr` form: an explicit label before `@`, otherwise
+            // the normalized URL doubles as the bootstrap label.
+            let (label, addr) = match raw.split_once('@') {
+                Some((id, addr)) if !id.is_empty() && !addr.is_empty() => {
+                    (Some(id.to_string()), addr)
+                }
+                _ => (None, raw),
+            };
+            let url = normalize_url(addr);
+            let id = label.unwrap_or_else(|| url.clone());
+            bootstrap.push((id, url));
+        }
+        Ok(Self { bootstrap })
+    }
+}
+
+#[async_trait]
+impl Cluster for ExternalCluster {
+    fn bootstrap(&self) -> Vec<(String, String)> {
+        self.bootstrap.clone()
+    }
+
+    /// Resolve once any supplied endpoint accepts a connection, or error with
+    /// [`BenchError::ClusterNotReady`] when `budget` elapses (Requirement 9.3).
+    ///
+    /// Probing connectivity to a single reachable endpoint is enough: the
+    /// client seeds from every endpoint and discovers the rest of the cluster
+    /// from there. At least one full pass over the endpoints is attempted
+    /// before the deadline is consulted.
+    async fn await_ready(&self, budget: Duration) -> Result<(), BenchError> {
+        let deadline = tokio::time::Instant::now() + budget;
+        loop {
+            for (_id, url) in &self.bootstrap {
+                if VelaClientClient::connect(url.clone()).await.is_ok() {
+                    return Ok(());
+                }
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(BenchError::ClusterNotReady {
+                    budget_secs: budget.as_secs(),
+                });
+            }
+            tokio::time::sleep(READINESS_POLL_INTERVAL).await;
+        }
+    }
+
+    /// A no-op: the external cluster is managed by the operator, not the
+    /// benchmark, so a run must never stop it.
+    async fn shutdown(self) -> Result<(), BenchError> {
+        Ok(())
+    }
+}
+
+/// Normalize a bootstrap address into a client-dialable URL: an address that
+/// already carries an `http`/`https` scheme is used verbatim, otherwise a bare
+/// `host:port` is prefixed with `http://`.
+fn normalize_url(addr: &str) -> String {
+    if addr.starts_with("http://") || addr.starts_with("https://") {
+        addr.to_string()
+    } else {
+        format!("http://{addr}")
+    }
+}
+
 /// Reserve a free localhost port by binding (then dropping) an ephemeral
 /// listener, returning the address the in-process server should bind.
 ///
@@ -247,5 +353,66 @@ mod tests {
             .expect("the freshly bound listener becomes ready within the budget");
 
         cluster.shutdown().await.expect("the cluster shuts down");
+    }
+
+    // ----- ExternalCluster (the `--endpoints` target) ----------------------
+
+    #[test]
+    fn external_cluster_normalizes_bare_and_schemed_endpoints() {
+        let cluster = ExternalCluster::new(&[
+            "127.0.0.1:7001".to_string(),
+            "http://127.0.0.1:7002".to_string(),
+        ])
+        .expect("valid endpoints build a cluster");
+
+        let bootstrap = cluster.bootstrap();
+        // A bare host:port is prefixed with http://; a schemed URL is kept as-is.
+        // With no explicit id label, the normalized URL doubles as the id.
+        assert_eq!(
+            bootstrap,
+            vec![
+                (
+                    "http://127.0.0.1:7001".to_string(),
+                    "http://127.0.0.1:7001".to_string()
+                ),
+                (
+                    "http://127.0.0.1:7002".to_string(),
+                    "http://127.0.0.1:7002".to_string()
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn external_cluster_honors_explicit_id_label() {
+        let cluster = ExternalCluster::new(&["node1@127.0.0.1:7001".to_string()])
+            .expect("an id@addr endpoint builds a cluster");
+        assert_eq!(
+            cluster.bootstrap(),
+            vec![("node1".to_string(), "http://127.0.0.1:7001".to_string())]
+        );
+    }
+
+    #[test]
+    fn external_cluster_rejects_empty_endpoint_list() {
+        let error = ExternalCluster::new(&[]).expect_err("no endpoints is an error");
+        assert!(matches!(error, BenchError::ClusterStartup { .. }));
+    }
+
+    #[test]
+    fn external_cluster_rejects_a_blank_endpoint() {
+        let error = ExternalCluster::new(&["   ".to_string()])
+            .expect_err("a blank endpoint entry is an error");
+        assert!(matches!(error, BenchError::ClusterStartup { .. }));
+    }
+
+    /// An external cluster's shutdown is a no-op: the benchmark must not tear
+    /// down a deployment it did not start. (`shutdown` consumes `self`, so this
+    /// also confirms it returns `Ok`.)
+    #[tokio::test]
+    async fn external_cluster_shutdown_is_a_no_op() {
+        let cluster =
+            ExternalCluster::new(&["127.0.0.1:7001".to_string()]).expect("valid endpoint");
+        cluster.shutdown().await.expect("shutdown is a no-op Ok");
     }
 }

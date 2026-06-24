@@ -63,8 +63,8 @@ use vela_proto::v1::{
     ConsumeRequest, ConsumeResponse, ConsumedRecord, CreateTopicRequest, CreateTopicResponse,
     DeleteTopicRequest, DeleteTopicResponse, DescribeClusterRequest, DescribeClusterResponse,
     DescribeTopicRequest, DescribeTopicResponse, FindLeaderRequest, FindLeaderResponse,
-    ListTopicsRequest, ListTopicsResponse, Member, ProduceRequest, ProduceResponse, Record,
-    TopicInfo,
+    ListTopicsRequest, ListTopicsResponse, Member, ProduceBatchRequest, ProduceBatchResponse,
+    ProduceRequest, ProduceResponse, Record, TopicInfo,
 };
 
 /// The node id the fake server's address is registered under and the believed
@@ -217,6 +217,15 @@ impl VelaClientService for ConsumeServer {
         _request: Request<ProduceRequest>,
     ) -> Result<Response<ProduceResponse>, Status> {
         Err(Status::unimplemented("produce is not used by this test"))
+    }
+
+    async fn produce_batch(
+        &self,
+        _request: Request<ProduceBatchRequest>,
+    ) -> Result<Response<ProduceBatchResponse>, Status> {
+        Err(Status::unimplemented(
+            "produce_batch is not used by this test",
+        ))
     }
 
     async fn create_topic(

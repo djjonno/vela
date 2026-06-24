@@ -124,12 +124,13 @@ pub(crate) fn encoded_len(payload_len: usize) -> usize {
 }
 
 /// Map a [`PayloadKind`] to its on-disk `kind` byte (`0=Record, 1=Cluster,
-/// 2=Noop`).
+/// 2=Noop, 3=RecordBatch`).
 fn kind_to_byte(kind: PayloadKind) -> u8 {
     match kind {
         PayloadKind::Record => 0,
         PayloadKind::Cluster => 1,
         PayloadKind::Noop => 2,
+        PayloadKind::RecordBatch => 3,
     }
 }
 
@@ -140,6 +141,7 @@ fn kind_from_byte(byte: u8) -> Option<PayloadKind> {
         0 => Some(PayloadKind::Record),
         1 => Some(PayloadKind::Cluster),
         2 => Some(PayloadKind::Noop),
+        3 => Some(PayloadKind::RecordBatch),
         _ => None,
     }
 }

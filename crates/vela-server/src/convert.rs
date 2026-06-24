@@ -33,8 +33,9 @@
 use prost::Message as _;
 
 use vela_core::{
-    ClusterCommand, ClusterMetadata, CoreError, LogBackend, Member, NodeAvailability, NodeId,
-    Partition, PartitionIndex, Record, Topic, TopicState,
+    decode_record_batch, encode_record_batch, ClusterCommand, ClusterMetadata, CoreError,
+    LogBackend, Member, NodeAvailability, NodeId, Partition, PartitionIndex, Record, Topic,
+    TopicState,
 };
 use vela_log::LogError;
 use vela_raft::{
@@ -66,12 +67,20 @@ pub fn record_to_proto(record: &Record) -> v1::Record {
 /// Convert a wire [`v1::EntryPayload`] into a consensus [`EntryPayload`].
 ///
 /// A `Record` payload keeps only its value bytes (see the module note); a
+/// `RecordBatch` payload converts its ordered records to domain [`Record`]s and
+/// encodes their value bytes with [`encode_record_batch`], so the whole batch
+/// becomes the length-delimited value concatenation the state machine decodes on
+/// apply (keys are dropped, exactly as the single-record path drops them); a
 /// `Noop` becomes an empty no-op payload; a `Cluster` command is re-encoded to
 /// its protobuf bytes so it round-trips. An unset oneof defaults to a no-op.
 pub fn entry_payload_from_proto(payload: v1::EntryPayload) -> EntryPayload {
     match payload.kind {
         Some(v1::entry_payload::Kind::Record(record)) => {
             EntryPayload::new(PayloadKind::Record, record.value)
+        }
+        Some(v1::entry_payload::Kind::RecordBatch(batch)) => {
+            let records: Vec<Record> = batch.records.into_iter().map(record_from_proto).collect();
+            EntryPayload::new(PayloadKind::RecordBatch, encode_record_batch(&records))
         }
         Some(v1::entry_payload::Kind::Noop(_)) => EntryPayload::new(PayloadKind::Noop, Vec::new()),
         Some(v1::entry_payload::Kind::Cluster(command)) => {
@@ -84,7 +93,10 @@ pub fn entry_payload_from_proto(payload: v1::EntryPayload) -> EntryPayload {
 /// Convert a consensus [`EntryPayload`] into a wire [`v1::EntryPayload`].
 ///
 /// A `Record` payload is rebuilt as a keyless [`v1::Record`] carrying the stored
-/// value bytes; a `Noop` becomes the no-op marker; a `Cluster` payload's bytes
+/// value bytes; a `RecordBatch` payload's bytes are decoded with
+/// [`decode_record_batch`] into the ordered value frames, each rebuilt as a
+/// keyless [`v1::Record`] (matching the single-record path's value-only
+/// semantics); a `Noop` becomes the no-op marker; a `Cluster` payload's bytes
 /// are decoded back into a [`v1::ClusterCommand`] (falling back to an empty
 /// command if the bytes are not a valid encoding).
 pub fn entry_payload_to_proto(payload: &EntryPayload) -> v1::EntryPayload {
@@ -93,6 +105,13 @@ pub fn entry_payload_to_proto(payload: &EntryPayload) -> v1::EntryPayload {
             key: None,
             value: payload.bytes.clone(),
         }),
+        PayloadKind::RecordBatch => {
+            let records = decode_record_batch(&payload.bytes)
+                .into_iter()
+                .map(|value| v1::Record { key: None, value })
+                .collect();
+            v1::entry_payload::Kind::RecordBatch(v1::RecordBatch { records })
+        }
         PayloadKind::Noop => v1::entry_payload::Kind::Noop(v1::Noop {}),
         PayloadKind::Cluster => {
             let command = v1::ClusterCommand::decode(payload.bytes.as_slice())
@@ -567,6 +586,15 @@ pub fn core_error_to_vela_error(error: &CoreError) -> v1::VelaError {
         CoreError::TopicExists(_) => (v1::ErrorCode::TopicExists, None),
         CoreError::TopicDeleting(_) => (v1::ErrorCode::TopicDeleting, None),
         CoreError::RecordTooLarge(_) => (v1::ErrorCode::PayloadTooLarge, None),
+        // Batched-produce validation rejections (Decision 3): an empty batch and
+        // a too-many-records count are validation failures; an oversized record
+        // and an oversized batch are payload-size failures. All keep the client
+        // `classify` Fatal/non-retryable, matching the single-record
+        // `RecordTooLarge` -> PayloadTooLarge and the validation codes.
+        CoreError::EmptyBatch => (v1::ErrorCode::Validation, None),
+        CoreError::RecordTooLargeAt { .. } => (v1::ErrorCode::PayloadTooLarge, None),
+        CoreError::BatchTooManyRecords { .. } => (v1::ErrorCode::Validation, None),
+        CoreError::BatchTooLarge { .. } => (v1::ErrorCode::PayloadTooLarge, None),
         CoreError::InsufficientNodes { .. } => (v1::ErrorCode::InsufficientNodes, None),
         CoreError::PartitionUnavailable => (v1::ErrorCode::PartitionUnavailable, None),
         CoreError::NotLeader { leader } => (
@@ -726,6 +754,94 @@ mod tests {
             entry_payload_from_proto(entry_payload_to_proto(&payload)),
             payload
         );
+    }
+
+    #[test]
+    fn record_batch_payload_round_trips_through_proto() {
+        // A RecordBatch proto carries an ordered set of records; converting to a
+        // domain payload encodes their value bytes (keys dropped, matching the
+        // single-record path), and converting back reproduces the values in
+        // order as keyless records.
+        let records = vec![
+            v1::Record {
+                key: Some(b"k0".to_vec()),
+                value: b"first".to_vec(),
+            },
+            v1::Record {
+                key: None,
+                value: b"second".to_vec(),
+            },
+            v1::Record {
+                key: Some(b"k2".to_vec()),
+                value: b"third".to_vec(),
+            },
+        ];
+        let proto = v1::EntryPayload {
+            kind: Some(v1::entry_payload::Kind::RecordBatch(v1::RecordBatch {
+                records: records.clone(),
+            })),
+        };
+
+        // proto -> domain: the bytes are exactly `encode_record_batch` of the
+        // records (value-only framing), tagged as a RecordBatch payload.
+        let payload = entry_payload_from_proto(proto);
+        assert_eq!(payload.kind, PayloadKind::RecordBatch);
+        let domain_records: Vec<Record> = records
+            .iter()
+            .map(|r| Record::new(None, r.value.clone()))
+            .collect();
+        assert_eq!(payload.bytes, encode_record_batch(&domain_records));
+
+        // domain -> proto: the values come back in order as keyless records.
+        let back = entry_payload_to_proto(&payload);
+        match back.kind {
+            Some(v1::entry_payload::Kind::RecordBatch(batch)) => {
+                let values: Vec<Vec<u8>> = batch.records.iter().map(|r| r.value.clone()).collect();
+                assert_eq!(
+                    values,
+                    vec![b"first".to_vec(), b"second".to_vec(), b"third".to_vec()]
+                );
+                assert!(batch.records.iter().all(|r| r.key.is_none()));
+            }
+            other => panic!("expected a record-batch payload, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn record_batch_payload_replicates_through_append_entries() {
+        // A RecordBatch entry must round-trip through an AppendEntriesRequest so
+        // the whole batch replicates as one LogEntry.
+        let records = vec![
+            v1::Record {
+                key: None,
+                value: b"a".to_vec(),
+            },
+            v1::Record {
+                key: None,
+                value: b"b".to_vec(),
+            },
+        ];
+        let payload = entry_payload_from_proto(v1::EntryPayload {
+            kind: Some(v1::entry_payload::Kind::RecordBatch(v1::RecordBatch {
+                records,
+            })),
+        });
+        let entry = LogEntry {
+            index: 5,
+            term: 2,
+            payload,
+        };
+        let ae = AppendEntries {
+            term: 2,
+            leader_id: raft_node_id("node-leader"),
+            prev_log_index: Some(4),
+            prev_log_term: Some(2),
+            entries: vec![entry.clone()],
+            leader_commit: Some(4),
+        };
+        let back =
+            append_entries_from_proto(&append_entries_to_proto(&ae, "events", 0, "node-leader"));
+        assert_eq!(back.entries, vec![entry]);
     }
 
     #[test]

@@ -35,6 +35,9 @@ pub const VALUE_SIZE_RANGE: std::ops::RangeInclusive<usize> = 0..=10_485_760;
 pub const PARTITION_COUNT_RANGE: std::ops::RangeInclusive<u32> = 1..=10_000;
 /// Inclusive accepted range for `producer_concurrency`.
 pub const PRODUCER_CONCURRENCY_RANGE: std::ops::RangeInclusive<u32> = 1..=10_000;
+/// Inclusive accepted range for `batch_size` (`1..=MAX_BATCH_RECORDS`); the
+/// upper bound equals `vela_core::MAX_BATCH_RECORDS` (Requirement 9.1, 9.5).
+pub const BATCH_SIZE_RANGE: std::ops::RangeInclusive<u32> = 1..=10_000;
 /// Inclusive accepted range for the target topic name length, in characters.
 pub const TOPIC_LEN_RANGE: std::ops::RangeInclusive<usize> = 1..=255;
 /// Inclusive accepted range for the per-run time budget, in seconds.
@@ -58,6 +61,9 @@ pub const DEFAULT_KEY_MODE: KeyMode = KeyMode::Keyless;
 pub const DEFAULT_PARTITION_COUNT: u32 = 4;
 /// Default number of produce requests kept in flight concurrently.
 pub const DEFAULT_PRODUCER_CONCURRENCY: u32 = 16;
+/// Default number of records produced per Produce_Batch (single-record
+/// behavior) (Requirement 9.1, 9.3).
+pub const DEFAULT_BATCH_SIZE: u32 = 1;
 /// Default target topic name.
 pub const DEFAULT_TOPIC: &str = "vela-bench";
 /// Default warmup operation count per phase.
@@ -110,6 +116,9 @@ pub struct WorkloadParameters {
     pub partition_count: u32,
     /// Produce requests kept in flight concurrently (`1..=10_000`).
     pub producer_concurrency: u32,
+    /// Records produced per Produce_Batch (`1..=10_000`; default 1). A value of
+    /// 1 yields single-record produce behavior (Requirement 9.1, 9.3).
+    pub batch_size: u32,
     /// Target topic name (`1..=255` characters).
     pub topic: String,
     /// Warmup operations per phase, excluded from the Measurement_Window
@@ -136,6 +145,7 @@ impl Default for WorkloadParameters {
             key_mode: DEFAULT_KEY_MODE,
             partition_count: DEFAULT_PARTITION_COUNT,
             producer_concurrency: DEFAULT_PRODUCER_CONCURRENCY,
+            batch_size: DEFAULT_BATCH_SIZE,
             topic: DEFAULT_TOPIC.to_string(),
             warmup: DEFAULT_WARMUP,
             time_budget: DEFAULT_TIME_BUDGET,
@@ -200,6 +210,18 @@ impl WorkloadParameters {
                     self.producer_concurrency,
                     PRODUCER_CONCURRENCY_RANGE.start(),
                     PRODUCER_CONCURRENCY_RANGE.end()
+                ),
+            ));
+        }
+
+        if !BATCH_SIZE_RANGE.contains(&self.batch_size) {
+            return Err(ValidationError::new(
+                "batch_size",
+                format!(
+                    "{} is outside the accepted range {}..={}",
+                    self.batch_size,
+                    BATCH_SIZE_RANGE.start(),
+                    BATCH_SIZE_RANGE.end()
                 ),
             ));
         }
@@ -278,6 +300,7 @@ mod tests {
         assert!(VALUE_SIZE_RANGE.contains(&DEFAULT_VALUE_SIZE));
         assert!(PARTITION_COUNT_RANGE.contains(&DEFAULT_PARTITION_COUNT));
         assert!(PRODUCER_CONCURRENCY_RANGE.contains(&DEFAULT_PRODUCER_CONCURRENCY));
+        assert!(BATCH_SIZE_RANGE.contains(&DEFAULT_BATCH_SIZE));
         assert!(TOPIC_LEN_RANGE.contains(&DEFAULT_TOPIC.chars().count()));
         const { assert!(DEFAULT_WARMUP < DEFAULT_RECORD_COUNT) };
         assert!(TIME_BUDGET_SECS_RANGE.contains(&DEFAULT_TIME_BUDGET.as_secs()));
@@ -328,6 +351,33 @@ mod tests {
         let mut p = valid();
         p.producer_concurrency = 10_001;
         assert_eq!(p.validate().unwrap_err().name, "producer_concurrency");
+    }
+
+    #[test]
+    fn batch_size_below_one_is_rejected() {
+        let mut p = valid();
+        p.batch_size = 0;
+        assert_eq!(p.validate().unwrap_err().name, "batch_size");
+    }
+
+    #[test]
+    fn batch_size_above_range_is_rejected() {
+        // The upper bound mirrors `vela_core::MAX_BATCH_RECORDS` (10_000), so a
+        // value one past the ceiling is rejected naming `batch_size`
+        // (Requirement 9.5).
+        let mut p = valid();
+        p.batch_size = 10_001;
+        assert_eq!(p.validate().unwrap_err().name, "batch_size");
+    }
+
+    #[test]
+    fn batch_size_one_and_at_ceiling_are_accepted() {
+        // The accepted range is inclusive on both ends (Requirement 9.1).
+        let mut p = valid();
+        p.batch_size = 1;
+        assert!(p.validate().is_ok());
+        p.batch_size = *BATCH_SIZE_RANGE.end();
+        assert!(p.validate().is_ok());
     }
 
     #[test]

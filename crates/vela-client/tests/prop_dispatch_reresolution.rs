@@ -53,7 +53,7 @@ use vela_proto::v1::{
     ConsumeRequest, ConsumeResponse, CreateTopicRequest, CreateTopicResponse, DeleteTopicRequest,
     DeleteTopicResponse, DescribeClusterRequest, DescribeClusterResponse, DescribeTopicRequest,
     DescribeTopicResponse, FindLeaderRequest, FindLeaderResponse, ListTopicsRequest,
-    ListTopicsResponse, ProduceRequest, ProduceResponse,
+    ListTopicsResponse, ProduceBatchRequest, ProduceBatchResponse, ProduceRequest, ProduceResponse,
 };
 
 /// The believed-but-wrong leader address each partition is seeded with — the
@@ -170,6 +170,15 @@ impl VelaClientService for FindLeaderServer {
         _request: Request<ProduceRequest>,
     ) -> std::result::Result<Response<ProduceResponse>, Status> {
         Err(Status::unimplemented("produce is not used by this test"))
+    }
+
+    async fn produce_batch(
+        &self,
+        _request: Request<ProduceBatchRequest>,
+    ) -> std::result::Result<Response<ProduceBatchResponse>, Status> {
+        Err(Status::unimplemented(
+            "produce_batch is not used by this test",
+        ))
     }
 
     async fn consume(

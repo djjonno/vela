@@ -1159,8 +1159,8 @@ mod example_tests {
         ConsumeRequest, ConsumeResponse, CreateTopicRequest, CreateTopicResponse,
         DeleteTopicRequest, DeleteTopicResponse, DescribeClusterRequest, DescribeClusterResponse,
         DescribeTopicRequest, DescribeTopicResponse, FindLeaderRequest, FindLeaderResponse,
-        ListTopicsRequest, ListTopicsResponse, LogBackend, PartitionInfo, ProduceRequest,
-        ProduceResponse, TopicInfo,
+        ListTopicsRequest, ListTopicsResponse, LogBackend, PartitionInfo, ProduceBatchRequest,
+        ProduceBatchResponse, ProduceRequest, ProduceResponse, TopicInfo,
     };
 
     /// An in-process fake of the client-facing `VelaClient` service.
@@ -1295,6 +1295,15 @@ mod example_tests {
             _request: Request<ProduceRequest>,
         ) -> Result<Response<ProduceResponse>, Status> {
             Err(Status::unimplemented("produce is not used by vela-ctl"))
+        }
+
+        async fn produce_batch(
+            &self,
+            _request: Request<ProduceBatchRequest>,
+        ) -> Result<Response<ProduceBatchResponse>, Status> {
+            Err(Status::unimplemented(
+                "produce_batch is not used by vela-ctl",
+            ))
         }
 
         async fn consume(

@@ -48,3 +48,8 @@ bytes = "1.8.0"
 # round-tripping, Property 39 / Requirement 12.4) and the membership
 # availability state machine (Property 37, task 14.4).
 proptest.workspace = true
+# Test-only edge: cross-node integration tests drive the high-level client to
+# prove client-side leader re-resolution and retry against a real in-process
+# cluster (batched-produce task 9.2). Dev-only, so the inward dependency
+# direction of the shipped crate is unchanged.
+vela-client.workspace = true

@@ -344,6 +344,7 @@ mod tests {
             key_mode: KeyMode::Keyless,
             partition_count,
             producer_concurrency: 4,
+            batch_size: 1,
             topic: "vela-bench".to_string(),
             warmup,
             time_budget: Duration::from_secs(60),

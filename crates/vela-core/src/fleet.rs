@@ -34,6 +34,7 @@ use vela_raft::{Clock, NodeId as RaftNodeId, RaftInput, RaftNode, RaftOutput, Ro
 
 use crate::model::{Offset, PartitionIndex};
 use crate::partition_log::PartitionLog;
+use crate::produce::decode_record_batch;
 
 /// The key identifying one partition's Raft group within a [`RaftGroupFleet`]:
 /// the topic name paired with the partition index (Requirement 7.1).
@@ -52,6 +53,28 @@ pub struct CommittedRecord {
     pub offset: Offset,
     /// The committed record's opaque payload bytes.
     pub value: Vec<u8>,
+}
+
+/// The offsets a single applied entry produced.
+///
+/// A single-record entry commits at exactly one offset
+/// ([`AppliedOffsets::One`]); a batch entry commits its N records at the
+/// contiguous range `base..base+count` ([`AppliedOffsets::Range`]), so a caller
+/// can report a batch's `base_offset` and `count` (batched-produce Requirement
+/// 1.3, 1.4, 2.4). A `Noop`/`Cluster` entry assigns no offset and yields
+/// `None` from [`StateMachine::apply`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AppliedOffsets {
+    /// A single-record entry committed at this offset.
+    One(Offset),
+    /// A batch entry committed `count` (>= 1) records at the contiguous range
+    /// `base..base+count`; the Nth record took `base + N` (Requirement 2.4).
+    Range {
+        /// The offset assigned to the batch's first record (its `Base_Offset`).
+        base: Offset,
+        /// The number of records the batch committed (always >= 1).
+        count: u32,
+    },
 }
 
 /// The partition state machine: applies committed entries in order and assigns
@@ -78,18 +101,34 @@ impl StateMachine {
         Self::default()
     }
 
-    /// Apply one committed log `entry`, returning the [`Offset`] assigned if it
-    /// was a record entry, or `None` for a `Noop`/`Cluster` entry.
+    /// Apply one committed log `entry`, returning the [`AppliedOffsets`]
+    /// assigned if it was a record-bearing entry, or `None` for a
+    /// `Noop`/`Cluster` entry.
     ///
-    /// Record entries receive the next gap-free 0-based offset and are stored
-    /// for later reads (Requirement 4.7, 5.1); non-record entries are applied
-    /// (acknowledged) but do not advance the record offset.
-    pub fn apply(&mut self, entry: &LogEntry) -> Option<Offset> {
+    /// A `Record` entry receives the next gap-free 0-based offset and is stored
+    /// for later reads, returning [`AppliedOffsets::One`] (Requirement 4.7,
+    /// 5.1). A `RecordBatch` entry decodes its N value frames via
+    /// [`decode_record_batch`], captures `base = next_offset()` **before** the
+    /// push, pushes all N values onto the dense `records` vector in batch order,
+    /// and returns [`AppliedOffsets::Range`] `{ base, count: N }`, so the Nth
+    /// record takes `base + N` and the batch occupies a contiguous offset run
+    /// (batched-produce Requirement 1.3, 2.1, 2.4, 2.5). A `Noop`/`Cluster`
+    /// entry is applied (acknowledged) but does not advance the record offset.
+    /// Record offsets therefore stay gap-free and contiguous whether records
+    /// are produced singly or in a batch (Requirement 4.5).
+    pub fn apply(&mut self, entry: &LogEntry) -> Option<AppliedOffsets> {
         match entry.payload.kind {
             PayloadKind::Record => {
                 let offset = self.records.len() as Offset;
                 self.records.push(entry.payload.bytes.clone());
-                Some(offset)
+                Some(AppliedOffsets::One(offset))
+            }
+            PayloadKind::RecordBatch => {
+                let base = self.records.len() as Offset;
+                let values = decode_record_batch(&entry.payload.bytes);
+                let count = values.len() as u32;
+                self.records.extend(values);
+                Some(AppliedOffsets::Range { base, count })
             }
             PayloadKind::Noop | PayloadKind::Cluster => None,
         }
@@ -488,6 +527,23 @@ mod tests {
         }
     }
 
+    /// A `RecordBatch` entry carrying `values` as the length-delimited
+    /// concatenation the state machine decodes on apply.
+    fn record_batch(values: &[&[u8]]) -> LogEntry {
+        let records: Vec<crate::model::Record> = values
+            .iter()
+            .map(|v| crate::model::Record::new(None, v.to_vec()))
+            .collect();
+        LogEntry {
+            index: 0,
+            term: 1,
+            payload: EntryPayload::new(
+                PayloadKind::RecordBatch,
+                crate::produce::encode_record_batch(&records),
+            ),
+        }
+    }
+
     #[test]
     fn state_machine_assigns_gap_free_zero_based_offsets() {
         let mut sm = StateMachine::new();
@@ -496,9 +552,9 @@ mod tests {
         assert_eq!(sm.high_water_mark(), None);
 
         // Each committed record takes the next contiguous 0-based offset.
-        assert_eq!(sm.apply(&record(b"a")), Some(0));
-        assert_eq!(sm.apply(&record(b"b")), Some(1));
-        assert_eq!(sm.apply(&record(b"c")), Some(2));
+        assert_eq!(sm.apply(&record(b"a")), Some(AppliedOffsets::One(0)));
+        assert_eq!(sm.apply(&record(b"b")), Some(AppliedOffsets::One(1)));
+        assert_eq!(sm.apply(&record(b"c")), Some(AppliedOffsets::One(2)));
 
         assert_eq!(sm.len(), 3);
         assert_eq!(sm.next_offset(), 3);
@@ -510,9 +566,9 @@ mod tests {
         let mut sm = StateMachine::new();
         // A Noop entry is applied but assigns no offset, so the surrounding
         // record offsets stay contiguous (0, 1) with no gap.
-        assert_eq!(sm.apply(&record(b"first")), Some(0));
+        assert_eq!(sm.apply(&record(b"first")), Some(AppliedOffsets::One(0)));
         assert_eq!(sm.apply(&noop()), None);
-        assert_eq!(sm.apply(&record(b"second")), Some(1));
+        assert_eq!(sm.apply(&record(b"second")), Some(AppliedOffsets::One(1)));
 
         assert_eq!(sm.len(), 2);
         assert_eq!(sm.high_water_mark(), Some(1));
@@ -583,6 +639,59 @@ mod tests {
         assert_eq!(records[0].value, b"one".to_vec());
         assert_eq!(records[1].offset, 1);
         assert_eq!(records[1].value, b"two".to_vec());
+    }
+
+    #[test]
+    fn state_machine_assigns_a_contiguous_range_for_a_batch_interleaved_with_singles() {
+        let mut sm = StateMachine::new();
+
+        // A single record takes offset 0.
+        assert_eq!(sm.apply(&record(b"s0")), Some(AppliedOffsets::One(0)));
+
+        // A batch of three takes the contiguous range 1..=3 from the captured
+        // base, with no gap after the preceding single record (Requirement
+        // 1.3, 2.4, 2.5).
+        assert_eq!(
+            sm.apply(&record_batch(&[b"b1", b"b2", b"b3"])),
+            Some(AppliedOffsets::Range { base: 1, count: 3 })
+        );
+        assert_eq!(sm.next_offset(), 4);
+
+        // A following single record continues gap-free at offset 4 (Req 4.5).
+        assert_eq!(sm.apply(&record(b"s4")), Some(AppliedOffsets::One(4)));
+
+        // A second batch picks up immediately after, still contiguous.
+        assert_eq!(
+            sm.apply(&record_batch(&[b"b5", b"b6"])),
+            Some(AppliedOffsets::Range { base: 5, count: 2 })
+        );
+
+        // A Noop in the middle consumes no offset, keeping records contiguous.
+        assert_eq!(sm.apply(&noop()), None);
+        assert_eq!(sm.apply(&record(b"s7")), Some(AppliedOffsets::One(7)));
+
+        // The dense record vector is gap-free and ascending across both single
+        // and batch entries (Requirement 2.5, 4.5).
+        assert_eq!(sm.len(), 8);
+        assert_eq!(sm.high_water_mark(), Some(7));
+        let read = sm.read(0, 100);
+        assert_eq!(
+            read.iter().map(|r| r.offset).collect::<Vec<_>>(),
+            (0..8).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            read.iter().map(|r| r.value.clone()).collect::<Vec<_>>(),
+            vec![
+                b"s0".to_vec(),
+                b"b1".to_vec(),
+                b"b2".to_vec(),
+                b"b3".to_vec(),
+                b"s4".to_vec(),
+                b"b5".to_vec(),
+                b"b6".to_vec(),
+                b"s7".to_vec(),
+            ]
+        );
     }
 
     #[test]

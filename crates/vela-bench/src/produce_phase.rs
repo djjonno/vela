@@ -39,7 +39,7 @@ use futures::stream::StreamExt;
 use thiserror::Error;
 
 use crate::outcome::{FailureReason, Phase};
-use crate::params::WorkloadParameters;
+use crate::params::{KeyMode, WorkloadParameters};
 use crate::workload::{key_for, payload_for};
 
 /// The set of positions counted toward Produce_Throughput: `[warmup, total)`.
@@ -89,6 +89,31 @@ pub trait ProduceSink {
         key: Option<Vec<u8>>,
         value: Vec<u8>,
     ) -> Result<u64, ProduceFailure>;
+
+    /// Produce a chunk of records as one Produce_Batch, returning each record's
+    /// committed offset in input order (Requirement 9.2).
+    ///
+    /// The default implementation groups the chunk through [`produce`], issuing
+    /// one single-record produce per record, so sinks that only implement
+    /// [`produce`] keep compiling and behave equivalently to one record per
+    /// request (Requirement 9.3). The real [`VelaProduceSink`](crate::run)
+    /// overrides this with the client's `producer().produce_batch`, which
+    /// appends the whole chunk as a single batch.
+    ///
+    /// [`produce`]: ProduceSink::produce
+    async fn produce_batch(
+        &self,
+        records: Vec<(Option<Vec<u8>>, Vec<u8>)>,
+    ) -> Result<Vec<u64>, ProduceFailure> {
+        // Default: produce each record singly, preserving order. The position
+        // is the record's index within the chunk — sinks that need the true
+        // workload position override this method.
+        let mut offsets = Vec::with_capacity(records.len());
+        for (i, (key, value)) in records.into_iter().enumerate() {
+            offsets.push(self.produce(i as u64, key, value).await?);
+        }
+        Ok(offsets)
+    }
 }
 
 /// The measured result of a completed Producer_Phase.
@@ -171,6 +196,39 @@ impl ProducerPhaseError {
     }
 }
 
+/// Produce one chunk of records as a single Produce_Batch through `sink`.
+///
+/// Builds the chunk's records from the deterministic workload
+/// ([`key_for`] / [`payload_for`]) for each `position`, then produces them as
+/// one batch. Resolves to `(records acknowledged, summed value bytes)` — the
+/// chunk's record count and the sum of its value byte lengths — so the caller
+/// counts throughput per RECORD, crediting each acknowledged record in the
+/// batch (Requirement 9.4). A [`ProduceFailure`] from the sink propagates
+/// unchanged. With a one-record chunk this is equivalent to a single produce
+/// (Requirement 9.3).
+async fn produce_chunk<S>(
+    sink: &S,
+    positions: Vec<u64>,
+    key_mode: KeyMode,
+    value_size: usize,
+) -> Result<(u64, u64), ProduceFailure>
+where
+    S: ProduceSink + ?Sized + Sync,
+{
+    let mut records = Vec::with_capacity(positions.len());
+    let mut value_bytes: u64 = 0;
+    for position in positions {
+        let key = key_for(position, key_mode);
+        let value = payload_for(position, value_size);
+        value_bytes += value.len() as u64;
+        records.push((key, value));
+    }
+    let count = records.len() as u64;
+    sink.produce_batch(records)
+        .await
+        .map(|_offsets| (count, value_bytes))
+}
+
 /// Run the Producer_Phase against `sink` for the given Workload_Parameters.
 ///
 /// Issues exactly `params.warmup` warmup produces first, awaiting their
@@ -188,37 +246,35 @@ pub async fn run_producer_phase<S>(
     params: &WorkloadParameters,
 ) -> Result<ProducerPhaseResult, ProducerPhaseError>
 where
-    S: ProduceSink + ?Sized,
+    S: ProduceSink + ?Sized + Sync,
 {
     let concurrency = (params.producer_concurrency.max(1)) as usize;
+    // Records produced per Produce_Batch. A `batch_size` of 1 makes every chunk
+    // a single record, so behavior is equivalent to one record per request
+    // (Requirement 9.3). Clamp to at least 1 because `Chunks` panics on 0.
+    let batch_size = (params.batch_size.max(1)) as usize;
 
-    // --- Warmup: exactly `warmup` produces, all completing before the window
-    // opens (Requirement 10.1). A failure aborts without opening the window
-    // (Requirement 10.6). Warmup records that are acknowledged still received a
-    // committed offset, so they count toward the *total* Acknowledged_Record
-    // figures (glossary), even though they never enter the measured window.
+    // --- Warmup: exactly `warmup` produces, chunked into batches of
+    // `batch_size`, all completing before the window opens (Requirement 10.1).
+    // A batch failure aborts without opening the window (Requirement 10.6).
+    // Warmup records that are acknowledged still received a committed offset, so
+    // they count toward the *total* Acknowledged_Record figures (glossary), even
+    // though they never enter the measured window.
     let mut warmup_acked_count: u64 = 0;
     let mut warmup_acked_value_bytes: u64 = 0;
     if params.warmup > 0 {
         let mut warmup_stream = futures::stream::iter(0..params.warmup)
-            .map(|position| {
-                let key = key_for(position, params.key_mode);
-                let value = payload_for(position, params.value_size);
-                let value_len = value.len() as u64;
-                async move {
-                    sink.produce(position, key, value)
-                        .await
-                        .map(|_offset| value_len)
-                }
-            })
+            .chunks(batch_size)
+            .map(|positions| produce_chunk(sink, positions, params.key_mode, params.value_size))
             .buffer_unordered(concurrency);
 
         while let Some(result) = warmup_stream.next().await {
             match result {
-                // A warmup ack got a committed offset: count it toward the total.
-                Ok(value_len) => {
-                    warmup_acked_count += 1;
-                    warmup_acked_value_bytes += value_len;
+                // A warmup batch's acks got committed offsets: count each record
+                // toward the total (Requirement 9.4).
+                Ok((count, value_bytes)) => {
+                    warmup_acked_count += count;
+                    warmup_acked_value_bytes += value_bytes;
                 }
                 Err(failure) => {
                     return Err(ProducerPhaseError::Warmup {
@@ -229,9 +285,10 @@ where
         }
     }
 
-    // --- Measured: open the window at the first measured produce invocation
-    // (Requirement 1.4) and drive the remaining records with bounded
-    // concurrency (Requirement 4.4).
+    // --- Measured: open the window at the first measured batch invocation
+    // (Requirement 1.4) and drive the remaining records, chunked into batches of
+    // `batch_size`, keeping up to `producer_concurrency` batches in flight
+    // (Requirement 4.4).
     let measured = measured_set(params.record_count, params.warmup);
 
     let mut acked_count: u64 = 0;
@@ -241,29 +298,21 @@ where
     let mut last_ack = window_open;
 
     let mut measured_stream = futures::stream::iter(measured)
-        .map(|position| {
-            let key = key_for(position, params.key_mode);
-            let value = payload_for(position, params.value_size);
-            let value_len = value.len() as u64;
-            async move {
-                sink.produce(position, key, value)
-                    .await
-                    .map(|_offset| value_len)
-            }
-        })
+        .chunks(batch_size)
+        .map(|positions| produce_chunk(sink, positions, params.key_mode, params.value_size))
         .buffer_unordered(concurrency);
 
     while let Some(result) = measured_stream.next().await {
         match result {
-            // Count a record only after it becomes an Acknowledged_Record, and
-            // close the window at the last such acknowledgment (Req 1.2, 1.4).
-            Ok(value_len) => {
-                acked_count += 1;
-                acked_value_bytes += value_len;
+            // Count each acknowledged record in the batch, and close the window
+            // at the last acknowledgment (Req 1.2, 1.4, 9.4).
+            Ok((count, value_bytes)) => {
+                acked_count += count;
+                acked_value_bytes += value_bytes;
                 last_ack = Instant::now();
             }
             // Stop further produces and abort (Requirements 3.7, 9.1). Dropping
-            // the stream cancels in-flight and not-yet-started produces.
+            // the stream cancels in-flight and not-yet-started batches.
             Err(failure) => {
                 return Err(ProducerPhaseError::Produce {
                     topic: failure.topic,
@@ -290,7 +339,12 @@ mod tests {
     use super::*;
     use crate::params::{KeyMode, WorkloadParameters};
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Mutex;
     use std::time::Duration;
+
+    /// A produced record as captured by [`RecordingSink`]: its optional key and
+    /// value bytes.
+    type ProducedRecord = (Option<Vec<u8>>, Vec<u8>);
 
     // ----- measured_set (Requirements 1.2, 10.1, 10.4) ---------------------
 
@@ -347,6 +401,30 @@ mod tests {
         }
     }
 
+    /// A sink that records the `(key, value)` of every `produce` call so a test
+    /// can assert exactly which records were produced. It implements only
+    /// `produce`, so it relies on the trait's default `produce_batch` — at
+    /// `batch_size == 1` every chunk is a single record routed through
+    /// `produce`, exactly the single-record path (Requirement 9.3).
+    #[derive(Default)]
+    struct RecordingSink {
+        produced: Mutex<Vec<ProducedRecord>>,
+    }
+
+    #[async_trait]
+    impl ProduceSink for RecordingSink {
+        async fn produce(
+            &self,
+            position: u64,
+            key: Option<Vec<u8>>,
+            value: Vec<u8>,
+        ) -> Result<u64, ProduceFailure> {
+            self.produced.lock().expect("lock").push((key, value));
+            // Echo the position back as the committed offset.
+            Ok(position)
+        }
+    }
+
     fn params() -> WorkloadParameters {
         WorkloadParameters {
             record_count: 20,
@@ -354,6 +432,7 @@ mod tests {
             key_mode: KeyMode::Keyed,
             partition_count: 4,
             producer_concurrency: 4,
+            batch_size: 1,
             topic: "vela-bench".to_string(),
             warmup: 5,
             time_budget: Duration::from_secs(60),
@@ -409,5 +488,107 @@ mod tests {
         assert_eq!(result.total_acked_value_bytes, result.acked_value_bytes);
         assert_eq!(result.total_acked_count, p.record_count);
         assert_eq!(sink.invocations.load(Ordering::SeqCst), p.record_count);
+    }
+
+    #[tokio::test]
+    async fn batching_acks_the_same_record_totals_as_single_record() {
+        // Chunking into batches of `batch_size` must not change how many records
+        // are acknowledged or how many value bytes are counted: each record in a
+        // committed batch is credited toward throughput (Requirement 9.4), and a
+        // `batch_size == 1` run is equivalent to one record per request
+        // (Requirement 9.3). A `record_count` not divisible by `batch_size`
+        // exercises the smaller final chunk.
+        let mut single = params();
+        single.batch_size = 1;
+        single.warmup = 5;
+        let single_sink = CountingSink::default();
+        let single_result = run_producer_phase(&single_sink, &single)
+            .await
+            .expect("single-record phase succeeds");
+
+        let mut batched = params();
+        batched.batch_size = 4; // record_count 20, warmup 5 -> uneven chunks
+        batched.warmup = 5;
+        let batched_sink = CountingSink::default();
+        let batched_result = run_producer_phase(&batched_sink, &batched)
+            .await
+            .expect("batched phase succeeds");
+
+        // The measured and total figures match across batch sizes.
+        assert_eq!(batched_result.acked_count, single_result.acked_count);
+        assert_eq!(
+            batched_result.acked_value_bytes,
+            single_result.acked_value_bytes
+        );
+        assert_eq!(
+            batched_result.total_acked_count,
+            single_result.total_acked_count
+        );
+        assert_eq!(
+            batched_result.total_acked_value_bytes,
+            single_result.total_acked_value_bytes
+        );
+
+        // Every record is still produced exactly once under either batch size.
+        assert_eq!(
+            batched_sink.invocations.load(Ordering::SeqCst),
+            single_sink.invocations.load(Ordering::SeqCst)
+        );
+        assert_eq!(
+            batched_sink.invocations.load(Ordering::SeqCst),
+            batched.record_count
+        );
+    }
+
+    #[tokio::test]
+    async fn batch_size_one_produces_the_same_per_record_results_as_single_record_path() {
+        // Requirement 9.3: a `batch_size == 1` run is equivalent to one record
+        // per produce request. At `batch_size == 1` each chunk is a single
+        // record routed through the default `produce_batch`, which calls
+        // `produce` once per record — so the set of `produce(key, value)` calls
+        // must be exactly the records a pure single-record drive would issue:
+        // every workload position (warmup + measured) produced exactly once with
+        // the deterministic `key_for`/`payload_for` payload.
+        let mut p = params(); // record_count 20, warmup 5, Keyed, value_size 32
+        p.batch_size = 1;
+
+        let sink = RecordingSink::default();
+        let result = run_producer_phase(&sink, &p).await.expect("phase succeeds");
+
+        // The records a direct single-record drive would produce: for every
+        // position in [0, record_count) the deterministic (key, value).
+        let mut expected: Vec<ProducedRecord> = (0..p.record_count)
+            .map(|position| {
+                (
+                    key_for(position, p.key_mode),
+                    payload_for(position, p.value_size),
+                )
+            })
+            .collect();
+
+        let mut produced = sink.produced.lock().expect("lock").clone();
+
+        // `buffer_unordered` does not preserve order, so compare as multisets.
+        // Equality of the sorted sequences proves every position was produced
+        // exactly once with the identical payload (no duplicates, no omissions).
+        expected.sort();
+        produced.sort();
+        assert_eq!(
+            produced, expected,
+            "batch_size == 1 must produce each record exactly once, identical to the single-record path"
+        );
+        assert_eq!(produced.len() as u64, p.record_count);
+
+        // The acked counts and value bytes match the single-record expectation:
+        // measured figures exclude the warmup prefix (Requirement 1.2), totals
+        // include it (glossary).
+        let measured = p.record_count - p.warmup;
+        assert_eq!(result.acked_count, measured);
+        assert_eq!(result.acked_value_bytes, measured * p.value_size as u64);
+        assert_eq!(result.total_acked_count, p.record_count);
+        assert_eq!(
+            result.total_acked_value_bytes,
+            p.record_count * p.value_size as u64
+        );
     }
 }

@@ -62,6 +62,7 @@ fn valid_params() -> impl Strategy<Value = WorkloadParameters> {
                 },
                 partition_count: pc,
                 producer_concurrency: conc,
+                batch_size: 1,
                 topic: topic.clone(),
                 warmup,
                 time_budget: Duration::from_secs(tb),

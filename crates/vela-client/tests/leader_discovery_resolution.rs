@@ -41,7 +41,8 @@ use vela_proto::v1::{
     ConsumeRequest, ConsumeResponse, CreateTopicRequest, CreateTopicResponse, DeleteTopicRequest,
     DeleteTopicResponse, DescribeClusterRequest, DescribeClusterResponse, DescribeTopicRequest,
     DescribeTopicResponse, FindLeaderRequest, FindLeaderResponse, ListTopicsRequest,
-    ListTopicsResponse, Member, ProduceRequest, ProduceResponse,
+    ListTopicsResponse, Member, ProduceBatchRequest, ProduceBatchResponse, ProduceRequest,
+    ProduceResponse,
 };
 
 /// An in-process fake of one node's client-facing `VelaClient` service.
@@ -101,6 +102,15 @@ impl VelaClientService for FakeNode {
         _request: Request<ProduceRequest>,
     ) -> Result<Response<ProduceResponse>, Status> {
         Err(Status::unimplemented("produce is not used by this test"))
+    }
+
+    async fn produce_batch(
+        &self,
+        _request: Request<ProduceBatchRequest>,
+    ) -> Result<Response<ProduceBatchResponse>, Status> {
+        Err(Status::unimplemented(
+            "produce_batch is not used by this test",
+        ))
     }
 
     async fn consume(

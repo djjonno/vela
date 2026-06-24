@@ -37,6 +37,10 @@ pub enum PayloadKind {
     Cluster,
     /// A leader's no-op entry, written on election (extended Raft paper §8).
     Noop,
+    /// A produced batch of records committed as one unit. The `bytes` are an
+    /// opaque length-delimited concatenation; `vela-log` does not interpret
+    /// them, treating the entry exactly like any other payload.
+    RecordBatch,
 }
 
 /// The opaque payload of a [`LogEntry`]: a [`PayloadKind`] tag plus raw bytes.

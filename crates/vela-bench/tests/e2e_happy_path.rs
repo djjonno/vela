@@ -58,6 +58,7 @@ fn tiny_params() -> WorkloadParameters {
         key_mode: KeyMode::Keyless,
         partition_count: 3,
         producer_concurrency: 4,
+        batch_size: 1,
         topic: unique_topic(),
         warmup: 0,
         time_budget: Duration::from_secs(60),

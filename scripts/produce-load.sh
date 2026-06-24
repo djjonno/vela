@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 #
-# produce-load.sh — produce random 32-character messages to a Vela topic.
+# produce-load.sh — produce random fixed-size messages to a Vela topic.
 #
 # Drives the existing `vela-ctl produce` command in a loop, sending a fixed
-# number of small random records (32 printable characters each).
+# number of random records of a configurable size (32 printable characters
+# each by default, see --size).
 #
 # Why a per-record key by default:
 #   `vela-ctl` is a fresh process per produce, and keyless routing uses a
@@ -18,6 +19,8 @@
 #
 # Options:
 #   -n, --count N           Number of messages to produce (default: 1000).
+#   -s, --size N            Size of each message value, in characters/bytes
+#                           (default: 32).
 #   -e, --endpoints LIST    Comma-separated id=url endpoints
 #                           (default: the local docker-compose 4-node cluster).
 #   -k, --key KEY           Pin every record to one partition using this fixed key.
@@ -32,6 +35,9 @@
 #
 #   # 50k messages, creating the topic first:
 #   scripts/produce-load.sh bench --count 50000 --create 8
+#
+#   # 1 KiB messages to fill segments faster:
+#   scripts/produce-load.sh orders --size 1024 --count 100000
 #
 #   # Target a single-node dev server:
 #   scripts/produce-load.sh orders --endpoints node-a=http://127.0.0.1:7001
@@ -65,6 +71,10 @@ while [ $# -gt 0 ]; do
     case "$1" in
         -n | --count)
             COUNT="${2:?--count needs a value}"
+            shift 2
+            ;;
+        -s | --size)
+            RECORD_CHARS="${2:?--size needs a value}"
             shift 2
             ;;
         -e | --endpoints)
@@ -107,6 +117,8 @@ done
 
 case "$COUNT" in *[!0-9]*) die "--count must be a positive integer";; esac
 [ "$COUNT" -gt 0 ] || die "--count must be greater than 0"
+case "$RECORD_CHARS" in *[!0-9]*) die "--size must be a positive integer";; esac
+[ "$RECORD_CHARS" -gt 0 ] || die "--size must be greater than 0"
 if [ -n "$CREATE_PARTITIONS" ]; then
     case "$CREATE_PARTITIONS" in *[!0-9]*) die "--create must be a positive integer";; esac
     [ "$CREATE_PARTITIONS" -gt 0 ] || die "--create must be greater than 0"

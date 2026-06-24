@@ -118,6 +118,7 @@ fn workload_parameters() -> impl Strategy<Value = WorkloadParameters> {
                 key_mode,
                 partition_count,
                 producer_concurrency,
+                batch_size: 1,
                 topic,
                 warmup,
                 time_budget,

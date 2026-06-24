@@ -44,6 +44,9 @@ fn _wire_types_are_owned_by_vela_proto() {
     // Produce / consume client messages.
     let _: Option<v1::ProduceRequest> = None;
     let _: Option<v1::ProduceResponse> = None;
+    let _: Option<v1::ProduceBatchRequest> = None;
+    let _: Option<v1::ProduceBatchResponse> = None;
+    let _: Option<v1::RecordBatch> = None;
     let _: Option<v1::ConsumeRequest> = None;
     let _: Option<v1::ConsumedRecord> = None;
     let _: Option<v1::ConsumeResponse> = None;
@@ -128,6 +131,60 @@ fn error_code_taxonomy_is_exposed() {
     // confirming the enum is fully generated in `vela-proto`.
     for code in codes {
         assert_eq!(v1::ErrorCode::try_from(code as i32), Ok(code));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Batched-produce wire surface (batched-produce Requirements 1.1, 1.4, 8.1, 8.3)
+// ---------------------------------------------------------------------------
+
+/// The batched-produce surface adds a `RecordBatch` payload arm, a
+/// `ProduceBatchRequest` carrying an ordered set of records for one
+/// (topic, partition), and a compact `ProduceBatchResponse { base_offset,
+/// count }` (batched-produce Requirements 1.1, 1.4, 8.1, 8.3). Constructing each
+/// message pins down its fields; setting the `record_batch` oneof arm asserts
+/// the fourth `EntryPayload` variant exists so a batch replicates as one
+/// `LogEntry`. The existing single-record `Produce` surface is left untouched.
+#[test]
+fn produce_batch_wire_surface_is_exposed() {
+    let records = vec![
+        v1::Record {
+            key: None,
+            value: b"a".to_vec(),
+        },
+        v1::Record {
+            key: Some(b"k".to_vec()),
+            value: b"b".to_vec(),
+        },
+    ];
+
+    // The request carries the resolved (topic, partition) and the ordered batch.
+    let request = v1::ProduceBatchRequest {
+        topic: "orders".to_string(),
+        partition: 2,
+        records: records.clone(),
+    };
+    assert_eq!(request.records.len(), 2);
+
+    // The response is the compact base-offset + count pair.
+    let response = v1::ProduceBatchResponse {
+        base_offset: 10,
+        count: 2,
+    };
+    assert_eq!(response.base_offset, 10);
+    assert_eq!(response.count, 2);
+
+    // A batch replicates as one `LogEntry` via the fourth `EntryPayload` arm.
+    let payload = v1::EntryPayload {
+        kind: Some(v1::entry_payload::Kind::RecordBatch(v1::RecordBatch {
+            records,
+        })),
+    };
+    match payload.kind {
+        Some(v1::entry_payload::Kind::RecordBatch(batch)) => {
+            assert_eq!(batch.records.len(), 2);
+        }
+        _ => panic!("expected the record_batch payload arm"),
     }
 }
 

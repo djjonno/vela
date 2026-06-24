@@ -50,7 +50,7 @@ use vela_proto::v1::{
     ConsumeRequest, ConsumeResponse, CreateTopicRequest, CreateTopicResponse, DeleteTopicRequest,
     DeleteTopicResponse, DescribeClusterRequest, DescribeClusterResponse, DescribeTopicRequest,
     DescribeTopicResponse, FindLeaderRequest, FindLeaderResponse, ListTopicsRequest,
-    ListTopicsResponse, ProduceRequest, ProduceResponse,
+    ListTopicsResponse, ProduceBatchRequest, ProduceBatchResponse, ProduceRequest, ProduceResponse,
 };
 
 /// The node id the fake server's address is registered under in the client
@@ -125,6 +125,15 @@ impl VelaClientService for RecordingServer {
         let offset = *next;
         *next += 1;
         Ok(Response::new(ProduceResponse { offset }))
+    }
+
+    async fn produce_batch(
+        &self,
+        _request: Request<ProduceBatchRequest>,
+    ) -> Result<Response<ProduceBatchResponse>, Status> {
+        Err(Status::unimplemented(
+            "produce_batch is not used by this test",
+        ))
     }
 
     async fn consume(

@@ -52,7 +52,7 @@ use vela_client::{LogBackend, VelaClient};
 use vela_proto::v1::vela_client_client::VelaClientClient;
 use vela_proto::v1::FindLeaderRequest;
 
-use crate::cluster::{Cluster, InProcessCluster};
+use crate::cluster::{Cluster, ExternalCluster, InProcessCluster};
 use crate::consume_phase::{run_consumer_phase, ConsumeFailure, ConsumeSource, ConsumedBatch};
 use crate::html::write_html_file;
 use crate::metrics::{throughput, Throughput};
@@ -92,6 +92,50 @@ pub async fn run(
         Err(error) => {
             // The cluster could not even be started (port reservation / config):
             // surface it as a not-ready failure against the startup budget.
+            let reason = bench_error_to_reason(&error, &params);
+            let report = assemble_report(params, PhaseData::failed(reason), start.elapsed());
+            emit_outputs(&report, report_json.as_deref(), report_html.as_deref());
+            report
+        }
+    }
+}
+
+/// Run one Benchmark_Run against a live, externally-managed cluster reachable at
+/// the caller-supplied `endpoints` (the `--endpoints` flag).
+///
+/// Identical sequencing to [`run`], but instead of starting an
+/// [`InProcessCluster`] the benchmark connects to the already-running
+/// deployment via an [`ExternalCluster`] and never tears it down. Validation
+/// still happens first (no connection on an invalid configuration); the overall
+/// time-budget clock starts immediately after a successful validation. A
+/// malformed/empty `endpoints` list fails the run with `ClusterNotReady` before
+/// any phase, mirroring how [`run`] handles an unstartable in-process cluster.
+///
+/// Note the same pre-existing-topic guard as [`run`] applies: the target topic
+/// must not already exist on the cluster, so successive external runs should use
+/// a fresh `--topic` (the benchmark does not delete the topics it creates).
+pub async fn run_external(
+    params: WorkloadParameters,
+    endpoints: Vec<String>,
+    report_json: Option<PathBuf>,
+    report_html: Option<PathBuf>,
+) -> BenchmarkReport {
+    // Reject an out-of-range parameter before connecting to anything — no side
+    // effects (Requirements 3.5, 4.5, 4.6, 10.5).
+    if let Some(report) = invalid_params_report(&params) {
+        emit_outputs(&report, report_json.as_deref(), report_html.as_deref());
+        return report;
+    }
+
+    // Start the overall time-budget clock at run start (Requirement 8.2).
+    let start = Instant::now();
+
+    match ExternalCluster::new(&endpoints) {
+        Ok(cluster) => run_started(cluster, params, start, report_json, report_html).await,
+        Err(error) => {
+            // A malformed/empty endpoint list means there is no cluster to
+            // reach: surface it as a not-ready failure against the startup
+            // budget, the same shape an unstartable in-process cluster yields.
             let reason = bench_error_to_reason(&error, &params);
             let report = assemble_report(params, PhaseData::failed(reason), start.elapsed());
             emit_outputs(&report, report_json.as_deref(), report_html.as_deref());
@@ -418,40 +462,51 @@ async fn await_partition_leaders<C: Cluster>(
     params: &WorkloadParameters,
 ) -> Result<(), FailureReason> {
     let bootstrap = cluster.bootstrap();
-    let addr = match bootstrap.first() {
-        Some((_, addr)) => addr.clone(),
-        None => {
-            return Err(FailureReason::ClusterNotReady {
-                budget_secs: params.startup_budget.as_secs(),
-            });
-        }
-    };
+    if bootstrap.is_empty() {
+        return Err(FailureReason::ClusterNotReady {
+            budget_secs: params.startup_budget.as_secs(),
+        });
+    }
+    // Probe every bootstrap endpoint, not just the first: on a multi-node
+    // cluster the first node may not host a given partition's replica and so
+    // cannot name its leader, whereas some other node can. (A single-node
+    // in-process cluster has one endpoint hosting every partition.)
+    let addrs: Vec<String> = bootstrap.into_iter().map(|(_, addr)| addr).collect();
 
     let deadline = tokio::time::Instant::now() + params.startup_budget;
     let mut remaining: Vec<u32> = (0..params.partition_count).collect();
 
     loop {
-        // A fresh stub each pass keeps the probe simple; the channel is cheap and
-        // the connection is reused for the per-partition lookups within a pass.
-        if let Ok(mut client) = VelaClientClient::connect(addr.clone()).await {
-            let mut still_pending = Vec::new();
-            for partition in remaining {
-                let elected = client
-                    .find_leader(FindLeaderRequest {
-                        topic: params.topic.clone(),
-                        partition,
-                    })
-                    .await
-                    .map(|response| response.into_inner().leader.is_some())
-                    .unwrap_or(false);
-                if !elected {
-                    still_pending.push(partition);
+        let mut still_pending = Vec::new();
+        for partition in remaining {
+            // A partition is ready once ANY reachable node reports a live leader
+            // for it. Try each endpoint until one names the leader; a node that
+            // does not host the partition answers `None` and the probe falls
+            // through to the next.
+            let mut elected = false;
+            for addr in &addrs {
+                if let Ok(mut client) = VelaClientClient::connect(addr.clone()).await {
+                    if let Ok(response) = client
+                        .find_leader(FindLeaderRequest {
+                            topic: params.topic.clone(),
+                            partition,
+                        })
+                        .await
+                    {
+                        if response.into_inner().leader.is_some() {
+                            elected = true;
+                            break;
+                        }
+                    }
                 }
             }
-            remaining = still_pending;
-            if remaining.is_empty() {
-                return Ok(());
+            if !elected {
+                still_pending.push(partition);
             }
+        }
+        remaining = still_pending;
+        if remaining.is_empty() {
+            return Ok(());
         }
 
         // Consult the deadline after at least one probe pass, so a budget that
@@ -647,6 +702,28 @@ impl ProduceSink for VelaProduceSink {
                 cause: error.to_string(),
             })
     }
+
+    /// Produce a chunk of records as one Produce_Batch through the client's
+    /// `producer().produce_batch`, which routes and groups per partition and
+    /// appends each per-partition group as a single batch (Requirement 9.2).
+    /// The client owns partition routing, leader redirection, and the retry
+    /// budget, so an `Err` is an unresolved operation error surfaced as a
+    /// [`ProduceFailure`] (Requirements 3.7, 9.1) with the same best-effort
+    /// partition sentinel as [`produce`](ProduceSink::produce).
+    async fn produce_batch(
+        &self,
+        records: Vec<(Option<Vec<u8>>, Vec<u8>)>,
+    ) -> Result<Vec<u64>, ProduceFailure> {
+        self.client
+            .producer()
+            .produce_batch(&self.topic, records)
+            .await
+            .map_err(|error| ProduceFailure {
+                topic: self.topic.clone(),
+                partition: 0,
+                cause: error.to_string(),
+            })
+    }
 }
 
 /// The real [`ConsumeSource`] adapter: consumes records through the
@@ -752,6 +829,7 @@ mod tests {
             key_mode: KeyMode::Keyless,
             partition_count: 2,
             producer_concurrency: 4,
+            batch_size: 1,
             topic: "vela-bench-test".to_string(),
             warmup: 0,
             time_budget: Duration::from_secs(60),

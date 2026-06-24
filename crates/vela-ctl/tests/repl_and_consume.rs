@@ -54,8 +54,8 @@ use vela_proto::v1::{
     ConsumeRequest, ConsumeResponse, ConsumedRecord, CreateTopicRequest, CreateTopicResponse,
     DeleteTopicRequest, DeleteTopicResponse, DescribeClusterRequest, DescribeClusterResponse,
     DescribeTopicRequest, DescribeTopicResponse, FindLeaderRequest, FindLeaderResponse,
-    ListTopicsRequest, ListTopicsResponse, PartitionInfo, ProduceRequest, ProduceResponse, Record,
-    TopicInfo,
+    ListTopicsRequest, ListTopicsResponse, PartitionInfo, ProduceBatchRequest,
+    ProduceBatchResponse, ProduceRequest, ProduceResponse, Record, TopicInfo,
 };
 
 // ---------------------------------------------------------------------------
@@ -272,6 +272,15 @@ impl VelaClientService for FakeNode {
             value: record.value,
         });
         Ok(Response::new(ProduceResponse { offset }))
+    }
+
+    async fn produce_batch(
+        &self,
+        _request: Request<ProduceBatchRequest>,
+    ) -> Result<Response<ProduceBatchResponse>, Status> {
+        Err(Status::unimplemented(
+            "produce_batch is not used by this test",
+        ))
     }
 
     async fn consume(

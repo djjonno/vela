@@ -531,8 +531,8 @@ mod tests {
         ConsumeRequest, ConsumeResponse, ConsumedRecord, CreateTopicRequest, CreateTopicResponse,
         DeleteTopicRequest, DeleteTopicResponse, DescribeClusterRequest, DescribeClusterResponse,
         DescribeTopicRequest, DescribeTopicResponse, FindLeaderRequest, FindLeaderResponse,
-        ListTopicsRequest, ListTopicsResponse, LogBackend, PartitionInfo, ProduceRequest,
-        ProduceResponse, Record, TopicInfo,
+        ListTopicsRequest, ListTopicsResponse, LogBackend, PartitionInfo, ProduceBatchRequest,
+        ProduceBatchResponse, ProduceRequest, ProduceResponse, Record, TopicInfo,
     };
 
     use crate::seams::TokioClock;
@@ -854,6 +854,15 @@ mod tests {
         ) -> std::result::Result<Response<ProduceResponse>, Status> {
             self.produce_calls.fetch_add(1, Ordering::SeqCst);
             Err(Status::unimplemented("produce is not used by the consumer"))
+        }
+
+        async fn produce_batch(
+            &self,
+            _request: Request<ProduceBatchRequest>,
+        ) -> std::result::Result<Response<ProduceBatchResponse>, Status> {
+            Err(Status::unimplemented(
+                "produce_batch is not used by the consumer",
+            ))
         }
 
         async fn create_topic(

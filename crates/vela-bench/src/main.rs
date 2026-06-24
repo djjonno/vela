@@ -17,7 +17,7 @@ use clap::Parser;
 
 use vela_bench::cli::Cli;
 use vela_bench::outcome::exit_code;
-use vela_bench::run::run;
+use vela_bench::run::{run, run_external};
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> ExitCode {
@@ -29,10 +29,16 @@ async fn main() -> ExitCode {
     let cli = Cli::parse();
     let params = cli.to_params();
 
-    // `run` validates the parameters before any side effect, drives the full
-    // Benchmark_Run, emits the JSON/stdout/HTML outputs, and returns the single
-    // report. Range violations surface as a failing Outcome rather than a panic.
-    let report = run(params, cli.report_json, cli.report_html).await;
+    // `run`/`run_external` validate the parameters before any side effect, drive
+    // the full Benchmark_Run, emit the JSON/stdout/HTML outputs, and return the
+    // single report. Range violations surface as a failing Outcome rather than a
+    // panic. When `--endpoints` is supplied the benchmark connects to that live
+    // cluster; otherwise it starts its own in-process single-node cluster.
+    let report = if cli.endpoints.is_empty() {
+        run(params, cli.report_json, cli.report_html).await
+    } else {
+        run_external(params, cli.endpoints, cli.report_json, cli.report_html).await
+    };
 
     // Map the Outcome to the process exit status (Requirement 7.3).
     ExitCode::from(exit_code(&report.outcome))

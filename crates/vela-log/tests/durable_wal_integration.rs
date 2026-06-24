@@ -70,6 +70,13 @@ fn record(bytes: &[u8]) -> EntryPayload {
     EntryPayload::new(PayloadKind::Record, bytes.to_vec())
 }
 
+/// Build a `RecordBatch` payload from raw bytes. The bytes are opaque to
+/// `vela-log` (a length-delimited concatenation produced by `vela-core`); the
+/// log must carry and recover them exactly like any other payload.
+fn record_batch(bytes: &[u8]) -> EntryPayload {
+    EntryPayload::new(PayloadKind::RecordBatch, bytes.to_vec())
+}
+
 /// open → produce (append several entries) → commit → drop → reopen → read.
 ///
 /// Asserts that after a clean reopen the recovered log reports the same
@@ -247,5 +254,162 @@ fn compaction_then_reopen_preserves_log_start_and_retained_entries() {
         reopened.read(0, total - 1),
         expected_retained.to_vec(),
         "a read spanning the line returns only retained entries"
+    );
+}
+
+/// append(RecordBatch) → read back, in a single open.
+///
+/// Asserts that a `RecordBatch` entry round-trips through the live WAL: the
+/// assigned index follows the append contract and the entry read back carries
+/// the same `PayloadKind::RecordBatch` tag and the exact opaque bytes that were
+/// appended, alongside an ordinary `Record` entry so the two kinds coexist
+/// (batched-produce Requirement 2.1).
+#[test]
+fn record_batch_entry_round_trips_through_real_fs() {
+    let tmp = TempDir::new("record-batch-round-trip");
+    let cfg = WalConfig::new(tmp.path());
+
+    // A length-delimited-style opaque payload: vela-log never interprets it.
+    let batch_bytes: Vec<u8> = (0..64u8).collect();
+
+    let mut wal = DurableWal::open(cfg).expect("open on a fresh dir should succeed");
+
+    // A plain Record first, then the RecordBatch, so the new kind is exercised
+    // interleaved with the existing one.
+    let record_index = wal
+        .append(record(&[1, 2, 3]), 1)
+        .expect("append of a Record should persist");
+    assert_eq!(record_index, 0, "first append takes index 0");
+
+    let batch_index = wal
+        .append(record_batch(&batch_bytes), 1)
+        .expect("append of a RecordBatch should persist");
+    assert_eq!(batch_index, 1, "append must assign Last_Index + 1");
+    assert_eq!(wal.last_index(), Some(1));
+
+    // Read the batch entry back and assert kind and bytes round-trip exactly.
+    let read_back = wal
+        .entry(batch_index)
+        .expect("the RecordBatch entry must be readable");
+    assert_eq!(
+        read_back.payload.kind,
+        PayloadKind::RecordBatch,
+        "the RecordBatch kind tag must round-trip"
+    );
+    assert_eq!(
+        read_back.payload.bytes, batch_bytes,
+        "the opaque RecordBatch bytes must round-trip byte-for-byte"
+    );
+    assert_eq!(read_back.index, batch_index);
+    assert_eq!(read_back.term, 1);
+
+    // The unrelated Record entry is unaffected by the new kind.
+    let plain = wal
+        .entry(record_index)
+        .expect("the Record entry is present");
+    assert_eq!(plain.payload.kind, PayloadKind::Record);
+    assert_eq!(plain.payload.bytes, vec![1, 2, 3]);
+}
+
+/// append(RecordBatch) → commit → drop → reopen → read.
+///
+/// Asserts that the recovery/replay path preserves a `RecordBatch` entry: after
+/// a clean reopen, the recovered segment reports the same `PayloadKind` tag and
+/// opaque bytes, the same `last_index`/`commit_index`, and the snapshot's
+/// committed prefix carries the batch entry intact (batched-produce
+/// Requirements 2.1, 7.3).
+#[test]
+fn record_batch_entry_survives_reopen_recovery() {
+    let tmp = TempDir::new("record-batch-recovery");
+    let cfg = WalConfig::new(tmp.path());
+
+    // Mixed kinds across the log so recovery must preserve each entry's tag.
+    let expected: Vec<LogEntry> = vec![
+        LogEntry {
+            index: 0,
+            term: 1,
+            payload: record(&[0xAA, 0xBB]),
+        },
+        LogEntry {
+            index: 1,
+            term: 1,
+            payload: record_batch(&(0..40u8).collect::<Vec<u8>>()),
+        },
+        LogEntry {
+            index: 2,
+            term: 2,
+            payload: record_batch(&[]), // an empty-bytes batch must also recover
+        },
+        LogEntry {
+            index: 3,
+            term: 2,
+            payload: record(&[0xCC]),
+        },
+    ];
+
+    // --- produce: append the mixed entries on a fresh dir, then commit all.
+    {
+        let mut wal = DurableWal::open(cfg.clone()).expect("open on a fresh dir should succeed");
+        for entry in &expected {
+            let assigned = wal
+                .append(entry.payload.clone(), entry.term)
+                .expect("append under the Always policy should persist");
+            assert_eq!(assigned, entry.index, "append must assign Last_Index + 1");
+        }
+        wal.commit(3).expect("commit within bounds should succeed");
+        // `wal` is dropped here, releasing the directory lock before reopen.
+    }
+
+    // --- reopen: recovery must replay every entry with its kind and bytes.
+    let reopened = DurableWal::open(cfg).expect("reopen of an existing dir should succeed");
+
+    assert_eq!(
+        reopened.last_index(),
+        Some(3),
+        "Last_Index must survive reopen"
+    );
+    assert_eq!(
+        reopened.commit_index(),
+        Some(3),
+        "Commit_Index must survive reopen"
+    );
+
+    for entry in &expected {
+        let recovered = reopened
+            .entry(entry.index)
+            .unwrap_or_else(|| panic!("entry {} must be recovered", entry.index));
+        assert_eq!(
+            recovered.payload.kind, entry.payload.kind,
+            "kind of entry {} must be preserved across recovery",
+            entry.index
+        );
+        assert_eq!(
+            recovered.payload.bytes, entry.payload.bytes,
+            "bytes of entry {} must be preserved byte-for-byte across recovery",
+            entry.index
+        );
+        assert_eq!(
+            &recovered, entry,
+            "entry {} must recover intact",
+            entry.index
+        );
+    }
+
+    // The full range read returns every entry in ascending order.
+    assert_eq!(
+        reopened.read(0, 3),
+        expected,
+        "range read must match after recovery"
+    );
+
+    // The snapshot's committed prefix carries the RecordBatch entries intact.
+    let snapshot = reopened.snapshot();
+    assert_eq!(
+        snapshot,
+        Snapshot {
+            commit_index: Some(3),
+            entries: expected.clone(),
+        },
+        "snapshot must preserve the RecordBatch entries in the committed prefix"
     );
 }

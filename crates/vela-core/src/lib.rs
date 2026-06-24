@@ -16,7 +16,8 @@ pub mod topic;
 
 pub use consume::{consume, DEFAULT_MAX_RECORDS, MAX_MAX_RECORDS, MIN_MAX_RECORDS};
 pub use fleet::{
-    CommittedRecord, FleetError, GroupKey, PartitionReplica, RaftGroupFleet, StateMachine,
+    AppliedOffsets, CommittedRecord, FleetError, GroupKey, PartitionReplica, RaftGroupFleet,
+    StateMachine,
 };
 pub use metadata::{
     apply_command, metadata_group_key, MetadataController, MetadataRecoverError,
@@ -29,7 +30,11 @@ pub use model::{
 #[cfg(feature = "sim")]
 pub use partition_log::SimWalClock;
 pub use partition_log::{PartitionLog, PartitionLogKind};
-pub use produce::{produce, ProduceOutcome, COMMIT_TIMEOUT_MS, MAX_RECORD_BYTES};
+pub use produce::{
+    decode_record_batch, encode_record_batch, produce, produce_batch, validate_batch, BatchOutcome,
+    BatchRejection, ProduceOutcome, COMMIT_TIMEOUT_MS, MAX_BATCH_BYTES, MAX_BATCH_RECORDS,
+    MAX_RECORD_BYTES,
+};
 pub use reconcile::{plan_reconcile, ReconcilePlan};
 pub use router::PartitionRouter;
 pub use topic::CoreError;

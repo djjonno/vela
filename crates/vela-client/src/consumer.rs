@@ -131,7 +131,8 @@ mod tests {
         self, ConsumeRequest, ConsumeResponse, CreateTopicRequest, CreateTopicResponse,
         DeleteTopicRequest, DeleteTopicResponse, DescribeClusterRequest, DescribeClusterResponse,
         DescribeTopicRequest, DescribeTopicResponse, FindLeaderRequest, FindLeaderResponse,
-        ListTopicsRequest, ListTopicsResponse, ProduceRequest, ProduceResponse,
+        ListTopicsRequest, ListTopicsResponse, ProduceBatchRequest, ProduceBatchResponse,
+        ProduceRequest, ProduceResponse,
     };
 
     use super::Consumer;
@@ -224,6 +225,13 @@ mod tests {
             _request: Request<ProduceRequest>,
         ) -> Result<Response<ProduceResponse>, Status> {
             Err(Status::unimplemented("produce is not exercised here"))
+        }
+
+        async fn produce_batch(
+            &self,
+            _request: Request<ProduceBatchRequest>,
+        ) -> Result<Response<ProduceBatchResponse>, Status> {
+            Err(Status::unimplemented("produce_batch is not exercised here"))
         }
 
         async fn create_topic(

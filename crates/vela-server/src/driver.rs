@@ -37,8 +37,9 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::{mpsc, oneshot, Notify};
 
 use vela_core::{
-    apply_command, ClusterCommand, ClusterMetadata, CommittedRecord, CoreError, MetadataController,
-    NodeId, Offset, PartitionReplica, StateMachine, COMMIT_TIMEOUT_MS,
+    apply_command, decode_record_batch, encode_record_batch, ClusterCommand, ClusterMetadata,
+    CommittedRecord, CoreError, MetadataController, NodeId, Offset, PartitionReplica, Record,
+    StateMachine, COMMIT_TIMEOUT_MS,
 };
 use vela_raft::{
     Clock, EntryPayload, LogEntry, LogStorage, NodeId as RaftNodeId, PayloadKind, RaftInput,
@@ -94,6 +95,22 @@ pub enum DriverCommand {
         value: Vec<u8>,
         /// Channel for the produce result.
         reply: oneshot::Sender<Result<Offset, ProduceError>>,
+    },
+    /// A client batch produce: append one `RecordBatch` entry on the leader and
+    /// report `(base_offset, count)` once it commits (batched-produce
+    /// Requirement 1, 2, 7).
+    ///
+    /// The whole batch is carried as a single Raft entry — one
+    /// `RaftInput::Propose(RecordBatch)` → one append → one commit — so its
+    /// records take a contiguous offset run `base_offset..base_offset+count`
+    /// with `base_offset` the count of records committed before the batch
+    /// entry's index (Requirement 1.3, 2.1, 2.4, 7.3).
+    ProduceBatch {
+        /// The ordered record value bytes to append as one entry.
+        values: Vec<Vec<u8>>,
+        /// Channel for the batch result: the base offset and record count, or a
+        /// typed error.
+        reply: oneshot::Sender<Result<(Offset, u32), ProduceError>>,
     },
     /// The commit deadline for the pending produce targeting log index `target`
     /// elapsed (Requirement 4.9).
@@ -160,13 +177,45 @@ pub enum DriverCommand {
     Shutdown,
 }
 
+/// How to resolve a produce awaiting commit, distinguishing a single-record
+/// produce (one offset) from a batch produce (`(base_offset, count)`).
+enum PendingReply {
+    /// A single-record produce: resolved with the offset of the record at the
+    /// pending entry's index.
+    Single(oneshot::Sender<Result<Offset, ProduceError>>),
+    /// A batch produce: resolved with the base offset (the count of records
+    /// committed before the batch entry's index) and the batch's record
+    /// `count`.
+    Batch {
+        /// The number of records the batch entry carries.
+        count: u32,
+        /// The caller awaiting the batch result.
+        reply: oneshot::Sender<Result<(Offset, u32), ProduceError>>,
+    },
+}
+
 /// A produce awaiting commit: the log index it landed at and the caller to
 /// resolve once that index commits.
 struct Pending {
-    /// The log index the proposed record occupies.
+    /// The log index the proposed entry occupies.
     target: u64,
-    /// The caller awaiting the committed offset.
-    reply: oneshot::Sender<Result<Offset, ProduceError>>,
+    /// How to resolve the caller once `target` commits (single or batch).
+    reply: PendingReply,
+}
+
+impl PendingReply {
+    /// Fail the awaiting caller with `err`, sending it through whichever reply
+    /// variant this pending holds.
+    fn fail(self, err: ProduceError) {
+        match self {
+            PendingReply::Single(reply) => {
+                let _ = reply.send(Err(err));
+            }
+            PendingReply::Batch { reply, .. } => {
+                let _ = reply.send(Err(err));
+            }
+        }
+    }
 }
 
 /// The owner of one partition replica and its command queue.
@@ -261,10 +310,13 @@ impl PartitionDriver {
                 DriverCommand::Produce { value, reply } => {
                     self.handle_produce(value, reply);
                 }
+                DriverCommand::ProduceBatch { values, reply } => {
+                    self.handle_produce_batch(values, reply);
+                }
                 DriverCommand::ProduceTimeout { target } => {
                     if let Some(pos) = self.pending.iter().position(|p| p.target == target) {
                         let pending = self.pending.remove(pos).expect("position just found");
-                        let _ = pending.reply.send(Err(ProduceError::CommitTimeout));
+                        pending.reply.fail(ProduceError::CommitTimeout);
                     }
                 }
                 DriverCommand::Consume { offset, max, reply } => {
@@ -314,7 +366,69 @@ impl PartitionDriver {
         }
 
         // Otherwise await replication; resolve on commit or after the deadline.
-        self.pending.push_back(Pending { target, reply });
+        self.pending.push_back(Pending {
+            target,
+            reply: PendingReply::Single(reply),
+        });
+        let tx = self.self_tx.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(COMMIT_TIMEOUT_MS)).await;
+            let _ = tx.send(DriverCommand::ProduceTimeout { target });
+        });
+    }
+
+    /// Append a produced batch as **one** `RecordBatch` entry on the leader and
+    /// either resolve immediately (single-node commit) or register it as pending
+    /// with a commit deadline.
+    ///
+    /// The whole batch is a single `RaftInput::Propose(RecordBatch)` — one
+    /// append, one fsync under `SyncPolicy::Always`, one commit as one
+    /// replicated unit (batched-produce Requirement 7.1, 7.2, 7.3). On commit
+    /// the batch's records take the contiguous run
+    /// `base_offset..base_offset+count`, where `base_offset` is the count of
+    /// records committed before the batch entry's index (Requirement 1.3, 2.1,
+    /// 2.4).
+    fn handle_produce_batch(
+        &mut self,
+        values: Vec<Vec<u8>>,
+        reply: oneshot::Sender<Result<(Offset, u32), ProduceError>>,
+    ) {
+        if self.replica.role() != Role::Leader {
+            let _ = reply.send(Err(ProduceError::NotLeader));
+            return;
+        }
+
+        let count = values.len() as u32;
+
+        // Reconstruct keyless domain records (keys are unpersisted, matching the
+        // single-record path) and encode them into one `RecordBatch` payload.
+        let records: Vec<Record> = values
+            .into_iter()
+            .map(|value| Record::new(None, value))
+            .collect();
+        let bytes = encode_record_batch(&records);
+
+        // The log index this batch entry will occupy once appended.
+        let target = self.replica.raft().log().last_index().map_or(0, |i| i + 1);
+
+        let payload = EntryPayload::new(PayloadKind::RecordBatch, bytes);
+        let out = self
+            .replica
+            .step(RaftInput::Propose(payload), &mut self.clock);
+        self.after_step(out, None);
+
+        if self.committed_through(target) {
+            // Committed within this step (the leader is its own majority in a
+            // single-node group): resolve with the base offset + count now.
+            let _ = reply.send(Ok((self.base_offset_at(target), count)));
+            return;
+        }
+
+        // Otherwise await replication; resolve on commit or after the deadline.
+        self.pending.push_back(Pending {
+            target,
+            reply: PendingReply::Batch { count, reply },
+        });
         let tx = self.self_tx.clone();
         tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_millis(COMMIT_TIMEOUT_MS)).await;
@@ -354,13 +468,24 @@ impl PartitionDriver {
     }
 
     /// Resolve every pending produce whose target index is now committed, in
-    /// order, assigning each its gap-free offset (Requirement 4.4, 4.7).
+    /// order, assigning each its gap-free offset (Requirement 4.4, 4.7). A
+    /// single produce resolves with the offset of its record; a batch resolves
+    /// with its base offset and record count (batched-produce Requirement 1.3,
+    /// 2.4).
     fn resolve_pending(&mut self) {
         while let Some(front) = self.pending.front() {
             if self.committed_through(front.target) {
                 let pending = self.pending.pop_front().expect("front just observed");
-                let offset = self.offset_at(pending.target);
-                let _ = pending.reply.send(Ok(offset));
+                match pending.reply {
+                    PendingReply::Single(reply) => {
+                        let offset = self.offset_at(pending.target);
+                        let _ = reply.send(Ok(offset));
+                    }
+                    PendingReply::Batch { count, reply } => {
+                        let base = self.base_offset_at(pending.target);
+                        let _ = reply.send(Ok((base, count)));
+                    }
+                }
             } else {
                 break;
             }
@@ -375,18 +500,54 @@ impl PartitionDriver {
             .is_some_and(|c| c >= target)
     }
 
-    /// The record offset assigned to the (committed) entry at log index
-    /// `target`: its position among record-kind entries, 0-based.
-    fn offset_at(&self, target: u64) -> Offset {
-        let records = self
-            .replica
+    /// The number of record **positions** committed before log index `index`:
+    /// the sum, over entries with log index strictly less than `index`, of the
+    /// record positions each contributes — `1` for a single
+    /// [`PayloadKind::Record`] entry, the decoded record count for a
+    /// [`PayloadKind::RecordBatch`] entry, and `0` for a `Noop`/`Cluster` entry.
+    ///
+    /// This is the gap-free, 0-based offset the next record appended at `index`
+    /// would receive, generalised so a batch entry counts as its N record
+    /// positions (batched-produce Requirement 2.4, 2.5, 4.5).
+    fn records_before(&self, index: u64) -> u64 {
+        if index == 0 {
+            return 0;
+        }
+        // `read(0, index)` is inclusive of `index`; filter to entries strictly
+        // before it so the entry at `index` itself does not count.
+        self.replica
             .raft()
             .log()
-            .read(0, target)
+            .read(0, index)
             .iter()
-            .filter(|e| e.payload.kind == PayloadKind::Record)
-            .count() as u64;
-        records.saturating_sub(1)
+            .filter(|e| e.index < index)
+            .map(Self::record_positions)
+            .sum()
+    }
+
+    /// The number of record positions a committed `entry` contributes to the
+    /// partition's offset space: `1` for a single record, the decoded record
+    /// count for a batch, `0` otherwise.
+    fn record_positions(entry: &LogEntry) -> u64 {
+        match entry.payload.kind {
+            PayloadKind::Record => 1,
+            PayloadKind::RecordBatch => decode_record_batch(&entry.payload.bytes).len() as u64,
+            PayloadKind::Noop | PayloadKind::Cluster => 0,
+        }
+    }
+
+    /// The record offset assigned to the (committed) single-record entry at log
+    /// index `target`: the count of record positions committed before its
+    /// index, 0-based (Requirement 4.4, 4.7).
+    fn offset_at(&self, target: u64) -> Offset {
+        self.records_before(target)
+    }
+
+    /// The base offset of the (committed) batch entry at log index `target`: the
+    /// count of record positions committed before the batch entry's index, so
+    /// its Nth record takes `base_offset + N` (batched-produce Requirement 2.4).
+    fn base_offset_at(&self, target: u64) -> Offset {
+        self.records_before(target)
     }
 
     /// This replica's known current leader as a domain [`NodeId`]: its own id
@@ -594,6 +755,7 @@ impl MetadataDriver {
                 // channel signals the caller) rather than treating them as Raft
                 // inputs.
                 DriverCommand::Produce { .. }
+                | DriverCommand::ProduceBatch { .. }
                 | DriverCommand::Consume { .. }
                 | DriverCommand::ProduceTimeout { .. } => {}
             }
@@ -1042,6 +1204,164 @@ mod tests {
             })
             .expect("driver accepts produce");
         reply_rx.await.expect("driver replies to produce")
+    }
+
+    /// Read the committed records of the driver's partition starting at `offset`.
+    async fn consume(handle: &DriverHandle, offset: u64, max: usize) -> Vec<CommittedRecord> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        handle
+            .send(DriverCommand::Consume {
+                offset,
+                max,
+                reply: reply_tx,
+            })
+            .expect("driver accepts consume");
+        reply_rx.await.expect("driver replies to consume")
+    }
+
+    /// A [`Clock`] that never advances and whose `arm` is a no-op, used to
+    /// pre-drive a replica to leader synchronously before the async driver is
+    /// spawned. Consensus is driven entirely by explicit inputs, so the replica
+    /// is left in exactly the state the test steps it into.
+    struct NoopClock;
+
+    impl Clock for NoopClock {
+        fn now(&self) -> std::time::Instant {
+            std::time::Instant::now()
+        }
+        fn arm(&mut self, _kind: TimerKind, _dur: Duration) {}
+    }
+
+    /// Pre-elect `self_id` as the leader of a two-voter partition group
+    /// (`self_id`, `peer_id`) **before** spawning its driver, then spawn it over
+    /// a [`GrpcTransport`] with an empty peer pool so `peer_id` is never
+    /// reachable. Returns the driver handle and the log index the next proposed
+    /// entry will occupy (the commit-timeout timer's `target`).
+    ///
+    /// The leader is established synchronously with a [`NoopClock`] (self-vote on
+    /// the first election tick, then `peer_id`'s granted vote — a majority of
+    /// two). Vela's Raft appends no entry on becoming leader and a leader ignores
+    /// later election ticks, so the captured `target` stays correct: with the
+    /// peer unreachable no proposal can reach a majority, so an appended entry
+    /// stays uncommitted until its deadline.
+    fn spawn_pre_elected_leader(topic: &str, self_id: &str, peer_id: &str) -> (DriverHandle, u64) {
+        let mut replica = PartitionReplica::new(raft_node_id(self_id), vec![raft_node_id(peer_id)]);
+
+        // Drive the replica to leader: an election self-vote plus the peer's one
+        // granted reply is a majority of two.
+        let mut clock = NoopClock;
+        replica.step(RaftInput::Tick(TimerKind::Election), &mut clock);
+        replica.step(
+            RaftInput::Message(RaftMessage::RequestVoteReply(vela_raft::RequestVoteReply {
+                term: replica.raft().current_term(),
+                vote_granted: true,
+                voter: raft_node_id(peer_id),
+            })),
+            &mut clock,
+        );
+        assert_eq!(
+            replica.role(),
+            Role::Leader,
+            "{self_id} must reach partition leadership with a majority of votes"
+        );
+
+        // The log index the next proposed entry (the batch) will occupy. Vela's
+        // Raft appends no leader noop, so this is stable until that propose.
+        let target = replica.raft().log().last_index().map_or(0, |i| i + 1);
+
+        let (tx, rx) = mpsc::unbounded_channel();
+        let clock = TimerClock::new(tx.clone());
+        let transport = GrpcTransport::new(
+            topic.to_string(),
+            0,
+            self_id.to_string(),
+            Arc::new(PeerPool::new()),
+            tx.clone(),
+        );
+        let leader_lookup = HashMap::from([
+            (raft_node_id(self_id), NodeId::new(self_id)),
+            (raft_node_id(peer_id), NodeId::new(peer_id)),
+        ]);
+        let driver = PartitionDriver::new(
+            topic.to_string(),
+            0,
+            self_id.to_string(),
+            replica,
+            clock,
+            transport,
+            rx,
+            tx.clone(),
+            leader_lookup,
+        );
+        driver.spawn();
+        (tx, target)
+    }
+
+    /// Batched-produce Requirements 2.3, 6.3, 8.4: a `ProduceBatch` whose
+    /// `RecordBatch` entry cannot be replicated to a majority within
+    /// `Commit_Timeout` fails with a caller-visible timeout, returns no offset,
+    /// and leaves the partition's committed offset unchanged.
+    ///
+    /// This drives the real driver timeout machinery deterministically: the
+    /// batch is appended on a pre-elected leader whose lone peer is unreachable,
+    /// so it can never commit, then the elapsed deadline is modelled by
+    /// delivering the same `DriverCommand::ProduceTimeout { target }` the armed
+    /// `COMMIT_TIMEOUT_MS` timer would post — exactly as
+    /// `metadata_propose_tests::leader_propose_that_never_commits_times_out` does
+    /// for the metadata propose path — rather than sleeping out the 5 s window.
+    #[tokio::test]
+    async fn batch_that_cannot_reach_a_majority_times_out_and_commits_nothing() {
+        let (handle, target) = spawn_pre_elected_leader("orders", "node-a", "node-b");
+
+        // Sanity: the pre-elected node leads, so the batch is appended locally
+        // (not rejected as NotLeader) and then awaits a majority that never forms.
+        assert_eq!(
+            known_leader(&handle).await,
+            Some(NodeId::new("node-a")),
+            "the pre-elected node reports itself as the current leader"
+        );
+
+        // Append the batch as one RecordBatch entry: the leader appends it but
+        // cannot commit it without the unreachable peer's ack, so it registers as
+        // pending and arms its commit-timeout timer.
+        let batch = vec![b"a".to_vec(), b"b".to_vec(), b"c".to_vec()];
+        let (reply_tx, reply_rx) = oneshot::channel();
+        handle
+            .send(DriverCommand::ProduceBatch {
+                values: batch,
+                reply: reply_tx,
+            })
+            .expect("driver accepts produce_batch");
+
+        // Model the elapsed commit deadline by delivering the same
+        // `ProduceTimeout` the armed timer would post once `COMMIT_TIMEOUT_MS`
+        // passes — ordered after the batch on the same queue, so the pending
+        // entry is already registered when it arrives (Requirement 6.3).
+        handle
+            .send(DriverCommand::ProduceTimeout { target })
+            .expect("driver accepts the produce-timeout poke");
+
+        // The caller sees a timeout error carrying no offset (Requirement 2.3,
+        // 6.3, 8.4).
+        let result = reply_rx.await.expect("driver replies to produce_batch");
+        assert_eq!(
+            result,
+            Err(ProduceError::CommitTimeout),
+            "a batch that cannot reach a majority within Commit_Timeout must fail \
+             with a timeout error and no offset"
+        );
+
+        // The partition's committed offset is unchanged: nothing committed, so a
+        // consume from offset 0 returns no records (Requirement 2.3, 6.3).
+        let committed = consume(&handle, 0, 10).await;
+        assert!(
+            committed.is_empty(),
+            "a timed-out batch commits no records, so the partition stays empty; \
+             got {} record(s)",
+            committed.len()
+        );
+
+        let _ = handle.send(DriverCommand::Shutdown);
     }
 
     #[tokio::test]

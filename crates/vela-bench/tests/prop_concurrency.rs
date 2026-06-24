@@ -80,6 +80,7 @@ fn params(record_count: u64, producer_concurrency: u32) -> WorkloadParameters {
         key_mode: KeyMode::Keyless,
         partition_count: 1,
         producer_concurrency,
+        batch_size: 1,
         topic: "vela-bench".to_string(),
         warmup: 0,
         time_budget: Duration::from_secs(60),

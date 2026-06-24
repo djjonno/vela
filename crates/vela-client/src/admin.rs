@@ -372,7 +372,8 @@ mod routing_tests {
         self, ConsumeRequest, ConsumeResponse, CreateTopicRequest, CreateTopicResponse,
         DeleteTopicRequest, DeleteTopicResponse, DescribeClusterRequest, DescribeClusterResponse,
         DescribeTopicRequest, DescribeTopicResponse, FindLeaderRequest, FindLeaderResponse,
-        ListTopicsRequest, ListTopicsResponse, ProduceRequest, ProduceResponse, TopicInfo,
+        ListTopicsRequest, ListTopicsResponse, ProduceBatchRequest, ProduceBatchResponse,
+        ProduceRequest, ProduceResponse, TopicInfo,
     };
 
     use super::{AdminClient, LogBackend};
@@ -534,6 +535,13 @@ mod routing_tests {
             _request: Request<ProduceRequest>,
         ) -> Result<Response<ProduceResponse>, Status> {
             Err(Status::unimplemented("produce is not exercised here"))
+        }
+
+        async fn produce_batch(
+            &self,
+            _request: Request<ProduceBatchRequest>,
+        ) -> Result<Response<ProduceBatchResponse>, Status> {
+            Err(Status::unimplemented("produce_batch is not exercised here"))
         }
 
         async fn consume(

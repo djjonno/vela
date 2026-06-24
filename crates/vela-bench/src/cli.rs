@@ -24,7 +24,7 @@ use std::time::Duration;
 use clap::{Parser, ValueEnum};
 
 use crate::params::{
-    KeyMode, WorkloadParameters, DEFAULT_KEY_MODE, DEFAULT_PARTITION_COUNT,
+    KeyMode, WorkloadParameters, DEFAULT_BATCH_SIZE, DEFAULT_KEY_MODE, DEFAULT_PARTITION_COUNT,
     DEFAULT_PRODUCER_CONCURRENCY, DEFAULT_RECORD_COUNT, DEFAULT_STARTUP_BUDGET,
     DEFAULT_TIME_BUDGET, DEFAULT_TOPIC, DEFAULT_VALUE_SIZE, DEFAULT_WARMUP,
 };
@@ -112,6 +112,10 @@ pub struct Cli {
     #[arg(long, default_value_t = DEFAULT_PRODUCER_CONCURRENCY, env = "VELA_BENCH_PRODUCER_CONCURRENCY")]
     pub producer_concurrency: u32,
 
+    /// Records produced per Produce_Batch (1..=10_000; default 1).
+    #[arg(long, default_value_t = DEFAULT_BATCH_SIZE, env = "VELA_BENCH_BATCH_SIZE")]
+    pub batch_size: u32,
+
     /// Target topic name (1..=255 characters).
     #[arg(long, default_value = DEFAULT_TOPIC, env = "VELA_BENCH_TOPIC")]
     pub topic: String,
@@ -148,6 +152,19 @@ pub struct Cli {
     /// surfaced separately for the entry point.
     #[arg(long, value_name = "PATH", env = "VELA_BENCH_REPORT_HTML")]
     pub report_html: Option<PathBuf>,
+
+    /// Live cluster endpoint(s) to benchmark against, comma-separated — each
+    /// `host:port`, `http://host:port`, or `id@addr`. When omitted, the
+    /// benchmark starts its own in-process single-node cluster instead. Not
+    /// part of the validated workload; it selects the Cluster_Under_Test, so it
+    /// is surfaced separately for the entry point.
+    #[arg(
+        long,
+        value_delimiter = ',',
+        value_name = "ENDPOINT",
+        env = "VELA_BENCH_ENDPOINTS"
+    )]
+    pub endpoints: Vec<String>,
 }
 
 impl Cli {
@@ -165,6 +182,7 @@ impl Cli {
             key_mode: self.key_mode.into(),
             partition_count: self.partition_count,
             producer_concurrency: self.producer_concurrency,
+            batch_size: self.batch_size,
             topic: self.topic.clone(),
             warmup: self.warmup,
             time_budget: Duration::from_secs(self.time_budget_secs),
@@ -211,6 +229,8 @@ mod tests {
             "8",
             "--producer-concurrency",
             "32",
+            "--batch-size",
+            "64",
             "--topic",
             "bench-topic",
             "--warmup",
@@ -240,6 +260,7 @@ mod tests {
                 key_mode: KeyMode::Keyed,
                 partition_count: 8,
                 producer_concurrency: 32,
+                batch_size: 64,
                 topic: "bench-topic".to_string(),
                 warmup: 100,
                 time_budget: Duration::from_secs(120),
@@ -256,6 +277,51 @@ mod tests {
             cli.report_html.as_deref(),
             Some(PathBuf::from("/tmp/report.html").as_path())
         );
+    }
+
+    /// `--batch-size` defaults to 1 (`DEFAULT_BATCH_SIZE`) when omitted and
+    /// parses an explicit value onto both the CLI field and the mapped
+    /// `WorkloadParameters` (Requirement 9.1).
+    #[test]
+    fn batch_size_defaults_to_one_and_parses() {
+        let default = Cli::try_parse_from(["vela-bench"]).expect("defaults parse");
+        assert_eq!(default.batch_size, DEFAULT_BATCH_SIZE);
+        assert_eq!(default.batch_size, 1);
+        assert_eq!(default.to_params().batch_size, 1);
+
+        let parsed =
+            Cli::try_parse_from(["vela-bench", "--batch-size", "8"]).expect("batch-size parses");
+        assert_eq!(parsed.batch_size, 8);
+        assert_eq!(parsed.to_params().batch_size, 8);
+    }
+
+    /// `--endpoints` defaults to empty (the in-process cluster is used) and
+    /// parses a comma-separated list into the `endpoints` field, which is not
+    /// part of the validated `WorkloadParameters`.
+    #[test]
+    fn endpoints_default_empty_and_parse_comma_separated() {
+        let default = Cli::try_parse_from(["vela-bench"]).expect("defaults parse");
+        assert!(
+            default.endpoints.is_empty(),
+            "no --endpoints means the in-process cluster is used"
+        );
+
+        let parsed = Cli::try_parse_from([
+            "vela-bench",
+            "--endpoints",
+            "127.0.0.1:7001,http://127.0.0.1:7002,node3@127.0.0.1:7003",
+        ])
+        .expect("a comma-separated --endpoints list parses");
+        assert_eq!(
+            parsed.endpoints,
+            vec![
+                "127.0.0.1:7001".to_string(),
+                "http://127.0.0.1:7002".to_string(),
+                "node3@127.0.0.1:7003".to_string(),
+            ]
+        );
+        // The endpoints selector is not part of the validated workload.
+        assert_eq!(parsed.to_params(), WorkloadParameters::default());
     }
 
     /// The `--key-mode` value enum maps onto the domain [`KeyMode`] for both

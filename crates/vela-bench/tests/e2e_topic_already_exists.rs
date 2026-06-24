@@ -55,6 +55,7 @@ fn params(topic: String) -> WorkloadParameters {
         key_mode: KeyMode::Keyless,
         partition_count: 2,
         producer_concurrency: 4,
+        batch_size: 1,
         topic,
         warmup: 0,
         time_budget: Duration::from_secs(60),

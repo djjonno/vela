@@ -624,6 +624,24 @@ pub(crate) mod fault {
                 $vis fn arm_write_failure_for(&self, path: &Path) {
                     self.lock().write_fail_paths.insert(path.to_path_buf());
                 }
+
+                /// The total number of fsync calls (`sync_all`, `sync_data`,
+                /// and `sync_dir`) this filesystem has observed since it was
+                /// created.
+                ///
+                /// Read-only inspection used by durability tests to observe how
+                /// many forces an operation performs. It lets a batched-produce
+                /// test assert that appending one `RecordBatch` entry forces to
+                /// stable storage with the same number of syncs as one
+                /// single-record append — and strictly fewer than appending the
+                /// same records as N separate single-record appends — so a
+                /// batch's durability cost is amortized over all its records
+                /// (batched-produce Requirement 7.1, 7.2). Like the `arm_*`
+                /// fault hooks it is gated to the simulation/test surface and
+                /// never compiled into production builds.
+                $vis fn fsync_count(&self) -> u64 {
+                    self.lock().fsync_count
+                }
             }
         };
     }

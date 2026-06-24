@@ -1551,6 +1551,7 @@ dependencies = [
  "tonic",
  "tracing",
  "tracing-subscriber",
+ "vela-client",
  "vela-core",
  "vela-log",
  "vela-proto",

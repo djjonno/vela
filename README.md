@@ -154,16 +154,27 @@ virtual-time budget so a simulation always terminates.
 ### Throughput Benchmark
 
 `vela-bench` measures Vela's end-to-end produce and consume throughput. It is a
-self-contained binary: it stands up an **in-process single-node cluster**, drives
-a configurable workload through the public `vela-client` Producer/Consumer APIs,
-verifies that every produced record is read back, and emits three coordinated
-outputs from one run — a machine-readable JSON report, a human-readable stdout
-summary, and a self-contained HTML report. The process exits `0` on a passing
-run and non-zero on a failing one (an operation error, a data-integrity
-violation, an exceeded time budget, or a breached throughput floor).
+self-contained binary: by default it stands up an **in-process single-node
+cluster**, drives a configurable workload through the public `vela-client`
+Producer/Consumer APIs, verifies that every produced record is read back, and
+emits three coordinated outputs from one run — a machine-readable JSON report, a
+human-readable stdout summary, and a self-contained HTML report. The process
+exits `0` on a passing run and non-zero on a failing one (an operation error, a
+data-integrity violation, an exceeded time budget, or a breached throughput
+floor).
 
-You do **not** need to start a server first — the benchmark owns its cluster for
-the duration of the run.
+By default you do **not** need to start a server first — the benchmark owns its
+cluster for the duration of the run. To instead benchmark an already-running
+deployment (e.g. the Docker Compose cluster), pass `--endpoints` with one or more
+bootstrap endpoints; the benchmark seeds a client from them, discovers the rest
+of the membership itself, and leaves the externally-managed cluster running when
+the run finishes.
+
+```bash
+# Benchmark a live cluster instead of an in-process one
+cargo run -p vela-bench --release -- \
+  --endpoints 127.0.0.1:7001,127.0.0.1:7002,127.0.0.1:7003
+```
 
 ```bash
 # Run with the documented defaults (prints a summary to stdout)
@@ -176,8 +187,15 @@ cargo run -p vela-bench --release -- \
 
 # A small, quick run
 cargo run -p vela-bench --release -- \
-  --record-count 1000 --value-size 128 --partition-count 2 --time-budget-secs 30
+  --record-count 200 --value-size 128 --partition-count 2 --time-budget-secs 60
 ```
+
+> Note: produce runs on the durable write-ahead log, which `fsync`s every
+> append, so sustained produce throughput is modest (tens of records/sec).
+> Size `--record-count` and `--time-budget-secs` accordingly — a run that
+> exceeds its budget mid-produce reports a failing Outcome with
+> `TimeBudgetExceeded` (and `0` acknowledged records, since the counts populate
+> only once the produce phase completes).
 
 The workload is configurable via flags (each also reads from a `VELA_BENCH_*`
 environment variable; run `cargo run -p vela-bench -- --help` for the full list):
@@ -197,6 +215,7 @@ environment variable; run `cargo run -p vela-bench -- --help` for the full list)
 | `--floor-consume-rps <f64>` | — | fail if measured consume records/s is below this |
 | `--report-json <path>` | — | write the JSON report to this path |
 | `--report-html <path>` | — | write the HTML report to this path |
+| `--endpoints <list>` | — | comma-separated live cluster endpoints (`host:port`, `http://host:port`, or `id@addr`); when omitted, an in-process cluster is used |
 
 Throughput on shared/CI hardware varies run to run, so the benchmark is treated
 as a continuously exercised, regression-detecting measurement rather than a

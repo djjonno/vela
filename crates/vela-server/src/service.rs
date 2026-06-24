@@ -25,8 +25,8 @@ use tokio::sync::oneshot;
 use tonic::{Request, Response, Status};
 
 use vela_core::{
-    CoreError, NodeId, PartitionIndex, DEFAULT_MAX_RECORDS, MAX_MAX_RECORDS, MAX_RECORD_BYTES,
-    MIN_MAX_RECORDS,
+    validate_batch, BatchRejection, CoreError, NodeId, PartitionIndex, DEFAULT_MAX_RECORDS,
+    MAX_MAX_RECORDS, MAX_RECORD_BYTES, MIN_MAX_RECORDS,
 };
 use vela_raft::RaftMessage;
 
@@ -177,6 +177,93 @@ impl VelaClient for VelaClientService {
                 Err(convert::core_error_to_status(&CoreError::CommitTimeout))
             }
             Err(_) => Err(Status::internal("produce result was dropped")),
+        }
+    }
+
+    async fn produce_batch(
+        &self,
+        request: Request<v1::ProduceBatchRequest>,
+    ) -> Result<Response<v1::ProduceBatchResponse>, Status> {
+        let req = request.into_inner();
+        let partition = PartitionIndex(req.partition);
+
+        // Validate topic admission and partition existence against metadata,
+        // exactly as the single-record `produce` path (Requirement 6.4, 6.5,
+        // 6.6). Any metadata `leader` field is only a non-authoritative initial
+        // hint (Requirement 8.4); the live Raft-elected leader for a redirect is
+        // read from the partition driver below.
+        {
+            let metadata = self.node.metadata.lock().expect("metadata mutex poisoned");
+            metadata
+                .ensure_producible(&req.topic)
+                .map_err(|e| convert::core_error_to_status(&e))?;
+            metadata
+                .topics
+                .get(&req.topic)
+                .and_then(|t| t.partitions.iter().find(|p| p.index == partition))
+                .ok_or_else(|| {
+                    convert::core_error_to_status(&Self::not_found(&req.topic, req.partition))
+                })?;
+        }
+
+        // Validate the whole batch BEFORE any append, so a rejected batch
+        // appends nothing and leaves the partition unchanged (Requirement 2.2,
+        // 3.6). `BatchRejection` maps to the matching typed `CoreError` carrying
+        // the requirement-mandated values (Requirement 3.1-3.5).
+        let records: Vec<vela_core::Record> = req
+            .records
+            .into_iter()
+            .map(convert::record_from_proto)
+            .collect();
+        if let Err(rejection) = validate_batch(&records) {
+            let error = match rejection {
+                BatchRejection::Empty => CoreError::EmptyBatch,
+                BatchRejection::RecordTooLarge { index, size } => {
+                    CoreError::RecordTooLargeAt { index, size }
+                }
+                BatchRejection::TooManyRecords { max, submitted } => {
+                    CoreError::BatchTooManyRecords { max, submitted }
+                }
+                BatchRejection::TooLarge { max, submitted } => {
+                    CoreError::BatchTooLarge { max, submitted }
+                }
+            };
+            return Err(convert::core_error_to_status(&error));
+        }
+
+        let handle = self.node.handle(&req.topic, req.partition).ok_or_else(|| {
+            convert::core_error_to_status(&Self::not_found(&req.topic, req.partition))
+        })?;
+
+        // Keys remain unpersisted (matching the single-record path); the batch
+        // entry carries the ordered value bytes.
+        let values: Vec<Vec<u8>> = records.into_iter().map(|r| r.value).collect();
+
+        let (reply_tx, reply_rx) = oneshot::channel();
+        handle
+            .send(DriverCommand::ProduceBatch {
+                values,
+                reply: reply_tx,
+            })
+            .map_err(|_| Status::unavailable("partition driver is not running"))?;
+
+        match reply_rx.await {
+            Ok(Ok((base, count))) => Ok(Response::new(v1::ProduceBatchResponse {
+                base_offset: base,
+                count,
+            })),
+            Ok(Err(ProduceError::NotLeader)) => {
+                // Redirect to the partition's live Raft-elected leader, not the
+                // stale metadata `leader` field (Requirement 6.1, 8.3, 8.4).
+                let leader = Self::known_leader(&handle).await;
+                Err(convert::core_error_to_status(&CoreError::NotLeader {
+                    leader,
+                }))
+            }
+            Ok(Err(ProduceError::CommitTimeout)) => {
+                Err(convert::core_error_to_status(&CoreError::CommitTimeout))
+            }
+            Err(_) => Err(Status::internal("produce batch result was dropped")),
         }
     }
 
@@ -596,13 +683,14 @@ mod tests {
 
     use std::collections::HashMap;
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Mutex;
 
     use tokio::sync::mpsc;
 
     use vela_core::{
         ClusterMetadata, CommittedRecord, LogBackend, Member, MetadataController, NodeAvailability,
-        Offset, Partition, Topic, TopicState,
+        Offset, Partition, Topic, TopicState, MAX_BATCH_BYTES, MAX_BATCH_RECORDS,
     };
 
     use crate::registry::raft_node_id;
@@ -622,18 +710,26 @@ mod tests {
         known_leader: Option<NodeId>,
         /// The result a `Produce` command resolves to.
         produce: Result<Offset, ProduceError>,
+        /// The result a `ProduceBatch` command resolves to (base offset, count).
+        produce_batch: Result<(Offset, u32), ProduceError>,
+        /// Set to `true` the moment a [`DriverCommand::ProduceBatch`] reaches the
+        /// driver, so a test can assert a rejected batch never appended — i.e.
+        /// the request never reached the driver (Requirement 2.2, 3.6, 6.4-6.6).
+        produce_batch_seen: Arc<AtomicBool>,
         /// The records a `Consume` command resolves to.
         consume: Vec<CommittedRecord>,
     }
 
     impl MockDriver {
         /// A driver reporting `leader` as its live known leader; it rejects
-        /// produces as a non-leader and reads back nothing (the defaults the
-        /// redirect-path tests use).
+        /// produces (single and batch) as a non-leader and reads back nothing
+        /// (the defaults the redirect-path tests use).
         fn reporting(leader: Option<&str>) -> Self {
             Self {
                 known_leader: leader.map(NodeId::new),
                 produce: Err(ProduceError::NotLeader),
+                produce_batch: Err(ProduceError::NotLeader),
+                produce_batch_seen: Arc::new(AtomicBool::new(false)),
                 consume: Vec::new(),
             }
         }
@@ -649,6 +745,10 @@ mod tests {
                         }
                         DriverCommand::Produce { reply, .. } => {
                             let _ = reply.send(self.produce);
+                        }
+                        DriverCommand::ProduceBatch { reply, .. } => {
+                            self.produce_batch_seen.store(true, Ordering::SeqCst);
+                            let _ = reply.send(self.produce_batch);
                         }
                         DriverCommand::Consume { reply, .. } => {
                             let _ = reply.send(self.consume.clone());
@@ -732,6 +832,23 @@ mod tests {
             partition,
             offset: 0,
             max_count: None,
+        })
+    }
+
+    /// A `ProduceBatch` request for `topic`/`partition` carrying `records` as
+    /// `(key, value)` pairs.
+    fn produce_batch_request(
+        topic: &str,
+        partition: u32,
+        records: Vec<(Option<Vec<u8>>, Vec<u8>)>,
+    ) -> Request<v1::ProduceBatchRequest> {
+        Request::new(v1::ProduceBatchRequest {
+            topic: topic.to_string(),
+            partition,
+            records: records
+                .into_iter()
+                .map(|(key, value)| v1::Record { key, value })
+                .collect(),
         })
     }
 
@@ -934,5 +1051,254 @@ mod tests {
             v1::NodeAvailability::Available as i32,
             "availability is carried through (Req 12.7)"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // ProduceBatch handler admission and error mapping (task 5.4)
+    //
+    // The `produce_batch` handler validates the whole batch BEFORE proposing
+    // anything, so an invalid batch appends nothing and never reaches the
+    // partition driver (Requirement 2.2, 3.6); the metadata admission checks
+    // (topic-not-found, partition-not-found, topic-deleting) reject before the
+    // driver too (Requirement 6.4-6.6). A driver `NotLeader` reply is mapped to
+    // a not-leader status carrying the live-leader hint (Requirement 6.1), and a
+    // `CommitTimeout` reply to the timeout status with no offset (Requirement
+    // 6.3). Each test pins the driver's `produce_batch` reply and asserts the
+    // mapped wire error via `vela_error_from_status`.
+    // -----------------------------------------------------------------------
+
+    /// A `produce_batch` request whose validation is expected to reject the
+    /// batch BEFORE any append: the driver must never see a `ProduceBatch`
+    /// command and the mapped error must carry `expected_code` (Requirement 2.2,
+    /// 3.2-3.6).
+    async fn assert_batch_validation_rejected(
+        records: Vec<(Option<Vec<u8>>, Vec<u8>)>,
+        expected_code: v1::ErrorCode,
+    ) {
+        let mock = MockDriver::reporting(Some("node-a"));
+        let seen = mock.produce_batch_seen.clone();
+        let node = node_hosting(
+            "node-a",
+            "orders",
+            0,
+            Some(STALE_METADATA_LEADER),
+            mock.spawn(),
+        );
+        let service = VelaClientService::new(node);
+
+        let status = service
+            .produce_batch(produce_batch_request("orders", 0, records))
+            .await
+            .expect_err("an invalid batch is rejected");
+        let error =
+            convert::vela_error_from_status(&status).expect("status carries a typed VelaError");
+
+        assert_eq!(error.code, expected_code as i32);
+        assert!(
+            !seen.load(Ordering::SeqCst),
+            "a validation-rejected batch must append nothing (never reach the driver)"
+        );
+    }
+
+    /// Requirement 2.2, 3.5: an empty batch is rejected as a validation error and
+    /// appends nothing (it never reaches the driver).
+    #[tokio::test]
+    async fn produce_batch_empty_is_rejected_and_appends_nothing() {
+        assert_batch_validation_rejected(Vec::new(), v1::ErrorCode::Validation).await;
+    }
+
+    /// Requirement 3.2, 3.6: a record whose combined key+value size exceeds the
+    /// 1 MiB per-record limit is rejected as payload-too-large and appends
+    /// nothing.
+    #[tokio::test]
+    async fn produce_batch_oversized_record_is_rejected_and_appends_nothing() {
+        let oversized = vec![0u8; MAX_RECORD_BYTES + 1];
+        assert_batch_validation_rejected(vec![(None, oversized)], v1::ErrorCode::PayloadTooLarge)
+            .await;
+    }
+
+    /// Requirement 3.3, 3.6: a batch carrying more than `MAX_BATCH_RECORDS`
+    /// records is rejected as a validation error and appends nothing. Tiny
+    /// empty-value records keep the total encoded size well under the byte limit
+    /// so the count limit is the one that trips.
+    #[tokio::test]
+    async fn produce_batch_too_many_records_is_rejected_and_appends_nothing() {
+        let records = vec![(None, Vec::new()); MAX_BATCH_RECORDS + 1];
+        assert_batch_validation_rejected(records, v1::ErrorCode::Validation).await;
+    }
+
+    /// Requirement 3.4, 3.6: a batch whose total encoded size exceeds
+    /// `MAX_BATCH_BYTES` is rejected as payload-too-large and appends nothing.
+    /// A handful of large-but-legal (<= 1 MiB) records overflow the 16 MiB byte
+    /// ceiling while staying under the per-record and count limits.
+    #[tokio::test]
+    async fn produce_batch_too_large_is_rejected_and_appends_nothing() {
+        // 17 records of 1 MiB each is ~17 MiB encoded, over the 16 MiB ceiling,
+        // while each record is exactly at the legal per-record limit and the
+        // count (17) is far under `MAX_BATCH_RECORDS`.
+        let record_count = MAX_BATCH_BYTES / MAX_RECORD_BYTES + 1;
+        let records = vec![(None, vec![0u8; MAX_RECORD_BYTES]); record_count];
+        assert_batch_validation_rejected(records, v1::ErrorCode::PayloadTooLarge).await;
+    }
+
+    /// Requirement 6.4: a batch targeting a topic that does not exist is rejected
+    /// with a topic-not-found error and appends nothing.
+    #[tokio::test]
+    async fn produce_batch_topic_not_found_is_rejected() {
+        let driver = MockDriver::reporting(Some("node-a")).spawn();
+        let node = node_hosting("node-a", "orders", 0, Some(STALE_METADATA_LEADER), driver);
+        let service = VelaClientService::new(node);
+
+        let status = service
+            .produce_batch(produce_batch_request(
+                "missing-topic",
+                0,
+                vec![(None, b"v0".to_vec())],
+            ))
+            .await
+            .expect_err("a batch to a missing topic is rejected");
+        let error =
+            convert::vela_error_from_status(&status).expect("status carries a typed VelaError");
+
+        assert_eq!(error.code, v1::ErrorCode::TopicNotFound as i32);
+    }
+
+    /// Requirement 6.5: a batch targeting a partition that does not exist in the
+    /// topic is rejected with a partition-not-found error and appends nothing.
+    #[tokio::test]
+    async fn produce_batch_partition_not_found_is_rejected() {
+        let driver = MockDriver::reporting(Some("node-a")).spawn();
+        // The topic hosts partition 0 only; request a non-existent partition 9.
+        let node = node_hosting("node-a", "orders", 0, Some(STALE_METADATA_LEADER), driver);
+        let service = VelaClientService::new(node);
+
+        let status = service
+            .produce_batch(produce_batch_request(
+                "orders",
+                9,
+                vec![(None, b"v0".to_vec())],
+            ))
+            .await
+            .expect_err("a batch to a missing partition is rejected");
+        let error =
+            convert::vela_error_from_status(&status).expect("status carries a typed VelaError");
+
+        assert_eq!(error.code, v1::ErrorCode::PartitionNotFound as i32);
+    }
+
+    /// Requirement 6.6: a batch targeting a topic being deleted is rejected with
+    /// a topic-deleting error and appends nothing.
+    #[tokio::test]
+    async fn produce_batch_topic_deleting_is_rejected() {
+        let mock = MockDriver::reporting(Some("node-a"));
+        let seen = mock.produce_batch_seen.clone();
+        let node = node_hosting(
+            "node-a",
+            "orders",
+            0,
+            Some(STALE_METADATA_LEADER),
+            mock.spawn(),
+        );
+        // Transition the served topic into the `Deleting` lifecycle state.
+        node.metadata
+            .lock()
+            .expect("metadata mutex poisoned")
+            .topics
+            .get_mut("orders")
+            .expect("seeded topic present")
+            .state = TopicState::Deleting;
+        let service = VelaClientService::new(node);
+
+        let status = service
+            .produce_batch(produce_batch_request(
+                "orders",
+                0,
+                vec![(None, b"v0".to_vec())],
+            ))
+            .await
+            .expect_err("a batch to a deleting topic is rejected");
+        let error =
+            convert::vela_error_from_status(&status).expect("status carries a typed VelaError");
+
+        assert_eq!(error.code, v1::ErrorCode::TopicDeleting as i32);
+        assert!(
+            !seen.load(Ordering::SeqCst),
+            "a topic-deleting rejection must append nothing"
+        );
+    }
+
+    /// Requirement 6.1, 8.3, 8.4: a `ProduceBatch` reaching a replica that is not
+    /// the partition's live leader is redirected to that **live** leader, using
+    /// the driver's known-leader hint rather than the stale metadata `leader`
+    /// field, and appends nothing.
+    #[tokio::test]
+    async fn produce_batch_to_non_leader_redirects_to_the_live_leader() {
+        // A valid batch flows past validation to the driver, which reports it is
+        // not the leader and knows the live leader is node-b.
+        let mut mock = MockDriver::reporting(Some("node-b"));
+        mock.produce_batch = Err(ProduceError::NotLeader);
+        let node = node_hosting(
+            "node-a",
+            "orders",
+            0,
+            Some(STALE_METADATA_LEADER),
+            mock.spawn(),
+        );
+        let service = VelaClientService::new(node);
+
+        let status = service
+            .produce_batch(produce_batch_request(
+                "orders",
+                0,
+                vec![(None, b"v0".to_vec())],
+            ))
+            .await
+            .expect_err("a non-leader batch is redirected");
+        let error =
+            convert::vela_error_from_status(&status).expect("status carries a typed VelaError");
+
+        assert_eq!(error.code, v1::ErrorCode::NotLeader as i32);
+        assert_eq!(
+            error.leader.as_deref(),
+            Some("node-b"),
+            "produce_batch must redirect to the live Raft-elected leader (Req 6.1, 8.3)"
+        );
+        assert_ne!(
+            error.leader.as_deref(),
+            Some(STALE_METADATA_LEADER),
+            "produce_batch must NOT use the stale metadata leader field (Req 8.4)"
+        );
+    }
+
+    /// Requirement 6.3: a batch the leader appends but cannot commit to a
+    /// majority within the commit timeout is mapped to the timeout error and
+    /// returns no offset.
+    #[tokio::test]
+    async fn produce_batch_commit_timeout_maps_to_timeout_with_no_offset() {
+        let mut mock = MockDriver::reporting(Some("node-a"));
+        mock.produce_batch = Err(ProduceError::CommitTimeout);
+        let node = node_hosting(
+            "node-a",
+            "orders",
+            0,
+            Some(STALE_METADATA_LEADER),
+            mock.spawn(),
+        );
+        let service = VelaClientService::new(node);
+
+        let result = service
+            .produce_batch(produce_batch_request(
+                "orders",
+                0,
+                vec![(None, b"v0".to_vec())],
+            ))
+            .await;
+
+        // A timeout yields an error and therefore carries no offset on the wire
+        // (the success `ProduceBatchResponse` is the only carrier of an offset).
+        let status = result.expect_err("a commit-timeout batch returns an error, no offset");
+        let error =
+            convert::vela_error_from_status(&status).expect("status carries a typed VelaError");
+        assert_eq!(error.code, v1::ErrorCode::CommitTimeout as i32);
     }
 }

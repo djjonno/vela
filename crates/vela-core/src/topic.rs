@@ -63,6 +63,45 @@ pub enum CoreError {
     /// A produced record exceeds the 1 MiB payload limit (Requirement 4.8).
     #[error("record exceeds 1 MiB limit ({0} bytes)")]
     RecordTooLarge(usize),
+    /// A produce batch carried zero records (Requirement 2.2, 3.5). The batch is
+    /// rejected, appending nothing and leaving the partition unchanged. Maps to
+    /// the `VALIDATION` wire error code (the proto mapping lives in
+    /// `vela-server`'s `convert.rs`).
+    #[error("produce batch is empty")]
+    EmptyBatch,
+    /// A batched record at 0-based `index` had a combined key-and-value `size`
+    /// exceeding the 1 MiB per-record limit (Requirement 3.2). The batch is
+    /// rejected and nothing is appended. A per-record size limit, so it maps to
+    /// the `PAYLOAD_TOO_LARGE` wire error code like the single-record
+    /// [`CoreError::RecordTooLarge`].
+    #[error("record at index {index} exceeds 1 MiB limit ({size} bytes)")]
+    RecordTooLargeAt {
+        /// The 0-based position of the offending record within the batch.
+        index: usize,
+        /// The offending record's submitted combined key + value size.
+        size: usize,
+    },
+    /// A produce batch carried `submitted` records, more than the `max`
+    /// permitted (Requirement 3.3). The batch is rejected and nothing is
+    /// appended. A count limit, so it maps to the `VALIDATION` wire error code.
+    #[error("batch carries {submitted} records, exceeds maximum of {max}")]
+    BatchTooManyRecords {
+        /// The configured maximum record count (`MAX_BATCH_RECORDS`).
+        max: usize,
+        /// The submitted record count.
+        submitted: usize,
+    },
+    /// A produce batch's total encoded size `submitted` exceeded the `max`
+    /// bytes permitted (Requirement 3.4). The batch is rejected and nothing is
+    /// appended. A size limit, so it maps to the `PAYLOAD_TOO_LARGE` wire error
+    /// code.
+    #[error("batch encoded size {submitted} bytes exceeds maximum of {max} bytes")]
+    BatchTooLarge {
+        /// The configured maximum encoded size in bytes (`MAX_BATCH_BYTES`).
+        max: usize,
+        /// The submitted total encoded size in bytes.
+        submitted: usize,
+    },
     /// Consume parameters (offset or max count) are invalid (Requirement 5.7).
     #[error("invalid consume parameters")]
     InvalidConsumeParams,

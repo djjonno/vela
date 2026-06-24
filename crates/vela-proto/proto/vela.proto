@@ -22,12 +22,20 @@ message Record {
 // A leader's no-op marker entry, appended on election (extended Raft paper, §8).
 message Noop {}
 
+// An ordered set of records produced as a single batch and replicated as one
+// log entry, so the whole batch is appended, committed, and made durable as one
+// unit (batched-produce Requirements 1, 2, 7).
+message RecordBatch {
+  repeated Record records = 1;
+}
+
 // The payload carried by a single log entry. Exactly one variant is set.
 message EntryPayload {
   oneof kind {
-    Record record = 1;          // a produced event record
-    Noop noop = 2;              // leader no-op on election
-    ClusterCommand cluster = 3; // a replicated cluster-metadata mutation
+    Record record = 1;              // a produced event record
+    Noop noop = 2;                  // leader no-op on election
+    ClusterCommand cluster = 3;     // a replicated cluster-metadata mutation
+    RecordBatch record_batch = 4;   // a produced multi-record batch
   }
 }
 
@@ -104,6 +112,23 @@ message ProduceRequest {
 // (Requirement 4.4, 4.7).
 message ProduceResponse {
   uint64 offset = 1;
+}
+
+// Produce an ordered batch of records to a resolved (topic, partition).
+// Partition routing happens client-side before dispatch (batched-produce
+// Requirement 5); the batch is appended and committed as one unit.
+message ProduceBatchRequest {
+  string topic = 1;
+  uint32 partition = 2;
+  repeated Record records = 3;
+}
+
+// Successful batch result: the base offset of the first record and the record
+// count; the Nth record's offset is base_offset + N (batched-produce
+// Requirement 1.4, 8.3).
+message ProduceBatchResponse {
+  uint64 base_offset = 1;
+  uint32 count = 2;
 }
 
 // Consume committed records from a partition starting at `offset`. `max_count`
@@ -346,6 +371,10 @@ service VelaClient {
   // Append a single Record to a (topic, partition); returns the committed
   // offset (Requirement 4).
   rpc Produce(ProduceRequest) returns (ProduceResponse);
+
+  // Append an ordered batch of Records to a (topic, partition) as one unit,
+  // returning the base offset and record count (batched-produce Requirement 1).
+  rpc ProduceBatch(ProduceBatchRequest) returns (ProduceBatchResponse);
 
   // Read committed Records from a (topic, partition) starting at an offset
   // (Requirement 5).
