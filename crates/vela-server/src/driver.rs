@@ -37,9 +37,9 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::{mpsc, oneshot, Notify};
 
 use vela_core::{
-    apply_command, decode_record_batch, encode_record_batch, ClusterCommand, ClusterMetadata,
-    CommittedRecord, CoreError, MetadataController, NodeId, Offset, PartitionReplica, Record,
-    StateMachine, COMMIT_TIMEOUT_MS,
+    apply_command, encode_record_batch, ClusterCommand, ClusterMetadata, CommittedRecord,
+    CoreError, MetadataController, NodeId, Offset, PartitionReplica, Record, StateMachine,
+    COMMIT_TIMEOUT_MS,
 };
 use vela_raft::{
     Clock, EntryPayload, LogEntry, LogStorage, NodeId as RaftNodeId, PayloadKind, RaftInput,
@@ -55,6 +55,17 @@ use crate::transport::GrpcTransport;
 /// Cloneable so the gRPC services, the timer clock, and the transport can all
 /// enqueue work onto the single driver task that owns the replica.
 pub type DriverHandle = mpsc::UnboundedSender<DriverCommand>;
+
+/// Upper bound on the number of commands a partition driver folds into one
+/// group-commit cycle.
+///
+/// Each cycle blocks on one [`recv`](mpsc::UnboundedReceiver::recv) and then
+/// drains up to `MAX_DRAIN - 1` further already-queued commands with
+/// [`try_recv`](mpsc::UnboundedReceiver::try_recv). Their appends are buffered
+/// and (from task 5.2) forced with a single `fsync`, so a burst of concurrent
+/// produces amortises into one force (Requirement 3.1). The bound caps the work
+/// and outbound buffering one cycle can accumulate before it must dispatch.
+const MAX_DRAIN: usize = 1024;
 
 /// Why a produce proposal did not yield a committed offset.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -281,68 +292,198 @@ impl PartitionDriver {
     }
 
     /// The driver's main loop: arm the initial election timer, then process
-    /// commands until the queue closes or a [`DriverCommand::Shutdown`] arrives.
+    /// commands in group-commit cycles until the queue closes or a
+    /// [`DriverCommand::Shutdown`] arrives.
+    ///
+    /// Each cycle awaits one command, then drains the rest of the ready queue
+    /// (up to [`MAX_DRAIN`]) into a batch. Every command is stepped through the
+    /// replica with **buffered** appends — no `fsync` inline — and the outbound
+    /// sends each step emits are held in a per-cycle buffer rather than
+    /// dispatched immediately. At the end of the cycle the buffered sends are
+    /// dispatched and any committed produces are resolved once (Requirement
+    /// 3.1). Synchronous inbound peer-RPC replies are still answered within the
+    /// batch (they are the gRPC handler's return value), and reads / known-leader
+    /// queries are served inline since they only read in-memory state.
     async fn run(mut self) {
         // Arm the first election timeout so an idle follower will start an
         // election (Requirement 7.2); a single-node group elects itself.
         self.clock.arm(TimerKind::Election, ELECTION_TIMEOUT_BASE);
 
-        while let Some(command) = self.rx.recv().await {
-            match command {
-                DriverCommand::Raft(input) => {
-                    let out = self.replica.step(input, &mut self.clock);
-                    self.after_step(out, None);
+        while let Some(first) = self.rx.recv().await {
+            // Drain the ready queue into one batch: the awaited command plus up
+            // to `MAX_DRAIN - 1` more already-queued commands, so their appends
+            // coalesce into a single group commit (Requirement 3.1).
+            let mut batch = Vec::with_capacity(MAX_DRAIN);
+            batch.push(first);
+            while batch.len() < MAX_DRAIN {
+                match self.rx.try_recv() {
+                    Ok(command) => batch.push(command),
+                    Err(_) => break,
                 }
-                DriverCommand::Tick { kind, generation } => {
-                    // Ignore a tick from a since-reset timer (Requirement 7.2,
-                    // 7.6): only the latest arming of each kind is honoured.
-                    if self.clock.is_current(kind, generation) {
-                        let out = self.replica.step(RaftInput::Tick(kind), &mut self.clock);
-                        self.after_step(out, None);
+            }
+
+            // Outbound sends emitted across the whole batch, dispatched once at
+            // the end of the cycle so an ack/reply is released together with
+            // (and, from task 5.2, only after) the batch's appends are durable.
+            let mut sends: Vec<(RaftNodeId, RaftMessage)> = Vec::new();
+            let mut shutdown = false;
+
+            for command in batch {
+                match command {
+                    DriverCommand::Raft(input) => {
+                        let out = self.replica.step(input, &mut self.clock);
+                        self.collect_step(out, &mut sends, None);
+                    }
+                    DriverCommand::Tick { kind, generation } => {
+                        // Ignore a tick from a since-reset timer (Requirement
+                        // 7.2, 7.6): only the latest arming of each kind is
+                        // honoured.
+                        if self.clock.is_current(kind, generation) {
+                            let out = self.replica.step(RaftInput::Tick(kind), &mut self.clock);
+                            self.collect_step(out, &mut sends, None);
+                        }
+                    }
+                    DriverCommand::PeerRpc { msg, reply } => {
+                        // Answer the inbound RPC synchronously: capture the one
+                        // reply message this step emits and route it back on the
+                        // oneshot; buffer every other send for end-of-cycle
+                        // dispatch.
+                        let want = ReplyKind::for_request(&msg);
+                        let out = self.replica.step(RaftInput::Message(msg), &mut self.clock);
+                        self.collect_step(out, &mut sends, Some((want, reply)));
+                    }
+                    DriverCommand::Produce { value, reply } => {
+                        self.handle_produce(value, reply, &mut sends);
+                    }
+                    DriverCommand::ProduceBatch { values, reply } => {
+                        self.handle_produce_batch(values, reply, &mut sends);
+                    }
+                    DriverCommand::ProduceTimeout { target } => {
+                        if let Some(pos) = self.pending.iter().position(|p| p.target == target) {
+                            let pending = self.pending.remove(pos).expect("position just found");
+                            pending.reply.fail(ProduceError::CommitTimeout);
+                        }
+                    }
+                    DriverCommand::Consume { offset, max, reply } => {
+                        // Reads are served from the in-memory state machine; no
+                        // force is needed, so answer inline.
+                        let _ = reply.send(self.replica.read(offset, max));
+                    }
+                    // Report this replica's known current leader for live-leader
+                    // routing (Requirement 8.1, 8.2). In-memory read; answer
+                    // inline.
+                    DriverCommand::KnownLeader { reply } => {
+                        let _ = reply.send(self.known_leader());
+                    }
+                    // Metadata-group proposals never target a partition driver;
+                    // drop them defensively (closing any reply channel signals
+                    // the caller) rather than treating them as partition work.
+                    DriverCommand::ProposeCluster { .. }
+                    | DriverCommand::ClusterCommitTimeout { .. } => {}
+                    DriverCommand::Shutdown => {
+                        // Stop folding further batched commands and break the
+                        // loop after this cycle's dispatch.
+                        shutdown = true;
+                        break;
                     }
                 }
-                DriverCommand::PeerRpc { msg, reply } => {
-                    let want = ReplyKind::for_request(&msg);
-                    let out = self.replica.step(RaftInput::Message(msg), &mut self.clock);
-                    let response = self.after_step(out, want);
-                    let _ = reply.send(response);
-                }
-                DriverCommand::Produce { value, reply } => {
-                    self.handle_produce(value, reply);
-                }
-                DriverCommand::ProduceBatch { values, reply } => {
-                    self.handle_produce_batch(values, reply);
-                }
-                DriverCommand::ProduceTimeout { target } => {
-                    if let Some(pos) = self.pending.iter().position(|p| p.target == target) {
-                        let pending = self.pending.remove(pos).expect("position just found");
-                        pending.reply.fail(ProduceError::CommitTimeout);
+            }
+
+            // ----- end of cycle: group commit -----
+            //
+            // If the batch left buffered appends beyond the durable extent,
+            // force them to stable storage with a single offloaded `fsync`
+            // before releasing any acknowledgement (Requirements 1.1, 2.1, 2.2,
+            // 3.1). `block_in_place` runs the force off the async scheduler so
+            // other partitions' timers and RPC handlers keep being serviced
+            // while this one syncs. Under the per-append `Always` policy the
+            // durable extent already reaches the tail (`durable_index ==
+            // last_index`), so there is nothing to force and the commit/ack
+            // behaviour is identical to before; the force becomes load-bearing
+            // once the partition WAL moves to the `Grouped` policy (task 5.4).
+            let needs_flush = {
+                let last = self.replica.raft().log().last_index();
+                last.is_some() && last > self.replica.durable_index()
+            };
+
+            if needs_flush {
+                match tokio::task::block_in_place(|| self.replica.flush()) {
+                    Ok(()) => {
+                        // The local Durable_Index advanced: re-drive consensus
+                        // so the leader can advance its commit index and a
+                        // follower can emit its now-durable ack (Requirements
+                        // 1.2, 1.3). Fold its outbound sends into the same
+                        // per-cycle buffer dispatched just below.
+                        let out = self.replica.step(RaftInput::Durable, &mut self.clock);
+                        self.collect_step(out, &mut sends, None);
+                    }
+                    Err(err) => {
+                        // The force failed, so the buffered tail is not durable.
+                        // Drop it back to the durable extent, fail the produces
+                        // awaiting those entries, and discard this cycle's
+                        // would-be acks rather than releasing them — no
+                        // acknowledgement or commit is surfaced for a
+                        // non-durable entry (Requirement 1.4). Recovery/retry
+                        // proceeds normally on the next cycle.
+                        tracing::error!(
+                            topic = %self.topic,
+                            partition = self.partition,
+                            node = %self.node_label,
+                            error = %err,
+                            "wal flush failed; reverting non-durable tail and failing affected produces"
+                        );
+                        let durable = self.replica.durable_index();
+                        if let Err(revert_err) = self.replica.revert_to_durable() {
+                            tracing::error!(
+                                topic = %self.topic,
+                                partition = self.partition,
+                                node = %self.node_label,
+                                error = %revert_err,
+                                "failed to revert non-durable tail after flush failure"
+                            );
+                        }
+                        self.fail_pending_above(durable);
+                        // Drop the buffered acks/replies for the non-durable
+                        // appends; they must not reach the transport.
+                        sends.clear();
+                        if shutdown {
+                            break;
+                        }
+                        continue;
                     }
                 }
-                DriverCommand::Consume { offset, max, reply } => {
-                    let _ = reply.send(self.replica.read(offset, max));
-                }
-                // Report this replica's known current leader for live-leader
-                // routing (Requirement 8.1, 8.2).
-                DriverCommand::KnownLeader { reply } => {
-                    let _ = reply.send(self.known_leader());
-                }
-                // Metadata-group proposals never target a partition driver; drop
-                // them defensively (closing any reply channel signals the
-                // caller) rather than treating them as partition work.
-                DriverCommand::ProposeCluster { .. }
-                | DriverCommand::ClusterCommitTimeout { .. } => {}
-                DriverCommand::Shutdown => break,
+            }
+
+            // Dispatch the cycle's buffered sends and resolve any produces now
+            // committed. After a successful force (or when nothing needed
+            // forcing) these are released together, so an ack or produce reply
+            // is surfaced only once its entry is durable (Requirements 1.1,
+            // 3.1).
+            for (to, msg) in sends.drain(..) {
+                self.transport.send(to, msg);
+            }
+            self.resolve_pending();
+
+            if shutdown {
+                break;
             }
         }
     }
 
-    /// Append a produced record on the leader and either resolve immediately
-    /// (single-node commit) or register it as pending with a commit deadline.
+    /// Append a produced record on the leader and register it as pending with a
+    /// commit deadline.
+    ///
+    /// The propose is a buffered append (no inline `fsync`); the step's outbound
+    /// sends are collected into the cycle's `sends` buffer. The produce reply is
+    /// **not** resolved here — it is held in `pending` and released by
+    /// [`resolve_pending`](Self::resolve_pending) at the end of the cycle once
+    /// its target index commits (a single-node group commits within the same
+    /// cycle), or failed after the commit deadline (Requirement 4.4, 4.7, 4.9).
     fn handle_produce(
         &mut self,
         value: Vec<u8>,
         reply: oneshot::Sender<Result<Offset, ProduceError>>,
+        sends: &mut Vec<(RaftNodeId, RaftMessage)>,
     ) {
         if self.replica.role() != Role::Leader {
             let _ = reply.send(Err(ProduceError::NotLeader));
@@ -356,16 +497,10 @@ impl PartitionDriver {
         let out = self
             .replica
             .step(RaftInput::Propose(payload), &mut self.clock);
-        self.after_step(out, None);
+        self.collect_step(out, sends, None);
 
-        if self.committed_through(target) {
-            // Committed within this step (the leader is its own majority in a
-            // single-node group): resolve with the assigned offset now.
-            let _ = reply.send(Ok(self.offset_at(target)));
-            return;
-        }
-
-        // Otherwise await replication; resolve on commit or after the deadline.
+        // Await commit: resolved at end of cycle by `resolve_pending`, or failed
+        // after the deadline.
         self.pending.push_back(Pending {
             target,
             reply: PendingReply::Single(reply),
@@ -378,13 +513,14 @@ impl PartitionDriver {
     }
 
     /// Append a produced batch as **one** `RecordBatch` entry on the leader and
-    /// either resolve immediately (single-node commit) or register it as pending
-    /// with a commit deadline.
+    /// register it as pending with a commit deadline.
     ///
     /// The whole batch is a single `RaftInput::Propose(RecordBatch)` — one
-    /// append, one fsync under `SyncPolicy::Always`, one commit as one
-    /// replicated unit (batched-produce Requirement 7.1, 7.2, 7.3). On commit
-    /// the batch's records take the contiguous run
+    /// buffered append, one commit as one replicated unit (batched-produce
+    /// Requirement 7.1, 7.2, 7.3). The step's outbound sends are collected into
+    /// the cycle's `sends` buffer; the reply is held in `pending` and resolved
+    /// by [`resolve_pending`](Self::resolve_pending) at the end of the cycle. On
+    /// commit the batch's records take the contiguous run
     /// `base_offset..base_offset+count`, where `base_offset` is the count of
     /// records committed before the batch entry's index (Requirement 1.3, 2.1,
     /// 2.4).
@@ -392,6 +528,7 @@ impl PartitionDriver {
         &mut self,
         values: Vec<Vec<u8>>,
         reply: oneshot::Sender<Result<(Offset, u32), ProduceError>>,
+        sends: &mut Vec<(RaftNodeId, RaftMessage)>,
     ) {
         if self.replica.role() != Role::Leader {
             let _ = reply.send(Err(ProduceError::NotLeader));
@@ -415,16 +552,10 @@ impl PartitionDriver {
         let out = self
             .replica
             .step(RaftInput::Propose(payload), &mut self.clock);
-        self.after_step(out, None);
+        self.collect_step(out, sends, None);
 
-        if self.committed_through(target) {
-            // Committed within this step (the leader is its own majority in a
-            // single-node group): resolve with the base offset + count now.
-            let _ = reply.send(Ok((self.base_offset_at(target), count)));
-            return;
-        }
-
-        // Otherwise await replication; resolve on commit or after the deadline.
+        // Await commit: resolved at end of cycle by `resolve_pending`, or failed
+        // after the deadline.
         self.pending.push_back(Pending {
             target,
             reply: PendingReply::Batch { count, reply },
@@ -436,14 +567,24 @@ impl PartitionDriver {
         });
     }
 
-    /// React to a [`RaftOutput`]: log any role transition, dispatch outbound
-    /// messages (optionally extracting the one reply addressed to an inbound
-    /// RPC), and resolve any produces whose entries have now committed.
+    /// Fold one step's [`RaftOutput`] into the current group-commit cycle: log
+    /// any role transition and move its outbound sends into the per-cycle
+    /// `sends` buffer (dispatched together at the end of the cycle). This does
+    /// **not** dispatch to the transport or resolve pending produces inline —
+    /// that happens once per cycle in [`run`](Self::run).
     ///
-    /// When `want` is `Some`, the single reply message of that kind is removed
-    /// from the outbound set and returned (for the gRPC handler to answer with);
-    /// every other message is dispatched through the transport.
-    fn after_step(&mut self, out: RaftOutput, want: Option<ReplyKind>) -> Option<RaftMessage> {
+    /// When `rpc_reply` is `Some`, this step answers an inbound peer RPC: the
+    /// one outbound message matching the expected [`ReplyKind`] is routed back
+    /// on the oneshot (so the gRPC handler can return it synchronously) rather
+    /// than buffered; every other send is buffered as usual. A `None` reply kind
+    /// (a message that is not a synchronously-answered request arriving as a
+    /// `PeerRpc`) routes `None` back, preserving the previous behaviour.
+    fn collect_step(
+        &mut self,
+        out: RaftOutput,
+        sends: &mut Vec<(RaftNodeId, RaftMessage)>,
+        rpc_reply: Option<(Option<ReplyKind>, oneshot::Sender<Option<RaftMessage>>)>,
+    ) {
         if let Some(role) = out.role_change {
             tracing::info!(
                 topic = %self.topic,
@@ -454,17 +595,20 @@ impl PartitionDriver {
             );
         }
 
-        let mut response = None;
-        for (to, msg) in out.sends {
-            if want.is_some_and(|kind| kind.matches(&msg)) && response.is_none() {
-                response = Some(msg);
-            } else {
-                self.transport.send(to, msg);
+        match rpc_reply {
+            Some((want, reply)) => {
+                let mut response = None;
+                for (to, msg) in out.sends {
+                    if want.is_some_and(|kind| kind.matches(&msg)) && response.is_none() {
+                        response = Some(msg);
+                    } else {
+                        sends.push((to, msg));
+                    }
+                }
+                let _ = reply.send(response);
             }
+            None => sends.extend(out.sends),
         }
-
-        self.resolve_pending();
-        response
     }
 
     /// Resolve every pending produce whose target index is now committed, in
@@ -492,6 +636,26 @@ impl PartitionDriver {
         }
     }
 
+    /// Fail every pending produce whose target log index lies beyond `durable`
+    /// (the entries dropped by a revert after a failed force), resolving each
+    /// caller with [`ProduceError::CommitTimeout`] so it can retry; pending
+    /// produces at or below `durable` remain durable and may still commit
+    /// (Requirement 1.4).
+    ///
+    /// A `None` `durable` means nothing on this replica is `fsync`ed, so every
+    /// pending produce in this cycle's batch is failed.
+    fn fail_pending_above(&mut self, durable: Option<u64>) {
+        let mut kept = VecDeque::with_capacity(self.pending.len());
+        while let Some(pending) = self.pending.pop_front() {
+            if durable.is_some_and(|d| pending.target <= d) {
+                kept.push_back(pending);
+            } else {
+                pending.reply.fail(ProduceError::CommitTimeout);
+            }
+        }
+        self.pending = kept;
+    }
+
     /// Whether the replica's commit index has reached `target`.
     fn committed_through(&self, target: u64) -> bool {
         self.replica
@@ -500,54 +664,28 @@ impl PartitionDriver {
             .is_some_and(|c| c >= target)
     }
 
-    /// The number of record **positions** committed before log index `index`:
-    /// the sum, over entries with log index strictly less than `index`, of the
-    /// record positions each contributes — `1` for a single
-    /// [`PayloadKind::Record`] entry, the decoded record count for a
-    /// [`PayloadKind::RecordBatch`] entry, and `0` for a `Noop`/`Cluster` entry.
-    ///
-    /// This is the gap-free, 0-based offset the next record appended at `index`
-    /// would receive, generalised so a batch entry counts as its N record
-    /// positions (batched-produce Requirement 2.4, 2.5, 4.5).
-    fn records_before(&self, index: u64) -> u64 {
-        if index == 0 {
-            return 0;
-        }
-        // `read(0, index)` is inclusive of `index`; filter to entries strictly
-        // before it so the entry at `index` itself does not count.
-        self.replica
-            .raft()
-            .log()
-            .read(0, index)
-            .iter()
-            .filter(|e| e.index < index)
-            .map(Self::record_positions)
-            .sum()
-    }
-
-    /// The number of record positions a committed `entry` contributes to the
-    /// partition's offset space: `1` for a single record, the decoded record
-    /// count for a batch, `0` otherwise.
-    fn record_positions(entry: &LogEntry) -> u64 {
-        match entry.payload.kind {
-            PayloadKind::Record => 1,
-            PayloadKind::RecordBatch => decode_record_batch(&entry.payload.bytes).len() as u64,
-            PayloadKind::Noop | PayloadKind::Cluster => 0,
-        }
-    }
-
     /// The record offset assigned to the (committed) single-record entry at log
-    /// index `target`: the count of record positions committed before its
-    /// index, 0-based (Requirement 4.4, 4.7).
+    /// index `target`: the offset its record was assigned on apply, looked up
+    /// from in-memory partition state with no log I/O (Requirement 2.1, 2.2,
+    /// 4.4, 4.7).
+    ///
+    /// `target` is only resolved once its entry has committed (and so been
+    /// applied to the state machine), so the in-memory lookup is always present;
+    /// a defensive `0` is returned only if it is somehow absent.
     fn offset_at(&self, target: u64) -> Offset {
-        self.records_before(target)
+        self.replica.base_offset_for(target).unwrap_or(0)
     }
 
     /// The base offset of the (committed) batch entry at log index `target`: the
-    /// count of record positions committed before the batch entry's index, so
-    /// its Nth record takes `base_offset + N` (batched-produce Requirement 2.4).
+    /// offset its first record was assigned on apply, so its Nth record takes
+    /// `base_offset + N` (batched-produce Requirement 2.4). Looked up from
+    /// in-memory partition state with no log I/O (Requirement 2.1, 2.2).
+    ///
+    /// As with [`offset_at`](Self::offset_at), `target` is always committed
+    /// (hence applied) when this is called, so the lookup is present; a
+    /// defensive `0` is returned only if it is somehow absent.
     fn base_offset_at(&self, target: u64) -> Offset {
-        self.records_before(target)
+        self.replica.base_offset_for(target).unwrap_or(0)
     }
 
     /// This replica's known current leader as a domain [`NodeId`]: its own id
@@ -759,7 +897,111 @@ impl MetadataDriver {
                 | DriverCommand::Consume { .. }
                 | DriverCommand::ProduceTimeout { .. } => {}
             }
+
+            // If the command left buffered appends beyond the durable extent,
+            // force them with a single offloaded `fsync` and re-drive consensus
+            // before the next command. Under the current `Always` policy the
+            // durable extent already reaches the tail, so this is a no-op until
+            // the metadata WAL moves to the `Grouped` policy (task 5.4).
+            self.force_and_redrive();
         }
+    }
+
+    /// If the metadata log has buffered appends beyond its durable extent, force
+    /// them to stable storage with a single **offloaded** `fsync` and re-drive
+    /// consensus so the leader can advance its commit index and a follower can
+    /// emit its now-durable ack (Requirements 1.1, 1.2, 1.3, 2.1, 2.2, 3.1).
+    ///
+    /// [`block_in_place`](tokio::task::block_in_place) runs the force off the
+    /// async scheduler so other drivers' timers and RPC handlers keep being
+    /// serviced while the metadata group syncs (Requirement 2.1, 2.2). Under the
+    /// per-append `Always` policy the durable extent already reaches the tail
+    /// (`durable_index == last_log_index`), so `needs_flush` is false and this
+    /// is a no-op — the metadata propose/commit behaviour is identical to
+    /// before; the force becomes load-bearing once the metadata WAL moves to the
+    /// `Grouped` policy (task 5.4). On a force failure the non-durable tail is
+    /// reverted and the proposals awaiting those entries are failed, so no
+    /// acknowledgement or commit is surfaced for a non-durable entry
+    /// (Requirement 1.4).
+    fn force_and_redrive(&mut self) {
+        let needs_flush = {
+            let controller = self.controller.lock().expect("controller mutex poisoned");
+            let last = controller.last_log_index();
+            last.is_some() && last > controller.durable_index()
+        };
+        if !needs_flush {
+            return;
+        }
+
+        let forced = tokio::task::block_in_place(|| {
+            self.controller
+                .lock()
+                .expect("controller mutex poisoned")
+                .flush()
+        });
+
+        match forced {
+            Ok(()) => {
+                // The metadata replica's Durable_Index advanced: re-drive
+                // consensus so the leader re-runs `advance_commit` and a follower
+                // emits its now-durable ack (Requirements 1.2, 1.3). `after_step`
+                // dispatches its sends, folds any newly committed entries through
+                // the sink, and resolves any now-committed proposals.
+                let out = self.step(RaftInput::Durable);
+                self.after_step(out, None);
+            }
+            Err(err) => {
+                // The force failed, so the buffered tail is not durable. Drop it
+                // back to the durable extent and fail the proposals awaiting
+                // those entries rather than releasing them — no acknowledgement
+                // or commit is surfaced for a non-durable entry (Requirement
+                // 1.4). Recovery/retry proceeds normally.
+                tracing::error!(
+                    topic = vela_core::METADATA_GROUP_TOPIC,
+                    partition = 0u32,
+                    node = %self.node_label,
+                    error = %err,
+                    "metadata wal flush failed; reverting non-durable tail and failing affected proposals"
+                );
+                let durable = {
+                    let controller = self.controller.lock().expect("controller mutex poisoned");
+                    controller.durable_index()
+                };
+                if let Err(revert_err) = self
+                    .controller
+                    .lock()
+                    .expect("controller mutex poisoned")
+                    .revert_to_durable()
+                {
+                    tracing::error!(
+                        topic = vela_core::METADATA_GROUP_TOPIC,
+                        partition = 0u32,
+                        node = %self.node_label,
+                        error = %revert_err,
+                        "failed to revert non-durable metadata tail after flush failure"
+                    );
+                }
+                self.fail_pending_above(durable);
+            }
+        }
+    }
+
+    /// Fail every pending metadata proposal whose target index lies beyond
+    /// `durable` (the entries dropped by a revert after a failed force),
+    /// resolving each caller with [`CoreError::CommitTimeout`] so it can retry;
+    /// proposals at or below `durable` remain durable and may still commit
+    /// (Requirement 1.4). A `None` `durable` means nothing is `fsync`ed, so
+    /// every pending proposal is failed.
+    fn fail_pending_above(&mut self, durable: Option<u64>) {
+        let mut kept = VecDeque::with_capacity(self.pending.len());
+        while let Some(pending) = self.pending.pop_front() {
+            if durable.is_some_and(|d| pending.target <= d) {
+                kept.push_back(pending);
+            } else {
+                let _ = pending.reply.send(Err(CoreError::CommitTimeout));
+            }
+        }
+        self.pending = kept;
     }
 
     /// Step the shared metadata group one input, using this driver's real clock.

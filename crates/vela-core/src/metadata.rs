@@ -29,7 +29,7 @@
 
 use std::path::Path;
 
-use vela_log::{DurableWal, LogError, LogStorage, PayloadKind, SyncPolicy, WalConfig};
+use vela_log::{CommitIndex, DurableWal, LogError, LogStorage, PayloadKind, SyncPolicy, WalConfig};
 use vela_raft::{Clock, NodeId as RaftNodeId, RaftInput, RaftOutput, Role};
 
 use crate::fleet::{FleetError, GroupKey, PartitionReplica, RaftGroupFleet};
@@ -223,8 +223,12 @@ impl MetadataController {
     ///
     /// The metadata group is infrastructure, not a client-selectable topic, so
     /// it always uses the [`Durable`](crate::model::LogBackend::Durable) backend
-    /// with the only consensus-safe policy, [`SyncPolicy::Always`] (Requirement
-    /// 16.1, 16.6). The durable WAL is opened directly at `meta_path` — path
+    /// with the group-commit policy, [`SyncPolicy::Grouped`]: appends buffer
+    /// their frame bytes and the [`MetadataDriver`](crate) — the metadata
+    /// group's single writer — owns forcing, issuing one offloaded `fsync` per
+    /// step and gating the commit/ack on the post-flush Durable_Index, so the
+    /// end-to-end durability guarantee is unchanged (Requirement 1.1, 3.1). The
+    /// durable WAL is opened directly at `meta_path` — path
     /// derivation is the server's concern, so the caller passes the reserved
     /// metadata path in — wrapped in a [`PartitionLog::Durable`], and the group
     /// is created through [`RaftGroupFleet::create_recovered_group`], which
@@ -248,9 +252,11 @@ impl MetadataController {
         meta_path: &Path,
         decode_cluster: impl Fn(&[u8]) -> ClusterCommand,
     ) -> Result<Self, MetadataRecoverError> {
-        // Open the durable metadata log at the reserved path with the only
-        // consensus-safe sync policy (Requirement 16.6).
-        let wal = DurableWal::open(WalConfig::new(meta_path).with_sync_policy(SyncPolicy::Always))?;
+        // Open the durable metadata log at the reserved path with the
+        // group-commit `Grouped` policy; the `MetadataDriver` owns forcing
+        // (Requirement 1.1, 3.1).
+        let wal =
+            DurableWal::open(WalConfig::new(meta_path).with_sync_policy(SyncPolicy::Grouped))?;
         let log = PartitionLog::Durable(wal);
 
         // Create the recovered group: this restores the Raft hard state and the
@@ -416,6 +422,55 @@ impl MetadataController {
         self.fleet
             .get(&metadata_group_key())
             .and_then(|r| r.raft().commit_index())
+    }
+
+    /// The highest log index the metadata replica has `fsync`ed to its own
+    /// stable storage — its [`Durable_Index`](vela_log::LogStorage::durable_index),
+    /// or `None` when nothing is durable yet (or the group is somehow absent).
+    ///
+    /// Distinct from [`last_log_index`](Self::last_log_index): under the
+    /// group-commit (`Grouped`) policy the metadata WAL's in-memory tail can sit
+    /// ahead of the durable extent until the [`MetadataDriver`](crate) forces
+    /// it. The driver reads this to decide whether a force is needed and to
+    /// choose a revert point after a failed force.
+    pub fn durable_index(&self) -> CommitIndex {
+        self.fleet
+            .get(&metadata_group_key())
+            .and_then(|r| r.durable_index())
+    }
+
+    /// Force the metadata replica's buffered log appends to stable storage,
+    /// advancing its [`Durable_Index`](Self::durable_index) to the highest
+    /// appended index (Requirement 3.2).
+    ///
+    /// Delegates to the hosted metadata replica's log force. The
+    /// [`MetadataDriver`](crate) — the metadata group's single writer — calls
+    /// this once per step (off the async runtime via `block_in_place`) and then
+    /// steps [`RaftInput::Durable`] so consensus reacts to the newly-durable
+    /// extent. Under the group-commit `Grouped` policy the buffered appends are
+    /// forced here in a single `fsync`; a force failure returns
+    /// [`LogError::Io`] leaving the durable extent unchanged so no entry is
+    /// reported durable that was not `fsync`ed (Requirement 1.4). Returns
+    /// `Ok(())` if the group is somehow absent.
+    pub fn flush(&mut self) -> Result<(), LogError> {
+        match self.fleet.get_mut(&metadata_group_key()) {
+            Some(replica) => replica.flush(),
+            None => Ok(()),
+        }
+    }
+
+    /// Drop any non-durable metadata-log tail back to the current
+    /// [`Durable_Index`](Self::durable_index), restoring "in-memory tail ==
+    /// durable tail" after a failed force (Requirement 1.4).
+    ///
+    /// Delegates to the hosted metadata replica. Because commit never outruns
+    /// the Durable_Index, reverting to it never discards a committed entry.
+    /// Returns `Ok(())` if the group is somehow absent.
+    pub fn revert_to_durable(&mut self) -> Result<(), LogError> {
+        match self.fleet.get_mut(&metadata_group_key()) {
+            Some(replica) => replica.revert_to_durable(),
+            None => Ok(()),
+        }
     }
 
     /// Apply a committed [`ClusterCommand`] to the controller's metadata view,

@@ -660,6 +660,29 @@ impl<F: FileSystem> SegmentSet<F> {
         }
     }
 
+    /// Force every segment whose base index is at or above `from_segment` to
+    /// stable storage: each qualifying **sealed** segment by opening its file
+    /// and forcing it, and the **active** segment through its open handle.
+    ///
+    /// This is the multi-segment force behind a group [`flush`](crate::DurableWal)
+    /// (Requirement 3.2): a batch of buffered appends may have rolled across
+    /// several segments since the last durable point, so making the tail
+    /// durable means forcing *every* segment that holds an un-forced frame, not
+    /// only the active one. Passing the base index of the segment that holds
+    /// the lowest un-forced frame forces exactly that suffix of segments;
+    /// re-forcing a segment that was already partially durable is harmless. A
+    /// no-op when the log is empty (no sealed match, no active segment).
+    pub(crate) fn sync_from(&self, fs: &F, from_segment: u64) -> io::Result<()> {
+        for meta in self
+            .sealed
+            .iter()
+            .filter(|meta| meta.base_index >= from_segment)
+        {
+            fs.open_read(&meta.path)?.sync_data()?;
+        }
+        self.sync_active()
+    }
+
     /// Read and decode the frame at `(segment, offset, len)`.
     ///
     /// Reads from the active segment's open handle when `segment` is the active

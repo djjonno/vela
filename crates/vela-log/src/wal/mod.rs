@@ -428,6 +428,9 @@ impl<F: FileSystem, C: Clock> DurableWal<F, C> {
     ///   `Periodic` makes no persist-before-acknowledge promise (Requirement
     ///   4.6); the operation still completes.
     /// - `Never`: never force the frames (Requirement 4.3).
+    /// - `Grouped`: never *auto*-force the frames; the caller forces them with a
+    ///   single `flush` (group commit, Requirement 3.1). Identical to `Never`
+    ///   for the per-operation force decision.
     fn persist_tail(
         &mut self,
         created_segment: bool,
@@ -446,7 +449,9 @@ impl<F: FileSystem, C: Clock> DurableWal<F, C> {
                 }
                 Ok(())
             }
-            SyncPolicy::Never => Ok(()),
+            // Both buffer frame bytes without an inline force; `Grouped` differs
+            // only in that the caller is expected to force via `flush`.
+            SyncPolicy::Never | SyncPolicy::Grouped => Ok(()),
         }
     }
 
@@ -891,6 +896,13 @@ impl<F: FileSystem, C: Clock> LogStorage for DurableWal<F, C> {
         self.commit_index
     }
 
+    fn durable_index(&self) -> CommitIndex {
+        // The acknowledged extent's highest index: entries up to and including
+        // `durable_last` have been forced to stable storage, while any appended
+        // frames beyond it are still buffered (Requirements 1.2, 1.3).
+        self.durable_last
+    }
+
     fn commit(&mut self, index: u64) -> Result<(), LogError> {
         if self.poisoned.get() {
             return Err(LogError::Io {
@@ -937,9 +949,12 @@ impl<F: FileSystem, C: Clock> LogStorage for DurableWal<F, C> {
             // `Always` forces the advanced commit to stable storage before
             // returning (Requirement 4.4); `Never` does not force frame data but
             // still records the commit in the manifest (metadata, not a
-            // Record_Frame) so it survives reopen. Both write the manifest; on
-            // failure the commit index is left unchanged (Requirement 4.5).
-            SyncPolicy::Always | SyncPolicy::Never => {
+            // Record_Frame) so it survives reopen. `Grouped` behaves like
+            // `Never` here — it records the commit as manifest metadata without
+            // an inline frame force; the caller forces buffered frames via
+            // `flush`. All write the manifest; on failure the commit index is
+            // left unchanged (Requirement 4.5).
+            SyncPolicy::Always | SyncPolicy::Never | SyncPolicy::Grouped => {
                 let state = self.manifest_state(Some(index));
                 self.manifest
                     .write(&self.fs, &state)
@@ -1090,18 +1105,107 @@ impl<F: FileSystem, C: Clock> LogStorage for DurableWal<F, C> {
     }
 
     fn flush(&mut self) -> Result<(), LogError> {
-        // Force the active segment's data and the manifest to stable storage,
-        // leaving reported state unchanged (Requirement 4.10).
-        self.segments.sync_active().map_err(|source| LogError::Io {
-            op: "flush segment",
-            source,
-        })?;
+        // A read fault has already fail-stopped the log; refuse to force over a
+        // poisoned log.
+        if self.poisoned.get() {
+            return Err(LogError::Io {
+                op: "flush",
+                source: io::Error::other("log poisoned by a prior read failure"),
+            });
+        }
+
+        // The highest appended index; with an empty log there is nothing to
+        // force, so the flush degenerates to forcing the manifest (a no-op when
+        // it has never been written) and leaves the (empty) extent unchanged.
+        let last = match self.index.last_index() {
+            Some(last) => last,
+            None => {
+                return self.manifest.sync(&self.fs).map_err(|source| LogError::Io {
+                    op: "flush manifest",
+                    source,
+                });
+            }
+        };
+
+        // Nothing un-forced: the durable extent already reaches the tail. Force
+        // what is buffered (the active segment) and the manifest without
+        // rewriting — or regressing — the acknowledged extent (Requirement
+        // 4.10).
+        if self.durable_last == Some(last) {
+            self.segments.sync_active().map_err(|source| LogError::Io {
+                op: "flush segment",
+                source,
+            })?;
+            return self.manifest.sync(&self.fs).map_err(|source| LogError::Io {
+                op: "flush manifest",
+                source,
+            });
+        }
+
+        // There are un-forced frames in `durable_last+1..=last`. Force every
+        // segment that holds one — a batch may have rolled across several
+        // segments since the last durable point (Requirement 3.2) — then make
+        // the advanced extent durable in the manifest before touching the
+        // in-memory mirror, so a force or manifest failure leaves the
+        // acknowledged extent (and thus `durable_index`) unchanged (Requirement
+        // 1.4).
+        let first_unforced = match self.durable_last {
+            Some(durable) => durable + 1,
+            None => self.index.log_start_index(),
+        };
+        let from_segment = self
+            .index
+            .location(first_unforced)
+            .expect("first un-forced index is within the retained range")
+            .segment;
+
+        // The frame at `last` fixes the advanced extent's segment and the byte
+        // offset just past it.
+        let tail = self
+            .index
+            .location(last)
+            .expect("last index is within the retained range");
+        let advanced_offset = tail.offset + tail.len as u64;
+
+        // Force the segment data for the whole un-forced suffix, then the
+        // directory so any segment files created since the last durable point
+        // have durable directory entries (mirroring the `Always` append path).
+        self.segments
+            .sync_from(&self.fs, from_segment)
+            .map_err(|source| LogError::Io {
+                op: "flush segment",
+                source,
+            })?;
+        self.fs
+            .sync_dir(&self.cfg.data_dir)
+            .map_err(|source| LogError::Io {
+                op: "flush directory",
+                source,
+            })?;
+
+        // Durably record the advanced extent. On failure the in-memory mirror
+        // below is not reached, so `durable_last`/segment/offset (and the
+        // manifest's prior extent) are unchanged.
+        let state = ManifestState {
+            log_start_index: self.index.log_start_index(),
+            commit_index: self.commit_index,
+            durable_last: Some(last),
+            durable_segment: tail.segment,
+            durable_offset: advanced_offset,
+            hs_current_term: self.hs_current_term,
+            hs_voted_for: self.hs_voted_for,
+        };
         self.manifest
-            .sync(&self.fs)
+            .write(&self.fs, &state)
             .map_err(|source| LogError::Io {
                 op: "flush manifest",
                 source,
             })?;
+
+        // The advanced extent is durable: advance the in-memory mirror to match.
+        self.durable_last = Some(last);
+        self.durable_segment = tail.segment;
+        self.durable_offset = advanced_offset;
         Ok(())
     }
 
@@ -2391,6 +2495,78 @@ mod tests {
         }
     }
 
+    // --- Grouped: writes go to the OS, never auto-forced (R3.1) ------------
+
+    /// A `Grouped` config with a tiny segment size (each frame in its own
+    /// segment), matching [`never_cfg`] so the buffering behaviour can be
+    /// compared directly.
+    fn grouped_cfg() -> WalConfig {
+        WalConfig::new(DIR)
+            .with_segment_size(40)
+            .with_sync_policy(SyncPolicy::Grouped)
+    }
+
+    #[test]
+    fn grouped_append_does_not_auto_force_segment_data() {
+        let fs = MemFileSystem::new();
+        let mut wal = DurableWal::open_with(grouped_cfg(), fs.clone()).unwrap();
+
+        // Arm a failure on every fsync of the first segment file. Under
+        // `Grouped` the append performs no auto-force (like `Never`), so the
+        // armed failure never fires and the append succeeds.
+        let seg0 = Path::new(DIR).join(super::segment_file_name(0));
+        fs.arm_fsync_failure_for(&seg0);
+
+        wal.append(payload(0), 1).unwrap();
+        assert_eq!(wal.last_index(), Some(0));
+        assert_eq!(
+            wal.durable_last, None,
+            "Grouped never auto-advances the acknowledged extent on append"
+        );
+    }
+
+    #[test]
+    fn grouped_append_entries_does_not_auto_force_segment_data() {
+        let fs = MemFileSystem::new();
+        let mut wal = DurableWal::open_with(grouped_cfg(), fs.clone()).unwrap();
+
+        // Arm a failure on the active segment's fsync; a buffered batch append
+        // must not trigger it under `Grouped`.
+        let seg0 = Path::new(DIR).join(super::segment_file_name(0));
+        fs.arm_fsync_failure_for(&seg0);
+
+        let entries = batch(0, &[1, 1]);
+        wal.append_entries(&entries).unwrap();
+        assert_eq!(wal.last_index(), Some(1));
+        assert_eq!(
+            wal.durable_last, None,
+            "Grouped append_entries buffers without an inline force"
+        );
+    }
+
+    #[test]
+    fn grouped_recovers_os_visible_data_and_committed_state_on_reopen() {
+        let fs = MemFileSystem::new();
+        {
+            let mut wal = DurableWal::open_with(grouped_cfg(), fs.clone()).unwrap();
+            for i in 0..3u8 {
+                assert_eq!(wal.append(payload(i), 1).unwrap(), i as u64);
+            }
+            // `commit` records the commit in the manifest (metadata) so it
+            // survives reopen, like `Never`; frame data is forced by the caller
+            // via `flush`, not auto-forced here.
+            wal.commit(1).unwrap();
+            assert_eq!(wal.commit_index(), Some(1));
+        } // drop releases the directory lock
+
+        let reopened = DurableWal::open_with(grouped_cfg(), fs.clone()).unwrap();
+        assert_eq!(reopened.last_index(), Some(2));
+        assert_eq!(reopened.commit_index(), Some(1));
+        for i in 0..3u64 {
+            assert_eq!(reopened.entry(i).unwrap().payload, payload(i as u8));
+        }
+    }
+
     // --- flush forces buffered frames + manifest (R4.10) -------------------
 
     #[test]
@@ -2458,5 +2634,162 @@ mod tests {
             DurableWal::open_with(periodic_cfg(1000), fs.clone()).expect("reopen should succeed");
         assert_eq!(reopened.last_index(), Some(1));
         assert_eq!(reopened.entry(1).unwrap().payload, payload(1));
+    }
+
+    // --- group flush: force across segments + advance durable_index --------
+
+    /// A `Grouped` config with a tiny segment so a run of appends rolls across
+    /// several segment files, exercising the multi-segment group force.
+    fn grouped_small_cfg() -> WalConfig {
+        WalConfig::new(DIR)
+            .with_segment_size(40)
+            .with_sync_policy(SyncPolicy::Grouped)
+    }
+
+    #[test]
+    fn grouped_appends_buffer_then_a_single_flush_advances_durable_index() {
+        let fs = MemFileSystem::new();
+        let mut wal = DurableWal::open_with(grouped_small_cfg(), fs.clone()).unwrap();
+
+        // Buffered appends under `Grouped` never auto-force, so nothing is
+        // durable until the caller flushes (Requirement 3.1).
+        for i in 0..5u8 {
+            wal.append(payload(i), 1).unwrap();
+        }
+        assert_eq!(wal.last_index(), Some(4));
+        assert_eq!(
+            wal.durable_index(),
+            None,
+            "Grouped appends do not advance the durable extent"
+        );
+
+        // The 40-byte segment forced rollovers, so the un-forced frames span
+        // several segments — a single flush must force every one of them.
+        assert!(
+            !wal.segments.sealed().is_empty(),
+            "expected a segment rollover so the flush spans multiple segments"
+        );
+
+        wal.flush()
+            .expect("group flush forces every un-forced segment");
+
+        // After a successful flush the durable extent reaches the tail
+        // (Requirement 3.2), and the reported state is otherwise unchanged.
+        assert_eq!(
+            wal.durable_index(),
+            Some(4),
+            "durable_index advances to last_index"
+        );
+        assert_eq!(wal.last_index(), Some(4), "last_index unchanged by flush");
+    }
+
+    #[test]
+    fn group_flush_across_a_rollover_survives_reopen() {
+        let fs = MemFileSystem::new();
+        {
+            let mut wal = DurableWal::open_with(grouped_small_cfg(), fs.clone()).unwrap();
+            for i in 0..6u8 {
+                wal.append(payload(i), 1).unwrap();
+            }
+            wal.commit(5).unwrap();
+            assert!(
+                !wal.segments.sealed().is_empty(),
+                "expected a rollover across segments"
+            );
+            wal.flush().expect("flush forces all rolled segments");
+            assert_eq!(wal.durable_index(), Some(5));
+        }
+
+        // Reopening recovers exactly the flushed prefix, across every segment
+        // the batch rolled into (Requirement 1.5).
+        let reopened =
+            DurableWal::open_with(grouped_small_cfg(), fs.clone()).expect("reopen should succeed");
+        assert_eq!(reopened.last_index(), Some(5));
+        assert_eq!(reopened.durable_index(), Some(5));
+        assert_eq!(reopened.commit_index(), Some(5));
+        for i in 0..6u8 {
+            assert_eq!(
+                reopened.entry(i as u64).unwrap().payload,
+                payload(i),
+                "entry {i} recovered with its flushed payload"
+            );
+        }
+    }
+
+    #[test]
+    fn group_flush_failure_leaves_the_durable_extent_unchanged() {
+        let fs = MemFileSystem::new();
+        let mut wal = DurableWal::open_with(grouped_small_cfg(), fs.clone()).unwrap();
+        for i in 0..4u8 {
+            wal.append(payload(i), 1).unwrap();
+        }
+        assert_eq!(wal.durable_index(), None, "nothing forced yet");
+
+        // Fail the next fsync — the flush's first segment force — and confirm it
+        // surfaces as `Io` while leaving the acknowledged extent (and the
+        // reported tail) unchanged (Requirement 1.4).
+        fs.arm_next_fsync_failure();
+        let err = wal.flush().unwrap_err();
+        assert!(matches!(err, LogError::Io { .. }), "got {err:?}");
+
+        assert_eq!(
+            wal.durable_index(),
+            None,
+            "a failed flush must not advance the durable extent"
+        );
+        assert_eq!(wal.last_index(), Some(3), "last_index unchanged");
+
+        // The un-forced tail stays non-durable, but a later flush still
+        // succeeds and makes it durable.
+        wal.flush().expect("a retried flush succeeds");
+        assert_eq!(wal.durable_index(), Some(3));
+    }
+
+    #[test]
+    fn reopen_recovers_exactly_the_flushed_prefix_dropping_the_unforced_tail() {
+        // A single large segment so the whole log lives in one file; the test
+        // truncates the un-forced tail to model a crash dropping un-fsynced
+        // bytes, then asserts recovery keeps only the flushed prefix.
+        let cfg = || {
+            WalConfig::new(DIR)
+                .with_segment_size(4096)
+                .with_sync_policy(SyncPolicy::Grouped)
+        };
+        let fs = MemFileSystem::new();
+        let (segment_path, durable_offset) = {
+            let mut wal = DurableWal::open_with(cfg(), fs.clone()).unwrap();
+            for i in 0..3u8 {
+                wal.append(payload(i), 1).unwrap();
+            }
+            wal.commit(2).unwrap();
+            wal.flush().expect("flush the prefix 0..=2");
+            assert_eq!(wal.durable_index(), Some(2));
+
+            // Append an un-forced tail (indices 3,4): written to the OS but not
+            // forced, so not acknowledged durable.
+            wal.append(payload(3), 1).unwrap();
+            wal.append(payload(4), 1).unwrap();
+            assert_eq!(wal.last_index(), Some(4));
+            assert_eq!(wal.durable_index(), Some(2), "tail not flushed");
+
+            // The acknowledged extent ends just past index 2's frame in the
+            // (single) durable segment.
+            let path = Path::new(DIR).join(segment_file_name(wal.durable_segment));
+            (path, wal.durable_offset)
+        };
+
+        // Model the crash: the un-fsynced tail bytes never reached disk.
+        fs.truncate_file(&segment_path, durable_offset);
+
+        // Reopen recovers exactly the flushed, acknowledged prefix 0..=2; the
+        // dropped tail is gone (Requirement 1.5).
+        let reopened = DurableWal::open_with(cfg(), fs.clone()).expect("reopen should succeed");
+        assert_eq!(reopened.last_index(), Some(2));
+        assert_eq!(reopened.durable_index(), Some(2));
+        assert_eq!(reopened.commit_index(), Some(2));
+        for i in 0..3u8 {
+            assert_eq!(reopened.entry(i as u64).unwrap().payload, payload(i));
+        }
+        assert_eq!(reopened.entry(3), None, "the un-forced tail was dropped");
     }
 }

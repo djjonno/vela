@@ -19,7 +19,9 @@ pub mod sim;
 // Boundary 1: the replicated log. Re-exported from `vela-log` so downstream
 // crates can name the storage seam and the entry/payload types through
 // `vela-raft` without taking a second dependency edge (Requirement 1.4).
-pub use vela_log::{CommitIndex, EntryPayload, HardState, LogEntry, LogStorage, PayloadKind};
+pub use vela_log::{
+    CommitIndex, EntryPayload, HardState, LogEntry, LogError, LogStorage, PayloadKind,
+};
 
 /// Base follower/candidate election timeout (Requirement 7.2).
 ///
@@ -204,6 +206,14 @@ pub enum RaftInput {
     Message(RaftMessage),
     /// A leader-side client proposal to append a payload to the log.
     Propose(EntryPayload),
+    /// This replica's log [`Durable_Index`](LogStorage::durable_index) may have
+    /// advanced because the driver just forced buffered appends to stable
+    /// storage. Driving this input lets consensus react to the newly-durable
+    /// extent without weakening durability (Requirements 1.2, 1.3): a leader
+    /// re-runs commit advancement now that more of its own log is `fsync`ed,
+    /// and a follower/candidate re-emits the deferred acknowledgement to the
+    /// current leader carrying its now-durable `match_index`.
+    Durable,
 }
 
 /// The operation whose hard-state persistence failed during a [`RaftNode::step`]
@@ -426,6 +436,44 @@ impl<S: LogStorage> RaftNode<S> {
         &self.log
     }
 
+    /// The highest log index this replica has `fsync`ed to its own stable
+    /// storage — its [`Durable_Index`](LogStorage::durable_index).
+    ///
+    /// A convenience pass-through to `self.log().durable_index()`, so the driver
+    /// can read the durable extent (e.g. to choose a revert point after a failed
+    /// force) without naming the log type. A volatile log reports its
+    /// `last_index`, so consensus over the in-memory backend is unchanged.
+    pub fn durable_index(&self) -> CommitIndex {
+        self.log.durable_index()
+    }
+
+    /// Force this replica's buffered log appends to stable storage, advancing
+    /// the [`Durable_Index`](LogStorage::durable_index) to the highest appended
+    /// index (Requirement 3.2).
+    ///
+    /// A pass-through to [`LogStorage::flush`] so the driver — the partition's
+    /// single writer — can group-commit a batch of buffered appends with one
+    /// `fsync` and then re-drive consensus with [`RaftInput::Durable`]. On a
+    /// volatile log this is a no-op `Ok(())`; on the durable backend a force
+    /// failure returns [`LogError::Io`] and leaves the durable extent unchanged
+    /// so no entry is reported durable that was not `fsync`ed (Requirement 1.4).
+    pub fn flush(&mut self) -> Result<(), LogError> {
+        self.log.flush()
+    }
+
+    /// Remove every log entry with index greater than `index`, dropping a
+    /// non-durable tail back to the durable extent (Requirement 1.4).
+    ///
+    /// A pass-through to [`LogStorage::revert`] used by the driver after a failed
+    /// force to restore the invariant "in-memory tail == durable tail" before
+    /// the next group-commit cycle. The log rejects a revert below its commit
+    /// index, protecting committed entries; because commit never outruns the
+    /// Durable_Index, reverting to the Durable_Index never discards a committed
+    /// entry.
+    pub fn revert(&mut self, index: u64) -> Result<(), LogError> {
+        self.log.revert(index)
+    }
+
     /// Advance the state machine one step: fold `input` and the current state
     /// into new state plus a set of [`RaftOutput`] effects.
     ///
@@ -475,6 +523,13 @@ impl<S: LogStorage> RaftNode<S> {
                 if self.role == Role::Leader {
                     self.propose(payload, &mut out);
                 }
+            }
+            // The local log's Durable_Index may have advanced after the driver
+            // forced buffered appends. Re-drive consensus so the leader can
+            // commit, and a follower/candidate can ack, the now-durable entries
+            // (Requirements 1.2, 1.3).
+            RaftInput::Durable => {
+                self.on_durable(&mut out);
             }
         }
 
@@ -673,6 +728,48 @@ impl<S: LogStorage> RaftNode<S> {
         self.advance_commit(out);
     }
 
+    /// React to an advance in this replica's local Durable_Index after the
+    /// driver forced buffered appends to stable storage (Requirements 1.2, 1.3).
+    ///
+    /// A leader re-runs [`advance_commit`](Self::advance_commit) so it can move
+    /// the commit index now that more of its own log is `fsync`ed — commit
+    /// never outruns the leader's durable extent (Requirement 1.3).
+    ///
+    /// A follower or candidate that knows the current leader emits a fresh
+    /// successful `AppendEntries` acknowledgement to it carrying
+    /// `match_index = min(last_index, durable_index)`: the deferred ack the
+    /// design defers until the just-appended entries are durable, so the
+    /// follower never acks past its own Durable_Index (Requirement 1.2). The
+    /// leader only ever takes the maximum `match_index`, so this late ack can
+    /// only advance — never regress — replication progress. With no known
+    /// leader (a candidate, or a freshly stepped-down node) there is nobody to
+    /// ack, so it does nothing.
+    fn on_durable(&mut self, out: &mut RaftOutput) {
+        if self.role == Role::Leader {
+            self.advance_commit(out);
+            return;
+        }
+        let Some(leader) = self.leader_id else {
+            return;
+        };
+        // Bound the acked index by both what is appended and what is durable;
+        // `durable_index <= last_index` always, so this is the durable extent.
+        let match_index = match (self.log.last_index(), self.log.durable_index()) {
+            (Some(last), Some(durable)) => Some(last.min(durable)),
+            _ => None,
+        };
+        out.sends.push((
+            leader,
+            RaftMessage::AppendEntriesReply(AppendEntriesReply {
+                from: self.id,
+                term: self.current_term,
+                success: true,
+                conflict_index: None,
+                match_index,
+            }),
+        ));
+    }
+
     /// Recompute the commit index after a change in replication progress and
     /// surface any newly committed entries (Requirements 8.5, 8.6, 8.7, 8.8).
     ///
@@ -681,6 +778,11 @@ impl<S: LogStorage> RaftNode<S> {
     /// index `n` implicitly commits every preceding entry. The commit index
     /// advances to the highest index replicated on a majority whose entry is of
     /// the current term, and never moves backward.
+    ///
+    /// The candidate ceiling is additionally capped at the leader's local
+    /// Durable_Index, so the leader never commits an index it has not itself
+    /// `fsync`ed; commit therefore continues to mean "durable on a majority"
+    /// (Requirement 1.3).
     fn advance_commit(&mut self, out: &mut RaftOutput) {
         if self.role != Role::Leader {
             return;
@@ -688,12 +790,19 @@ impl<S: LogStorage> RaftNode<S> {
         let Some(last) = self.log.last_index() else {
             return;
         };
+        // The leader must never commit an index it has not itself `fsync`ed:
+        // cap the candidate ceiling at the local Durable_Index (Requirement
+        // 1.3). With nothing durable there is nothing new to commit.
+        let Some(durable) = self.log.durable_index() else {
+            return;
+        };
+        let ceiling = last.min(durable);
 
         let majority = self.majority();
         let start = self.commit_index.map_or(0, |c| c + 1);
 
         let mut new_commit = self.commit_index;
-        for n in start..=last {
+        for n in start..=ceiling {
             // Only a current-term entry may be committed directly (§5.4.2).
             if self.log.term_at(n) != Some(self.current_term) {
                 continue;
@@ -972,9 +1081,21 @@ impl<S: LogStorage> RaftNode<S> {
         // The highest index now known to agree with the leader: the last
         // conveyed entry, or — for an empty heartbeat — the matched preceding
         // entry.
-        let match_index = match ae.entries.last() {
+        let computed_match_index = match ae.entries.last() {
             Some(last) => Some(last.index),
             None => ae.prev_log_index,
+        };
+        // Gate the immediate ack on the follower's Durable_Index: it must never
+        // report a `match_index` beyond what has been `fsync`ed locally
+        // (Requirement 1.2). Under the `Grouped` policy the just-appended
+        // entries are buffered but not yet durable, so `durable_index` lags
+        // `last_index` and this ack conveys only the previously-durable extent.
+        // The post-flush `RaftInput::Durable` step then re-emits the ack that
+        // advances `match_index` to cover the newly-durable entries. With
+        // nothing durable there is nothing `fsync`ed to acknowledge.
+        let match_index = match (computed_match_index, self.log.durable_index()) {
+            (Some(computed), Some(durable)) => Some(computed.min(durable)),
+            _ => None,
         };
 
         // Advance the follower's commit index toward the leader's, bounded by
@@ -1655,5 +1776,324 @@ mod tests {
         assert_eq!(sim.node(NodeId(0)).unwrap().commit_index(), Some(0));
         assert_eq!(out.committed.len(), 1);
         assert_eq!(out.committed[0].payload, record(5));
+    }
+
+    /// A test [`LogStorage`] that delegates to [`InMemoryLog`] but reports a
+    /// `durable_index` capped to a settable ceiling, modelling the buffered
+    /// `Grouped` state in which the appended tail is not yet `fsync`ed. It lets
+    /// the follower `Durable` tests assert the deferred ack is bounded by the
+    /// *durable* extent rather than the last appended index (Requirement 1.2).
+    #[derive(Default)]
+    struct DurableTestLog {
+        inner: InMemoryLog,
+        durable: CommitIndex,
+    }
+
+    impl DurableTestLog {
+        /// Mark the log durable through `index` — what the driver's post-flush
+        /// extent would be.
+        fn set_durable(&mut self, index: CommitIndex) {
+            self.durable = index;
+        }
+    }
+
+    impl LogStorage for DurableTestLog {
+        fn append(&mut self, payload: EntryPayload, term: u64) -> Result<u64, vela_log::LogError> {
+            self.inner.append(payload, term)
+        }
+        fn append_entries(&mut self, entries: &[LogEntry]) -> Result<(), vela_log::LogError> {
+            self.inner.append_entries(entries)
+        }
+        fn read(&self, start: u64, end: u64) -> Vec<LogEntry> {
+            self.inner.read(start, end)
+        }
+        fn entry(&self, index: u64) -> Option<LogEntry> {
+            self.inner.entry(index)
+        }
+        fn last_index(&self) -> Option<u64> {
+            self.inner.last_index()
+        }
+        fn term_at(&self, index: u64) -> Option<u64> {
+            self.inner.term_at(index)
+        }
+        fn commit_index(&self) -> CommitIndex {
+            self.inner.commit_index()
+        }
+        // The whole point of this test double: a durable extent that can lag the
+        // last appended index.
+        fn durable_index(&self) -> CommitIndex {
+            self.durable
+        }
+        fn commit(&mut self, index: u64) -> Result<(), vela_log::LogError> {
+            self.inner.commit(index)
+        }
+        fn revert(&mut self, index: u64) -> Result<(), vela_log::LogError> {
+            self.inner.revert(index)
+        }
+        fn snapshot(&self) -> vela_log::Snapshot {
+            self.inner.snapshot()
+        }
+    }
+
+    #[test]
+    fn leader_durable_input_reruns_commit_advancement() {
+        // A leader whose peers already match the latest current-term entry, but
+        // whose commit index has not yet caught up (no commit-advancing step has
+        // run since they matched). Stepping `RaftInput::Durable` must re-run
+        // `advance_commit` and commit the now-majority-replicated entry (R1.3).
+        let mut node = RaftNode::new(NodeId(0), vec![NodeId(1), NodeId(2)], InMemoryLog::new());
+        node.role = Role::Leader;
+        node.current_term = 1;
+        node.leader_id = Some(NodeId(0));
+        node.log.append(record(0), 1).expect("append entry 0");
+        node.log.append(record(1), 1).expect("append entry 1");
+        // A majority (the leader plus peer 1) holds index 1, recorded without a
+        // commit-advancing step, so commit still lags.
+        node.match_index.insert(NodeId(1), 1);
+        node.next_index.insert(NodeId(1), 2);
+        assert_eq!(node.commit_index(), None);
+
+        let mut clock = TestClock::default();
+        let out = node.step(RaftInput::Durable, &mut clock);
+
+        // Commit advanced to the majority-replicated current-term high-water
+        // mark and both entries surfaced exactly once for the state machine.
+        assert_eq!(node.commit_index(), Some(1));
+        let committed: Vec<u64> = out.committed.iter().map(|e| e.index).collect();
+        assert_eq!(committed, vec![0, 1]);
+    }
+
+    #[test]
+    fn follower_durable_input_acks_known_leader_with_durable_bounded_match() {
+        // A follower that knows the current leader re-emits a successful ack on
+        // `Durable`, carrying `match_index = min(last_index, durable_index)` —
+        // the deferred ack covering the newly-durable entries. The ack must be
+        // bounded by the durable extent, never the (larger) appended index, so
+        // a follower never acks past what it has `fsync`ed (Requirement 1.2).
+        let mut log = DurableTestLog::default();
+        log.append(record(0), 1).expect("append entry 0");
+        log.append(record(1), 1).expect("append entry 1");
+        log.append(record(2), 1).expect("append entry 2");
+        // Indices 0..=1 are durable; index 2 is appended but still buffered.
+        log.set_durable(Some(1));
+
+        let mut node = RaftNode::new(NodeId(0), vec![NodeId(1), NodeId(2)], log);
+        node.current_term = 4;
+        node.leader_id = Some(NodeId(1));
+
+        let mut clock = TestClock::default();
+        let out = node.step(RaftInput::Durable, &mut clock);
+
+        // Exactly one message: a successful ack addressed to the known leader.
+        assert_eq!(out.sends.len(), 1);
+        assert_eq!(out.sends[0].0, NodeId(1));
+        let reply = expect_append_reply(&out);
+        assert!(reply.success);
+        assert_eq!(reply.from, NodeId(0));
+        assert_eq!(reply.term, 4);
+        // Bounded by durable_index (1), not last_index (2).
+        assert_eq!(reply.match_index, Some(1));
+    }
+
+    #[test]
+    fn follower_durable_input_with_no_known_leader_emits_nothing() {
+        // With no leader to ack (a candidate, or a node that has not yet heard
+        // from a leader), `Durable` is a no-op: there is nobody to send the
+        // deferred ack to (Requirement 1.2).
+        let mut log = DurableTestLog::default();
+        log.append(record(0), 1).expect("append entry 0");
+        log.set_durable(Some(0));
+
+        let mut node = RaftNode::new(NodeId(0), vec![NodeId(1), NodeId(2)], log);
+        assert_eq!(node.leader_id(), None);
+
+        let mut clock = TestClock::default();
+        let out = node.step(RaftInput::Durable, &mut clock);
+
+        assert!(out.sends.is_empty(), "no known leader → no deferred ack");
+        assert!(out.committed.is_empty());
+    }
+
+    #[test]
+    fn leader_does_not_commit_beyond_durable_index() {
+        // A leader with two current-term entries appended and a majority of
+        // peers matching the latest, but whose local Durable_Index lags at the
+        // first entry. Commit must NOT advance past `durable_index` even though
+        // the peers have acked further — the leader has not `fsync`ed index 1
+        // locally (Requirement 1.3).
+        let mut log = DurableTestLog::default();
+        log.append(record(0), 1).expect("append entry 0");
+        log.append(record(1), 1).expect("append entry 1");
+        // Only index 0 is durable; index 1 is appended but still buffered.
+        log.set_durable(Some(0));
+
+        let mut node = RaftNode::new(NodeId(0), vec![NodeId(1), NodeId(2)], log);
+        node.role = Role::Leader;
+        node.current_term = 1;
+        node.leader_id = Some(NodeId(0));
+        // A majority (leader plus peer 1) matches index 1.
+        node.match_index.insert(NodeId(1), 1);
+        node.next_index.insert(NodeId(1), 2);
+
+        let mut clock = TestClock::default();
+        let out = node.step(RaftInput::Durable, &mut clock);
+
+        // Commit is capped at the durable extent (0), not the majority-matched
+        // appended index (1).
+        assert_eq!(node.commit_index(), Some(0));
+        let committed: Vec<u64> = out.committed.iter().map(|e| e.index).collect();
+        assert_eq!(committed, vec![0]);
+    }
+
+    #[test]
+    fn leader_commit_catches_up_to_min_last_and_durable_when_durable_advances() {
+        // Same leader, but after the driver's flush advances Durable_Index to
+        // cover index 1. A subsequent `Durable` step commits up to
+        // `min(last_index, durable_index)`, catching up to the
+        // majority-replicated, now-durable high-water mark (Requirement 1.3).
+        let mut log = DurableTestLog::default();
+        log.append(record(0), 1).expect("append entry 0");
+        log.append(record(1), 1).expect("append entry 1");
+        log.set_durable(Some(0));
+
+        let mut node = RaftNode::new(NodeId(0), vec![NodeId(1), NodeId(2)], log);
+        node.role = Role::Leader;
+        node.current_term = 1;
+        node.leader_id = Some(NodeId(0));
+        node.match_index.insert(NodeId(1), 1);
+        node.next_index.insert(NodeId(1), 2);
+
+        let mut clock = TestClock::default();
+        // First force only made index 0 durable: commit stays at 0.
+        let out = node.step(RaftInput::Durable, &mut clock);
+        assert_eq!(node.commit_index(), Some(0));
+        let committed: Vec<u64> = out.committed.iter().map(|e| e.index).collect();
+        assert_eq!(committed, vec![0]);
+
+        // The driver forces again, making index 1 durable.
+        node.log.set_durable(Some(1));
+        let out = node.step(RaftInput::Durable, &mut clock);
+
+        // Commit now catches up to min(last_index, durable_index) = 1, and only
+        // the newly committed entry surfaces.
+        assert_eq!(node.commit_index(), Some(1));
+        let committed: Vec<u64> = out.committed.iter().map(|e| e.index).collect();
+        assert_eq!(committed, vec![1]);
+    }
+
+    #[test]
+    fn leader_with_nothing_durable_commits_nothing() {
+        // A leader with appended-but-unforced entries and a matching majority,
+        // but `durable_index == None` (nothing `fsync`ed yet). There is nothing
+        // the leader may commit (Requirement 1.3).
+        let mut log = DurableTestLog::default();
+        log.append(record(0), 1).expect("append entry 0");
+        log.set_durable(None);
+
+        let mut node = RaftNode::new(NodeId(0), vec![NodeId(1), NodeId(2)], log);
+        node.role = Role::Leader;
+        node.current_term = 1;
+        node.leader_id = Some(NodeId(0));
+        node.match_index.insert(NodeId(1), 0);
+        node.next_index.insert(NodeId(1), 1);
+
+        let mut clock = TestClock::default();
+        let out = node.step(RaftInput::Durable, &mut clock);
+
+        assert_eq!(node.commit_index(), None);
+        assert!(out.committed.is_empty());
+    }
+
+    #[test]
+    fn follower_immediate_ack_is_bounded_by_lagging_durable_index() {
+        // A follower receives a matching AppendEntries that conveys entries
+        // bringing `last_index` to 2, but its Durable_Index lags at 0 (the
+        // just-appended tail is buffered, not yet `fsync`ed under `Grouped`).
+        // The immediate success ack must report `match_index = min(2, 0) = 0`,
+        // never the appended index, so the follower never acks past what it has
+        // durably stored (Requirement 1.2).
+        let mut log = DurableTestLog::default();
+        log.set_durable(Some(0));
+
+        let mut node = RaftNode::new(NodeId(0), vec![NodeId(1), NodeId(2)], log);
+        let mut clock = TestClock::default();
+
+        let out = node.step(
+            RaftInput::Message(RaftMessage::AppendEntries(AppendEntries {
+                term: 1,
+                leader_id: NodeId(1),
+                prev_log_index: None,
+                prev_log_term: None,
+                entries: vec![
+                    LogEntry {
+                        index: 0,
+                        term: 1,
+                        payload: record(0),
+                    },
+                    LogEntry {
+                        index: 1,
+                        term: 1,
+                        payload: record(1),
+                    },
+                    LogEntry {
+                        index: 2,
+                        term: 1,
+                        payload: record(2),
+                    },
+                ],
+                leader_commit: None,
+            })),
+            &mut clock,
+        );
+
+        // The entries are appended to the buffered log...
+        assert_eq!(node.log().last_index(), Some(2));
+        let reply = expect_append_reply(&out);
+        assert!(reply.success);
+        // ...but the immediate ack is bounded by the durable extent (0), not
+        // the appended index (2).
+        assert_eq!(reply.match_index, Some(0));
+    }
+
+    #[test]
+    fn follower_immediate_ack_is_none_when_nothing_durable() {
+        // Same matching append, but the follower has `durable_index == None`
+        // (nothing `fsync`ed yet). The immediate success ack reports no
+        // `match_index` at all — there is nothing durable to acknowledge — even
+        // though the entries are buffered in the log (Requirement 1.2).
+        let mut log = DurableTestLog::default();
+        log.set_durable(None);
+
+        let mut node = RaftNode::new(NodeId(0), vec![NodeId(1), NodeId(2)], log);
+        let mut clock = TestClock::default();
+
+        let out = node.step(
+            RaftInput::Message(RaftMessage::AppendEntries(AppendEntries {
+                term: 1,
+                leader_id: NodeId(1),
+                prev_log_index: None,
+                prev_log_term: None,
+                entries: vec![
+                    LogEntry {
+                        index: 0,
+                        term: 1,
+                        payload: record(0),
+                    },
+                    LogEntry {
+                        index: 1,
+                        term: 1,
+                        payload: record(1),
+                    },
+                ],
+                leader_commit: None,
+            })),
+            &mut clock,
+        );
+
+        assert_eq!(node.log().last_index(), Some(1));
+        let reply = expect_append_reply(&out);
+        assert!(reply.success);
+        // Nothing is durable, so the immediate ack carries no match_index.
+        assert_eq!(reply.match_index, None);
     }
 }

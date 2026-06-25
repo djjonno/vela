@@ -94,13 +94,20 @@ pub(crate) enum SpawnError {
 /// Build the [`WalConfig`] for one durable partition log.
 ///
 /// The config is rooted at the partition's derived [`partition_data_path`] and
-/// uses the only consensus-safe sync policy, [`SyncPolicy::Always`], which
-/// forces each mutating operation to stable storage before it returns
-/// (Requirement 5.3, 12.1). Factored out so the construction site's path
-/// rooting and sync policy are testable without filesystem I/O.
+/// uses the group-commit sync policy, [`SyncPolicy::Grouped`]: mutating
+/// operations buffer their frame bytes but do not force inline. The
+/// per-partition [`PartitionDriver`](crate::driver::PartitionDriver) — the
+/// single writer for the partition's log and consensus state — owns forcing,
+/// issuing one offloaded `fsync` per group-commit cycle and only then releasing
+/// any acknowledgement (Requirement 1.1, 3.1). The end-to-end durability
+/// guarantee is unchanged: a produce is acked only after its entry is `fsync`ed
+/// on a strict majority of replicas, because the driver gates the commit/ack on
+/// the post-flush Durable_Index rather than on the in-memory append. Factored
+/// out so the construction site's path rooting and sync policy are testable
+/// without filesystem I/O.
 fn durable_wal_config(data_dir: &Path, topic: &str, partition: u32) -> WalConfig {
     WalConfig::new(partition_data_path(data_dir, topic, partition))
-        .with_sync_policy(SyncPolicy::Always)
+        .with_sync_policy(SyncPolicy::Grouped)
 }
 
 /// Shared state backing both gRPC services on a node.
@@ -151,8 +158,9 @@ impl NodeShared {
     /// 16, 17, 18):
     ///
     /// 1. **Recover the `__meta` group first.** The dedicated metadata Raft
-    ///    group is opened durably at its reserved path with the consensus-safe
-    ///    [`SyncPolicy::Always`] and its committed `ClusterCommand`s are
+    ///    group is opened durably at its reserved path with the group-commit
+    ///    [`SyncPolicy::Grouped`] (the [`MetadataDriver`] owns forcing) and its
+    ///    committed `ClusterCommand`s are
     ///    replayed to rebuild the catalogue *before* any client partition is
     ///    touched. If the metadata log cannot be opened the node refuses to
     ///    start (Requirement 16.1, 17.x, 18.1).
@@ -515,8 +523,8 @@ impl NodeShared {
     /// (Requirement 5.1-5.4): an in-memory topic builds an [`InMemoryLog`] and
     /// writes nothing to disk (Requirement 13.3), while a durable topic opens a
     /// [`DurableWal`] rooted at the partition's derived path with the
-    /// consensus-safe [`SyncPolicy::Always`] and recovers its committed prefix
-    /// (Requirement 11.1-11.3, 12.1).
+    /// group-commit [`SyncPolicy::Grouped`] (the partition driver owns forcing)
+    /// and recovers its committed prefix (Requirement 11.1-11.3, 12.1).
     ///
     /// Returns `Ok(true)` if a driver was started, `Ok(false)` if this node does
     /// not replicate the partition or already runs it, and
@@ -579,10 +587,11 @@ impl NodeShared {
                 PartitionLog::InMemory(InMemoryLog::new()),
             ),
             // Durable: open the WAL rooted at the derived path with the
-            // consensus-safe Always policy. On failure, log a structured error
-            // identifying the topic and partition and leave the replica
-            // unstarted — never an in-memory fallback (Requirement 5.3, 8.1,
-            // 8.2, 12.1).
+            // group-commit Grouped policy; the partition driver owns forcing
+            // (one offloaded `fsync` per group-commit cycle). On failure, log a
+            // structured error identifying the topic and partition and leave the
+            // replica unstarted — never an in-memory fallback (Requirement 5.3,
+            // 8.1, 8.2, 12.1).
             LogBackend::Durable => {
                 let cfg = durable_wal_config(&self.data_dir, topic, partition.index.0);
                 let wal = match DurableWal::open(cfg) {
@@ -825,15 +834,15 @@ mod tests {
     }
 
     #[test]
-    fn durable_wal_config_is_rooted_at_the_derived_path_and_uses_always_policy() {
+    fn durable_wal_config_is_rooted_at_the_derived_path_and_uses_grouped_policy() {
         // The construction site roots the WAL at the partition's derived path
-        // and selects the only consensus-safe policy, `Always` (Requirement 5.3,
-        // 12.1). Verified without I/O by inspecting the config the spawn path
-        // builds.
-        let data_dir = Path::new("/var/lib/vela");
+        // and selects the group-commit `Grouped` policy; the partition driver
+        // owns forcing (Requirement 1.1, 3.1). Verified without I/O by
+        // inspecting the config the spawn path builds.
+        let data_dir = Path::new("/tmp/vela-data");
         let cfg = durable_wal_config(data_dir, "orders", 2);
         assert_eq!(cfg.data_dir, partition_data_path(data_dir, "orders", 2));
-        assert_eq!(cfg.sync_policy, SyncPolicy::Always);
+        assert_eq!(cfg.sync_policy, SyncPolicy::Grouped);
     }
 
     #[tokio::test]

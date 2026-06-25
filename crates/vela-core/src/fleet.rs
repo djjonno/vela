@@ -29,7 +29,7 @@
 
 use std::collections::HashMap;
 
-use vela_log::{InMemoryLog, LogEntry, LogStorage, PayloadKind};
+use vela_log::{CommitIndex, InMemoryLog, LogEntry, LogError, LogStorage, PayloadKind};
 use vela_raft::{Clock, NodeId as RaftNodeId, RaftInput, RaftNode, RaftOutput, Role};
 
 use crate::model::{Offset, PartitionIndex};
@@ -93,6 +93,20 @@ pub struct StateMachine {
     /// record committed at offset `o`. Because non-record entries are skipped,
     /// this vector's positions are exactly the gap-free record offsets.
     records: Vec<Vec<u8>>,
+    /// The base offset assigned to each committed record-bearing entry, keyed by
+    /// its **log index**. A single [`PayloadKind::Record`] entry maps to the one
+    /// offset it took; a [`PayloadKind::RecordBatch`] entry maps to its first
+    /// record's offset (its `Base_Offset`). Non-record entries assign no offset
+    /// and are absent from the map.
+    ///
+    /// This is the in-memory replacement for the old disk-read offset
+    /// computation: the offset (or base offset) of the committed entry at a
+    /// given log index is recorded here the moment it is applied, so the driver
+    /// can resolve a produce's offset without re-reading the log from disk
+    /// (Requirement 2.1, 2.2). It is rebuilt on recovery because the recovered
+    /// committed prefix is re-applied through [`StateMachine::apply`], which
+    /// keys each entry by its real log index.
+    base_offsets: HashMap<u64, Offset>,
 }
 
 impl StateMachine {
@@ -120,6 +134,7 @@ impl StateMachine {
         match entry.payload.kind {
             PayloadKind::Record => {
                 let offset = self.records.len() as Offset;
+                self.base_offsets.insert(entry.index, offset);
                 self.records.push(entry.payload.bytes.clone());
                 Some(AppliedOffsets::One(offset))
             }
@@ -127,6 +142,7 @@ impl StateMachine {
                 let base = self.records.len() as Offset;
                 let values = decode_record_batch(&entry.payload.bytes);
                 let count = values.len() as u32;
+                self.base_offsets.insert(entry.index, base);
                 self.records.extend(values);
                 Some(AppliedOffsets::Range { base, count })
             }
@@ -148,6 +164,21 @@ impl StateMachine {
     /// applied so far).
     pub fn next_offset(&self) -> Offset {
         self.records.len() as Offset
+    }
+
+    /// The record offset assigned to the committed record-bearing entry at log
+    /// index `log_index`, or `None` if no such entry has been applied (the index
+    /// is uncommitted, or it holds a `Noop`/`Cluster` entry that assigns no
+    /// offset).
+    ///
+    /// For a single-record entry this is the offset its record took; for a batch
+    /// entry it is the batch's `Base_Offset` (its first record's offset), so the
+    /// batch's Nth record took `base + N` (batched-produce Requirement 2.4).
+    /// This is the in-memory lookup the driver uses in place of the former
+    /// disk-read offset computation, so resolving a committed produce's offset
+    /// does no log I/O (Requirement 2.1, 2.2).
+    pub fn base_offset_for(&self, log_index: u64) -> Option<Offset> {
+        self.base_offsets.get(&log_index).copied()
     }
 
     /// The highest committed offset, or `None` if no record has been committed.
@@ -296,6 +327,59 @@ impl PartitionReplica {
     /// at most `max` (Requirement 5.1).
     pub fn read(&self, start: Offset, max: usize) -> Vec<CommittedRecord> {
         self.state.read(start, max)
+    }
+
+    /// The record offset (or batch `Base_Offset`) assigned to the committed
+    /// record-bearing entry at log index `log_index`, or `None` if that index is
+    /// not a committed record entry (Requirement 2.1, 2.2).
+    ///
+    /// A pass-through to [`StateMachine::base_offset_for`] so the driver can map
+    /// a committed produce's log index to its assigned offset from in-memory
+    /// state, doing no log I/O on the dispatch path.
+    pub fn base_offset_for(&self, log_index: u64) -> Option<Offset> {
+        self.state.base_offset_for(log_index)
+    }
+
+    /// The highest log index this replica has `fsync`ed to its own stable
+    /// storage — its [`Durable_Index`](vela_log::LogStorage::durable_index).
+    ///
+    /// Distinct from the log's `last_index`: under a group-commit (buffered)
+    /// sync policy the in-memory tail can sit ahead of the durable extent until
+    /// the driver forces it. A volatile (in-memory) backend has no disk and
+    /// reports its `last_index`, so consensus over it is unchanged.
+    pub fn durable_index(&self) -> CommitIndex {
+        self.raft.durable_index()
+    }
+
+    /// Force this replica's buffered log appends to stable storage, advancing
+    /// the [`Durable_Index`](vela_log::LogStorage::durable_index) to the highest
+    /// appended index (Requirement 3.2).
+    ///
+    /// Delegates to the Raft node's log force. The driver — the partition's
+    /// single writer — calls this once per group-commit cycle (off the async
+    /// runtime) and then steps [`RaftInput::Durable`](vela_raft::RaftInput) so
+    /// consensus reacts to the newly-durable extent. On a volatile backend this
+    /// is an `Ok(())` no-op; on the durable backend a force failure returns
+    /// [`LogError::Io`] and leaves the durable extent unchanged, so no entry is
+    /// reported durable that was not `fsync`ed (Requirement 1.4).
+    pub fn flush(&mut self) -> Result<(), LogError> {
+        self.raft.flush()
+    }
+
+    /// Drop any non-durable log tail back to the current
+    /// [`Durable_Index`](Self::durable_index), restoring the invariant
+    /// "in-memory tail == durable tail" after a failed force (Requirement 1.4).
+    ///
+    /// Reverts the log to its Durable_Index. When nothing has been forced yet
+    /// (`durable_index` is `None`) the log has no durable entries, so it reverts
+    /// to index `0` — the lowest target the storage seam accepts — leaving at
+    /// most the first, still-non-durable entry, which the next cycle's force
+    /// re-attempts; no acknowledgement or commit is released for the reverted
+    /// entries either way. Because commit never outruns the Durable_Index,
+    /// reverting here never discards a committed entry.
+    pub fn revert_to_durable(&mut self) -> Result<(), LogError> {
+        let target = self.raft.durable_index().unwrap_or(0);
+        self.raft.revert(target)
     }
 }
 

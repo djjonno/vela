@@ -54,6 +54,15 @@ pub enum SyncPolicy {
     /// Write Record_Frames to the operating system without ever forcing them to
     /// stable storage (Requirement 4.3).
     Never,
+    /// Write Record_Frames to the operating system but never *auto*-force them;
+    /// forcing is driven by the caller via [`flush`](super::DurableWal::flush)
+    /// (group commit). For the per-operation auto-force decision this behaves
+    /// exactly like [`Never`](SyncPolicy::Never) — `append`/`append_entries`
+    /// buffer frame bytes without an inline `fsync` — but the intent is
+    /// explicit: a `Grouped` log expects its writer to coalesce many buffered
+    /// appends into a single force. Durability is therefore caller-driven, not
+    /// per-append.
+    Grouped,
 }
 
 impl SyncPolicy {
@@ -213,6 +222,12 @@ mod tests {
         assert_eq!(cfg.sync_policy, SyncPolicy::Never);
     }
 
+    #[test]
+    fn builder_accepts_grouped_sync_policy() {
+        let cfg = WalConfig::new("/wal").with_sync_policy(SyncPolicy::Grouped);
+        assert_eq!(cfg.sync_policy, SyncPolicy::Grouped);
+    }
+
     // --- validation (R11.5, R11.7) -----------------------------------------
 
     #[test]
@@ -236,6 +251,12 @@ mod tests {
     fn validate_rejects_zero_periodic_interval() {
         let cfg = WalConfig::new("/wal").with_sync_policy(SyncPolicy::Periodic { interval_ms: 0 });
         assert!(matches!(cfg.validate(), Err(LogError::Config { .. })));
+    }
+
+    #[test]
+    fn validate_accepts_grouped_sync_policy() {
+        let cfg = WalConfig::new("/wal").with_sync_policy(SyncPolicy::Grouped);
+        assert!(cfg.validate().is_ok());
     }
 
     // --- prepare: validation is enforced with no partial init (R11.5, R11.7)

@@ -240,6 +240,23 @@ pub trait LogStorage {
     /// The current commit index (Requirement 6.7).
     fn commit_index(&self) -> CommitIndex;
 
+    /// The highest log index this log has made durable on its own stable
+    /// storage, or `None` when nothing is durable yet.
+    ///
+    /// This is distinct from [`last_index`](LogStorage::last_index), which is
+    /// the highest *appended* index and may still be buffered. Consensus gates
+    /// acknowledgement and commit on the durable index so that a write counts
+    /// as durable only once it is actually on disk (Requirements 1.2, 1.3).
+    ///
+    /// The default returns [`last_index`](LogStorage::last_index): a volatile
+    /// log such as [`InMemoryLog`] has no disk, so an appended entry is
+    /// "durable" in the only sense it can be, leaving existing consensus
+    /// behaviour over the in-memory log unchanged. The durable implementation
+    /// overrides this to report its `fsync`ed extent.
+    fn durable_index(&self) -> CommitIndex {
+        self.last_index()
+    }
+
     /// Advance the commit index to `index` when
     /// `current_commit <= index <= last_index`; otherwise reject and leave
     /// state unchanged (Requirements 6.8, 6.9).

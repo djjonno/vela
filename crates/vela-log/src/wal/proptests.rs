@@ -33,7 +33,7 @@ use proptest::prelude::*;
 use proptest::test_runner::TestCaseError;
 
 use super::fs::fault::MemFileSystem;
-use super::{DurableWal, WalConfig};
+use super::{DurableWal, SyncPolicy, WalConfig};
 use crate::{EntryPayload, HardState, InMemoryLog, LogEntry, LogError, LogStorage, PayloadKind};
 
 /// Data directory used for every generated case; each case gets a fresh
@@ -630,5 +630,113 @@ proptest! {
             Some(expected),
             "reopened hard state must equal the last persisted value"
         );
+    }
+}
+
+// ===========================================================================
+// Task 1.4: durable-index / flush interleaving invariant
+// Feature: wal-group-commit, Property 1
+// ===========================================================================
+//
+// ### Property: durable_index tracks last_index across any append/flush mix
+//
+// *For any* interleaving of `append` and `flush` operations applied to a
+// `DurableWal` under the [`Grouped`](super::SyncPolicy::Grouped) sync policy:
+//
+// 1. at **every** step `durable_index <= last_index` — a forced (durable)
+//    prefix can never run ahead of the appended tail; and
+// 2. immediately after a **successful** `flush`, `durable_index == last_index`
+//    — a group force makes the entire appended tail durable (Requirements 3.2).
+//
+// **Validates: Requirements 1.4, 1.5, 3.2**
+//
+// Both `durable_index` and `last_index` return `CommitIndex` (`Option<u64>`),
+// where `None` is the empty state "preceding index 0". `Option`'s ordering puts
+// `None` below every `Some`, which is exactly the intended meaning here:
+// "nothing durable" is below any appended index, and on an empty log both are
+// `None` (so `None <= None` and `None == None` both hold). No fsync fault is
+// armed, so every `flush` succeeds and the post-flush equality always applies.
+
+/// One operation in a generated append/flush interleaving under `Grouped`.
+#[derive(Debug, Clone)]
+enum FlushOp {
+    /// Append a single fresh entry at `last_index + 1` (buffered; no force).
+    Append {
+        term: u64,
+        kind: u8,
+        len: usize,
+        fill: u8,
+    },
+    /// Force every un-forced segment with a single group `flush`.
+    Flush,
+}
+
+/// Strategy for one operation, weighted toward `Append` so the log grows enough
+/// for a `flush` to have buffered frames to force, while still flushing often.
+fn flush_op_strategy() -> impl Strategy<Value = FlushOp> {
+    prop_oneof![
+        3 => (0u64..6, 0u8..3, 0usize..8, any::<u8>())
+            .prop_map(|(term, kind, len, fill)| FlushOp::Append { term, kind, len, fill }),
+        2 => Just(FlushOp::Flush),
+    ]
+}
+
+proptest! {
+    // At least 256 cases, matching this crate's existing proptest config and
+    // comfortably above the project's 100-iteration minimum.
+    #![proptest_config(ProptestConfig::with_cases(256))]
+
+    /// Apply a random `append`/`flush` interleaving to a `Grouped` `DurableWal`
+    /// and assert the durable-index invariant holds after every step, and that a
+    /// successful `flush` always brings `durable_index` up to `last_index`.
+    #[test]
+    fn grouped_durable_index_tracks_last_index_across_append_flush(
+        // A small segment size makes runs of appends roll across several segment
+        // files, so a `flush` must force multiple segments to satisfy equality.
+        segment_size in 16u64..256,
+        ops in prop::collection::vec(flush_op_strategy(), 0..40),
+    ) {
+        let fs = MemFileSystem::new();
+        let cfg = WalConfig::new(DIR)
+            .with_segment_size(segment_size)
+            .with_sync_policy(SyncPolicy::Grouped);
+        let mut wal = DurableWal::open_with(cfg, fs)
+            .expect("open on a fresh filesystem should succeed");
+
+        // Invariant holds from the empty state, before any operation.
+        prop_assert!(
+            wal.durable_index() <= wal.last_index(),
+            "durable_index {:?} must not exceed last_index {:?} on an empty log",
+            wal.durable_index(),
+            wal.last_index()
+        );
+
+        for op in &ops {
+            match op {
+                FlushOp::Append { term, kind, len, fill } => {
+                    wal.append(make_payload(*kind, *len, *fill), *term)
+                        .expect("a buffered Grouped append never forces, so never faults");
+                }
+                FlushOp::Flush => {
+                    wal.flush().expect("flush with no armed fault succeeds");
+                    // Property part 2: a successful group force makes the whole
+                    // appended tail durable (Requirement 3.2).
+                    prop_assert_eq!(
+                        wal.durable_index(),
+                        wal.last_index(),
+                        "after a successful flush durable_index must equal last_index"
+                    );
+                }
+            }
+
+            // Property part 1: the durable prefix never runs ahead of the tail,
+            // after every operation in the interleaving.
+            prop_assert!(
+                wal.durable_index() <= wal.last_index(),
+                "durable_index {:?} must not exceed last_index {:?}",
+                wal.durable_index(),
+                wal.last_index()
+            );
+        }
     }
 }
